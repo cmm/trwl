@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "embedding-model": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775096165,
+        "narHash": "sha256-KtI3FS1mp/I9WJTR59cNkO+tA+gWoqQymDj6zExfkwI=",
+        "ref": "main",
+        "rev": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+        "revCount": 16,
+        "type": "git",
+        "url": "https://huggingface.co/intfloat/multilingual-e5-small"
+      },
+      "original": {
+        "ref": "main",
+        "type": "git",
+        "url": "https://huggingface.co/intfloat/multilingual-e5-small"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1791456040,
+        "narHash": "sha256-H83yz/do+hjOO0uujHyH8RgtIQP2v7Mw+cLwcZK/xKc=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "e7439b6b14ad3cc35d05608ebca9bce01a25f5f8",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "embedding-model": "embedding-model",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
