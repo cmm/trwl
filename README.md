@@ -47,7 +47,7 @@ selection](#workspace-selection)).
 
 ## How it works
 
-`setup` imports each provider's native history — OpenCode SQLite, and
+`setup` imports each provider's native history — OpenCode v1/v2 SQLite, and
 Codex, Pi, Claude Code and Copilot CLI JSONL — into a local index
 under the data directory. Every search, transcript and location lookup
 reads that index, so retrieval keeps working even if the original

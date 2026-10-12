@@ -58,7 +58,7 @@ rustPlatform.buildRustPackage {
   postInstallCheck = ''
     patchShebangs tests
     tests/e2e.py --binary "$out/bin/trwl" \
-      --case discovery --case retrieval --case selection --case workspaces --case updates \
+      --case discovery --case retrieval --case opencode-v2 --case selection --case workspaces --case updates \
       --case refresh-restart --case hybrid-grouping --case semantic-cache
     tests/test-perf-compare.py
     tests/test-perf-runner.py

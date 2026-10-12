@@ -50,6 +50,7 @@ repository fixtures. The trwl executable discovers roots without invoking Git.
 | `benchmark-restore` | Prepared benchmark history survives restoration and its next import reports unchanged sources |
 | `discovery` | Data-root flag and environment override, XDG/home defaults; setup discovers OpenCode, Codex, Pi, Claude Code and Copilot CLI histories; repeating setup preserves content and references |
 | `retrieval` | OpenCode SQLite messages, tool input/output, parent/child sessions, windows, list, locate, text and Markdown transcripts |
+| `opencode-v2` | Hand-built OpenCode v1/v2 SQLite; mixed and v2-only databases, streaming tools, output/errors, metadata, children, edits/deletions, migration precedence, and incremental/fresh-import agreement |
 | `selection` | OpenCode SQLite and Codex rollout JSONL; matching counterexamples for filters, grouping, children and current-session exclusion |
 | `workspaces` | Git roots, subdirectories, nested repositories, symlinks, SHA-256 repositories and linked worktrees; all five providers; default, glob and global selection across all backends and both result modes; root preservation through updates and deleted checkouts |
 | `file-search` | Codex file operations versus prose and other-file counterexamples; alternative search terms |

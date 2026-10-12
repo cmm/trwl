@@ -14,6 +14,7 @@ sys.dont_write_bytecode = True
 from e2e_history import bad_input, selection, updates
 from e2e_http import hybrid_grouping, semantic_cache, semantic_http
 from e2e_live import busy_source, many_inputs, semantic_live, semantic_recovery
+from e2e_opencode import opencode_v2
 from e2e_processes import interruption, overlap, refresh_restart
 from e2e_providers import provider_cases
 from e2e_retrieval import retrieval
@@ -41,6 +42,7 @@ CASES = {
     "benchmark-restore": benchmark_restore,
     "discovery": discovery,
     "retrieval": retrieval,
+    "opencode-v2": opencode_v2,
     "selection": selection,
     "workspaces": workspaces,
     "updates": updates,

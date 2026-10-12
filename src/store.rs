@@ -100,11 +100,15 @@ struct InputState {
     /// earlier versions kept checkpoints inline; their inputs are reparsed.
     #[serde(default)]
     checkpointed: bool,
+    #[serde(default)]
+    parser_revision: u32,
 }
 
 impl InputState {
     fn unchanged(&self, stamp: &Stamp) -> bool {
-        self.checkpointed && self.stamp == *stamp
+        self.checkpointed
+            && self.parser_revision == providers::parser_revision(self.provider)
+            && self.stamp == *stamp
     }
 }
 
@@ -1532,7 +1536,13 @@ fn update_with_parser(
             continue;
         }
         let previous = match manifest.inputs.get(key) {
-            Some(old) if old.checkpointed && !full => load_checkpoint(&searcher, fields, key),
+            Some(old)
+                if old.checkpointed
+                    && old.parser_revision == providers::parser_revision(*provider)
+                    && !full =>
+            {
+                load_checkpoint(&searcher, fields, key)
+            }
             _ => Ok(None),
         };
         let parsed = previous.and_then(|previous| {
@@ -1564,6 +1574,7 @@ fn update_with_parser(
                     InputState {
                         provider: *provider,
                         path: path.clone(),
+                        parser_revision: providers::parser_revision(*provider),
                         stamp: input.stamp,
                         checkpointed: true,
                     },

@@ -16,7 +16,7 @@
 //! duplicate-identity counters and rejections (a count and the first few
 //! diagnostics).
 
-use crate::record::{EventType, Provider, Record, digest, millis, session_id, timestamp};
+use crate::record::{EventType, Provider, Record, Role, digest, millis, session_id, timestamp};
 use crate::report::Diagnostic;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags};
@@ -193,6 +193,14 @@ pub fn parse(
     Ok(parsed)
 }
 
+/// Invalidate cached parses when a reader learns a previously ignored format.
+pub fn parser_revision(provider: Provider) -> u32 {
+    match provider {
+        Provider::Opencode => 1,
+        _ => 0,
+    }
+}
+
 fn text(value: &Value) -> String {
     if let Some(s) = value.as_str() {
         return s.into();
@@ -272,15 +280,27 @@ fn file_paths(tool: &str, args: &Value) -> Vec<String> {
 /// when a writer replaces a row, except when it deletes and re-inserts the
 /// table's last row. A same-size `UPDATE` that keeps `time_updated` is not
 /// detected; a full import reparses it.
-fn opencode_fingerprints(db: &Connection) -> Result<BTreeMap<String, String>> {
+fn opencode_fingerprints(
+    db: &Connection,
+    schema: OpencodeSchema,
+) -> Result<BTreeMap<String, String>> {
     const AGGREGATE: &str = "count(*) || ':' || ifnull(max(time_updated), '') || ':' \
         || total(time_updated) || ':' || total(octet_length(data)) || ':' || total(rowid)";
-    let mut statement = db.prepare(&format!(
-        "SELECT s.id, s.directory, s.parent_id,
+    let sql = match schema {
+        OpencodeSchema::V1 => format!(
+            "SELECT s.id, s.directory, s.parent_id,
            (SELECT {AGGREGATE} FROM part WHERE session_id = s.id),
            (SELECT {AGGREGATE} FROM message WHERE session_id = s.id)
          FROM session s"
-    ))?;
+        ),
+        OpencodeSchema::V2 => format!(
+            "SELECT s.id, s.directory, s.parent_id,
+               (SELECT {AGGREGATE} || ':' || total(seq) FROM session_message WHERE session_id = s.id),
+               'v2'
+             FROM session_v2 s"
+        ),
+    };
+    let mut statement = db.prepare(&sql)?;
     let mut rows = statement.query([])?;
     let mut sessions = BTreeMap::new();
     while let Some(row) = rows.next()? {
@@ -291,6 +311,39 @@ fn opencode_fingerprints(db: &Connection) -> Result<BTreeMap<String, String>> {
         sessions.insert(row.get(0)?, digest(&columns));
     }
     Ok(sessions)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpencodeSchema {
+    V1,
+    V2,
+}
+
+impl OpencodeSchema {
+    fn ordered_sql(self) -> &'static str {
+        match self {
+            Self::V1 => {
+                "SELECT p.rowid FROM part p JOIN message m ON p.message_id = m.id
+                 WHERE p.session_id = ?1 ORDER BY p.time_created, p.id"
+            }
+            Self::V2 => "SELECT rowid FROM session_message WHERE session_id = ?1 ORDER BY seq",
+        }
+    }
+
+    fn payload_sql(self) -> &'static str {
+        match self {
+            Self::V1 => {
+                "SELECT p.id, p.data, p.time_created, m.data, s.directory, s.parent_id, m.id
+                 FROM part p JOIN message m ON p.message_id = m.id
+                 JOIN session s ON p.session_id = s.id WHERE p.rowid = ?1"
+            }
+            Self::V2 => {
+                "SELECT m.id, m.data, m.time_created, m.type, s.directory, s.parent_id, m.id, m.seq
+                 FROM session_message m JOIN session_v2 s ON m.session_id = s.id
+                 WHERE m.rowid = ?1"
+            }
+        }
+    }
 }
 
 /// Read changed sessions, verifying their saved prefixes before emitting a suffix.
@@ -304,102 +357,124 @@ fn opencode(
     let mut db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     let tx = db.transaction()?;
+    let has_table = |name: &str| -> Result<bool> {
+        Ok(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )?)
+    };
+    let mut schemas = Vec::new();
+    if has_table("session")? && has_table("message")? && has_table("part")? {
+        schemas.push(OpencodeSchema::V1);
+    }
+    if has_table("session_v2")? && has_table("session_message")? {
+        schemas.push(OpencodeSchema::V2);
+    }
+    ensure!(!schemas.is_empty(), "no supported OpenCode session tables");
+    let mut fingerprints = BTreeMap::new();
+    for &schema in &schemas {
+        for (id, fingerprint) in opencode_fingerprints(&tx, schema)? {
+            // OpenCode's v1 migration copies session IDs and keeps legacy rows.
+            // Prefer the v2 copy so migrated transcripts are not indexed twice.
+            fingerprints.insert(id, (schema, fingerprint));
+        }
+    }
     // Sort row IDs rather than full JSON payloads, which can spill to temporary
     // files. Read each payload afterward, within the same snapshot.
-    let mut ordered = tx.prepare(
-        "SELECT p.rowid FROM part p JOIN message m ON p.message_id = m.id
-         WHERE p.session_id = ?1 ORDER BY p.time_created, p.id",
-    )?;
-    let mut statement = tx.prepare(
-        "SELECT p.id, p.data, p.time_created, m.data, s.directory, s.parent_id, m.id
-         FROM part p JOIN message m ON p.message_id = m.id
-         JOIN session s ON p.session_id = s.id
-         WHERE p.rowid = ?1",
-    )?;
     let mut sessions = BTreeMap::new();
     let mut changed = Vec::new();
-    for (id, fingerprint) in opencode_fingerprints(&tx)? {
-        let old = previous.and_then(|sessions| sessions.get(&id));
-        let session = match old {
-            Some(old) if old.fingerprint == fingerprint => old.clone(),
-            _ => {
-                let mut rows = ordered.query([&id])?;
-                let mut hasher = Sha256::new();
-                let mut count = 0;
-                let mut session = SqliteSession {
-                    fingerprint,
-                    records: 0,
-                    diagnostics: Diagnostics::default(),
-                    prefixes: Vec::new(),
-                };
-                if let Some(old) = old {
-                    for prefix in &old.prefixes {
-                        let verified_hasher = hasher.clone();
-                        while count < prefix.rows {
-                            let Some(row) = rows.next()? else { break };
-                            let mut payload = statement.query([row.get::<_, i64>(0)?])?;
-                            let row = payload
-                                .next()?
-                                .context("OpenCode part missing from snapshot")?;
-                            hash_opencode_row(&mut hasher, row)?;
-                            count += 1;
-                        }
-                        if count != prefix.rows
-                            || hex::encode(hasher.clone().finalize()) != prefix.hash
-                        {
-                            // A growing session can also contain edits, removals
-                            // or parts inserted before the old end. Restart at
-                            // the last verified prefix, before staging records.
-                            hasher = verified_hasher;
-                            count = session.prefixes.last().map_or(0, |p| p.rows);
-                            drop(rows);
-                            rows = ordered.query([&id])?;
-                            for _ in 0..count {
-                                rows.next()?
-                                    .context("OpenCode prefix missing from snapshot")?;
+    for schema in schemas {
+        let mut ordered = tx.prepare(schema.ordered_sql())?;
+        let mut statement = tx.prepare(schema.payload_sql())?;
+        for (id, (_, fingerprint)) in fingerprints.iter().filter(|(_, (s, _))| *s == schema) {
+            let old = previous.and_then(|sessions| sessions.get(id));
+            let session = match old {
+                Some(old) if &old.fingerprint == fingerprint => old.clone(),
+                _ => {
+                    let mut rows = ordered.query([&id])?;
+                    let mut hasher = Sha256::new();
+                    let mut count = 0;
+                    let mut session = SqliteSession {
+                        fingerprint: fingerprint.clone(),
+                        records: 0,
+                        diagnostics: Diagnostics::default(),
+                        prefixes: Vec::new(),
+                    };
+                    if let Some(old) = old {
+                        for prefix in &old.prefixes {
+                            let verified_hasher = hasher.clone();
+                            while count < prefix.rows {
+                                let Some(row) = rows.next()? else { break };
+                                let mut payload = statement.query([row.get::<_, i64>(0)?])?;
+                                let row = payload
+                                    .next()?
+                                    .context("OpenCode row missing from snapshot")?;
+                                hash_opencode_row(&mut hasher, row)?;
+                                count += 1;
                             }
-                            break;
+                            if count != prefix.rows
+                                || hex::encode(hasher.clone().finalize()) != prefix.hash
+                            {
+                                // A growing session can also contain edits, removals
+                                // or parts inserted before the old end. Restart at
+                                // the last verified prefix, before staging records.
+                                hasher = verified_hasher;
+                                count = session.prefixes.last().map_or(0, |p| p.rows);
+                                drop(rows);
+                                rows = ordered.query([&id])?;
+                                for _ in 0..count {
+                                    rows.next()?
+                                        .context("OpenCode prefix missing from snapshot")?;
+                                }
+                                break;
+                            }
+                            session.records = prefix.records;
+                            session.diagnostics = prefix.diagnostics.clone();
+                            session.prefixes.push(prefix.clone());
                         }
-                        session.records = prefix.records;
-                        session.diagnostics = prefix.diagnostics.clone();
-                        session.prefixes.push(prefix.clone());
+                        if old.prefixes.is_empty() || session.prefixes.len() != old.prefixes.len() {
+                            changed.push(SessionSuffix {
+                                native_session: id.clone(),
+                                from_sequence: session.records as u64,
+                            });
+                        }
                     }
-                    if old.prefixes.is_empty() || session.prefixes.len() != old.prefixes.len() {
-                        changed.push(SessionSuffix {
-                            native_session: id.clone(),
-                            from_sequence: session.records as u64,
-                        });
+                    // Keep checkpoints every 64 rows and at the end, rather than
+                    // accumulating one checkpoint for every small append.
+                    const PREFIX_ROWS: usize = 64;
+                    if session
+                        .prefixes
+                        .last()
+                        .is_some_and(|p| p.rows % PREFIX_ROWS != 0)
+                    {
+                        session.prefixes.pop();
                     }
-                }
-                // Keep checkpoints every 64 rows and at the end, rather than
-                // accumulating one checkpoint for every small append.
-                const PREFIX_ROWS: usize = 64;
-                if session
-                    .prefixes
-                    .last()
-                    .is_some_and(|p| p.rows % PREFIX_ROWS != 0)
-                {
-                    session.prefixes.pop();
-                }
-                while let Some(row) = rows.next()? {
-                    let mut payload = statement.query([row.get::<_, i64>(0)?])?;
-                    let row = payload
-                        .next()?
-                        .context("OpenCode part missing from snapshot")?;
-                    hash_opencode_row(&mut hasher, row)?;
-                    count += 1;
-                    opencode_part(path, &id, row, &mut session, emit)?;
-                    if count % PREFIX_ROWS == 0 {
+                    while let Some(row) = rows.next()? {
+                        let mut payload = statement.query([row.get::<_, i64>(0)?])?;
+                        let row = payload
+                            .next()?
+                            .context("OpenCode row missing from snapshot")?;
+                        hash_opencode_row(&mut hasher, row)?;
+                        count += 1;
+                        match schema {
+                            OpencodeSchema::V1 => opencode_part(path, id, row, &mut session, emit)?,
+                            OpencodeSchema::V2 => {
+                                opencode_v2_message(path, id, row, &mut session, emit)?
+                            }
+                        }
+                        if count % PREFIX_ROWS == 0 {
+                            session.save_prefix(count, &hasher);
+                        }
+                    }
+                    if session.prefixes.last().is_none_or(|p| p.rows != count) {
                         session.save_prefix(count, &hasher);
                     }
+                    session
                 }
-                if session.prefixes.last().is_none_or(|p| p.rows != count) {
-                    session.save_prefix(count, &hasher);
-                }
-                session
-            }
-        };
-        sessions.insert(id, session);
+            };
+            sessions.insert(id.clone(), session);
+        }
     }
     let replace = match previous {
         None => Replace::All,
@@ -432,7 +507,7 @@ fn hash_opencode_row(hasher: &mut Sha256, row: &rusqlite::Row) -> Result<()> {
     use rusqlite::types::ValueRef;
     // Include message and session metadata as well as parts: changing a role,
     // workspace or parent changes records even when part JSON is untouched.
-    for column in 0..7 {
+    for column in 0..row.as_ref().column_count() {
         let value = row.get_ref(column)?;
         hasher.update([value.data_type() as u8]);
         match value {
@@ -528,6 +603,163 @@ fn opencode_part(
         record.sequence += 1;
         emit(&record)?;
         session.records += 1;
+    }
+    Ok(())
+}
+
+fn opencode_v2_message(
+    path: &Path,
+    native_session: &str,
+    row: &rusqlite::Row,
+    session: &mut SqliteSession,
+    sink: &mut impl FnMut(&Record) -> Result<()>,
+) -> Result<()> {
+    let id: String = row.get(0)?;
+    let data: String = row.get(1)?;
+    let kind: String = row.get(3)?;
+    // The discriminator lives in its own column, outside the JSON payload.
+    let mut value = match serde_json::from_str::<serde_json::Map<String, Value>>(&data) {
+        Ok(value) => Value::Object(value),
+        Err(error) => {
+            session
+                .diagnostics
+                .push(Diagnostic::new(path, format!("message {id}: {error}")));
+            return Ok(());
+        }
+    };
+    value["type"] = kind.clone().into();
+    let mut base = Record::new(
+        Provider::Opencode,
+        native_session,
+        &id,
+        EventType::Message,
+        path,
+    );
+    base.provider_message_id = Some(id.clone());
+    base.occurred_at = millis(row.get(2)?)?;
+    base.workspace = row.get::<_, Option<String>>(4)?.unwrap_or_default();
+    base.parent_session_id = row
+        .get::<_, Option<String>>(5)?
+        .map(|p| session_id(Provider::Opencode, &p));
+    base.is_subagent = base.parent_session_id.is_some();
+    base.role = match kind.as_str() {
+        "user" => Some(Role::User),
+        "assistant" => Some(Role::Assistant),
+        "system" | "synthetic" | "skill" => Some(Role::System),
+        _ => None,
+    };
+    let mut emit = |selector: &str,
+                    event_type: EventType,
+                    body: String,
+                    structured: Value,
+                    files: Vec<String>|
+     -> Result<()> {
+        let mut record = base.clone();
+        record.event_id = digest(&[
+            "event",
+            &record.session_id,
+            &id,
+            event_type.as_str(),
+            selector,
+        ]);
+        record.event_type = event_type;
+        record.text = body;
+        record.structured_content = structured;
+        record.files = files;
+        record.sequence = session.records as u64;
+        sink(&record)?;
+        session.records += 1;
+        Ok(())
+    };
+    match kind.as_str() {
+        "user" | "system" | "synthetic" | "skill" => {
+            emit(
+                "",
+                EventType::Message,
+                text(&value["text"]),
+                value,
+                Vec::new(),
+            )?;
+        }
+        "assistant" => {
+            let visible = text(&value["content"]);
+            let mut body = vec![visible.as_str()];
+            strings(&value["error"], &mut body);
+            emit(
+                "",
+                EventType::Message,
+                body.into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                value.clone(),
+                Vec::new(),
+            )?;
+            for (index, part) in value["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if part["type"] != "tool" {
+                    continue;
+                }
+                let tool = part["name"].as_str().unwrap_or("tool");
+                let args = &part["state"]["input"];
+                // Tool IDs survive streaming updates and content-array insertions.
+                let selector = part["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("index:{index}"));
+                emit(
+                    &selector,
+                    EventType::ToolCall,
+                    format!("{tool} {}", arguments(args)),
+                    part.clone(),
+                    file_paths(tool, args),
+                )?;
+                let content = text(&part["state"]["content"]);
+                let mut output = vec![content.as_str()];
+                strings(&part["state"]["error"], &mut output);
+                let output = output
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !output.is_empty() {
+                    emit(
+                        &selector,
+                        EventType::ToolOutput,
+                        output,
+                        Value::Null,
+                        file_paths(tool, args),
+                    )?;
+                }
+            }
+        }
+        "shell" => {
+            emit(
+                "",
+                EventType::ToolCall,
+                text(&value["command"]),
+                value.clone(),
+                Vec::new(),
+            )?;
+            if let Some(output) = value["output"]["output"].as_str() {
+                emit(
+                    "",
+                    EventType::ToolOutput,
+                    output.into(),
+                    Value::Null,
+                    Vec::new(),
+                )?;
+            }
+        }
+        _ => {
+            let mut body = Vec::new();
+            strings(&value, &mut body);
+            emit("", EventType::Metadata, body.join("\n"), value, Vec::new())?;
+        }
     }
     Ok(())
 }
