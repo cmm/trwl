@@ -39,7 +39,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use ort::{
-    ep::{ExecutionProvider, ExecutionProviderDispatch},
+    ep::{ArbitrarilyConfigurableExecutionProvider, ExecutionProvider, ExecutionProviderDispatch},
     session::Session,
     value::Tensor,
 };
@@ -463,7 +463,15 @@ impl Executor {
         if intel_render_device_available() && ort::ep::OpenVINO::default().is_available()? {
             providers.push((
                 Accelerator::OpenvinoGpu,
-                ort::ep::OpenVINO::default().with_device_type("GPU").build(),
+                ort::ep::OpenVINO::default()
+                    .with_device_type("GPU")
+                    // Intel's OpenCL compiler can crash in
+                    // SPIRV::OCLToSPIRVBase during parallel compilation.
+                    .with_arbitrary_config(
+                        "load_config",
+                        json!({"GPU": {"COMPILATION_NUM_THREADS": "1"}}).to_string(),
+                    )
+                    .build(),
             ));
         }
         for (device, provider) in providers {

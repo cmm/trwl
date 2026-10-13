@@ -107,6 +107,9 @@ impl Client {
             });
         }
         let child = process.spawn().context("starting embedding worker")?;
+        // Command retains its configured stdin after spawning. Close our copy
+        // of the child's socket so an initialization crash delivers EOF.
+        drop(process);
         let mut client = Self {
             child,
             stream: BufReader::new(stream),
@@ -153,7 +156,7 @@ impl Client {
             ),
             "embedding worker cancelled: {status}"
         );
-        eprintln!("trwl: GPU embedding worker failed: {error:#}; finishing on CPU");
+        eprintln!("trwl: GPU embedding worker failed ({status}): {error:#}; finishing on CPU");
         Ok(())
     }
 
@@ -397,7 +400,14 @@ mod tests {
     fn initialization_crash_and_timeout_fall_back_but_errors_propagate() {
         let dir = tempfile::tempdir().unwrap();
         for mode in ["cpu", "init-crash", "init-hang"] {
+            let started = Instant::now();
             assert!(start(mode, dir.path()).unwrap().is_none(), "{mode}");
+            if mode == "init-crash" {
+                assert!(
+                    started.elapsed() < Duration::from_secs(1),
+                    "a dead worker must not wait for the two-second initialization timeout"
+                );
+            }
             assert!(!is_locked(dir.path(), "gpu.lock").unwrap());
         }
         assert!(start("init-error", dir.path()).is_err());
