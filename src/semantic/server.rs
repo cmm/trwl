@@ -252,6 +252,11 @@ impl Client {
                         let mut child = command.spawn().context("starting inference server")?;
                         loop {
                             if let Ok(stream) = connect(&directory, INITIALIZE) {
+                                // The updater can outlive many idle-expired servers.
+                                // Dropping Child would leave their exit statuses unreaped.
+                                thread::spawn(move || {
+                                    let _ = child.wait();
+                                });
                                 break stream;
                             }
                             if let Some(status) = child.try_wait()? {

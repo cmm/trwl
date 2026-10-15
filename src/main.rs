@@ -95,7 +95,10 @@ fn start_daemon(config: &Config) -> Result<()> {
             Ok(())
         });
     }
-    process.spawn()?;
+    let mut child = process.spawn()?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
