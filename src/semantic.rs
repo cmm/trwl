@@ -1278,7 +1278,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "requires the built-in model and ONNX Runtime"]
+    #[ignore = "requires the built-in model and ONNX Runtime with the OpenVINO provider"]
     fn builtin_providers_produce_equivalent_normalized_embeddings() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::edit(dir.path(), |doc| {

@@ -36,9 +36,8 @@ rustPlatform.buildRustPackage {
   };
   cargoLock.lockFile = ./Cargo.lock;
 
-  # Ignored tests need the built-in model and ONNX Runtime, which the
-  # environment below provides.
-  checkFlags = [ "--include-ignored" ];
+  # The ignored provider-equivalence test needs OpenVINO, which the ONNX
+  # Runtime package in stable nixpkgs does not include.
 
   doInstallCheck = true;
   nativeBuildInputs = [ makeWrapper ];
