@@ -1,0 +1,53 @@
+name: Update nixpkgs
+
+on:
+  schedule:
+    - cron: '0 6 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: update-nixpkgs
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
+      - name: Update the stable nixpkgs input
+        run: python3 .github/scripts/update-nixpkgs.py
+      - name: Open an update PR and run CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- flake.nix flake.lock; then
+            echo 'nixpkgs is already current.'
+            exit 0
+          fi
+          branch=automation/nixpkgs
+          git switch --force-create "$branch"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add flake.nix flake.lock
+          git commit -m 'Update nixpkgs to the latest stable NixOS release'
+          git push --force-with-lease origin "HEAD:refs/heads/$branch"
+          pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --base main \
+            --state open --json number --jq '.[0].number // empty')
+          if [[ -z "$pr" ]]; then
+            gh pr create --repo "$GITHUB_REPOSITORY" --head "$branch" --base main \
+              --title 'Update nixpkgs to the latest stable NixOS release' \
+              --body 'Monthly update of the nixpkgs lock and stable release branch. Auto-merge follows a successful regression run.'
+          fi
+          # PRs created with GITHUB_TOKEN do not trigger pull_request workflows.
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"

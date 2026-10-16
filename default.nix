@@ -1,5 +1,6 @@
 {
   pkgsCuda,
+  onnxruntime,
   lib,
   rustPlatform,
   versionCheckHook,
@@ -11,10 +12,11 @@
   callPackage,
   trwlEmbeddingModelSource,
   makeWrapper,
+  enableGpu ? true,
 }:
 let
   model = callPackage ./model.nix { source = trwlEmbeddingModelSource; };
-  cudaRuntime = pkgsCuda.onnxruntime;
+  runtime = if enableGpu then pkgsCuda.onnxruntime else onnxruntime;
   intelRuntimeSupported = lib.meta.availableOn stdenv.hostPlatform intel-compute-runtime;
 in
 rustPlatform.buildRustPackage {
@@ -46,11 +48,11 @@ rustPlatform.buildRustPackage {
     git
     time
   ];
-  buildInputs = [ cudaRuntime ];
-  env.ORT_LIB_PATH = "${cudaRuntime}/lib";
+  buildInputs = [ runtime ];
+  env.ORT_LIB_PATH = "${runtime}/lib";
   env.TRWL_SEMANTIC_MODEL_DIR = model;
 
-  postInstall = lib.optionalString intelRuntimeSupported ''
+  postInstall = lib.optionalString (enableGpu && intelRuntimeSupported) ''
     wrapProgram "$out/bin/trwl" \
       --set-default OCL_ICD_VENDORS "${intel-compute-runtime}/etc/OpenCL/vendors"
   '';
@@ -68,7 +70,7 @@ rustPlatform.buildRustPackage {
   passthru = {
     inherit model;
     inherit (model) modelMetadata;
-    onnxruntime = cudaRuntime;
+    onnxruntime = runtime;
   };
 
   meta = {

@@ -1,0 +1,14 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    # Cargo's constraints also bound incompatible 0.x and prerelease upgrades.
+    versioning-strategy: lockfile-only
+    allow:
+      - dependency-type: all
+    groups:
+      cargo:
+        patterns:
+          - "*"

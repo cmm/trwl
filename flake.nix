@@ -2,7 +2,7 @@
   description = "Search coding agent history";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     embedding-model = {
       url = "git+https://huggingface.co/intfloat/multilingual-e5-small?ref=main";
       flake = false;
@@ -51,6 +51,42 @@
         {
           trwl = app;
           default = app;
+        }
+      );
+
+      checks = forAllSystems (
+        system:
+        let
+          pkgs = pkgsFor system;
+          trwl = (packageFor system).override { enableGpu = false; };
+          python = pkgs.python3.withPackages (p: [
+            p.numpy
+            p.onnxruntime
+            p.tokenizers
+          ]);
+        in
+        {
+          regression =
+            pkgs.runCommand "trwl-regression"
+              {
+                nativeBuildInputs = [
+                  python
+                  pkgs.git
+                  pkgs.time
+                ];
+              }
+              ''
+                # The harness writes artifacts beside tests and selects CPU inference.
+                cp -r ${./tests} tests
+                if ! python3 tests/e2e.py \
+                  --binary ${pkgs.lib.getExe trwl} \
+                  --model-dir ${trwl.model}; then
+                  cat .cache/trwl-e2e-*/report.json
+                  exit 1
+                fi
+                mkdir -p "$out"
+                cp .cache/trwl-e2e-*/report.json "$out/report.json"
+              '';
         }
       );
 

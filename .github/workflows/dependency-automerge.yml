@@ -1,0 +1,63 @@
+name: Dependency auto-merge
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      (github.event.workflow_run.event == 'pull_request' ||
+       github.event.workflow_run.event == 'workflow_dispatch') &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    steps:
+      # This privileged workflow never checks out or executes PR code.
+      - name: Merge a tested dependency update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          TESTED_HEAD: ${{ github.event.workflow_run.head_sha }}
+          TESTED_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$PR_NUMBER" && "$RUN_EVENT" == 'workflow_dispatch' && "$TESTED_BRANCH" == 'automation/nixpkgs' ]]; then
+            PR_NUMBER=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$TESTED_BRANCH" --base main \
+              --state open --json number --jq 'if length == 1 then .[0].number else empty end')
+          fi
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo 'No pull request associated with this run.'
+            exit 0
+          fi
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")
+          if ! jq -e --arg repo "$GITHUB_REPOSITORY" --arg sha "$TESTED_HEAD" '
+            .state == "open" and
+            .base.ref == "main" and
+            .head.repo.full_name == $repo and
+            .head.sha == $sha
+          ' <<< "$pr" > /dev/null; then
+            echo 'Not the tested revision of an open PR to main.'
+            exit 0
+          fi
+          author=$(jq -r '.user.login' <<< "$pr")
+          branch=$(jq -r '.head.ref' <<< "$pr")
+          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --jq '.[].filename' | sort)
+          if [[ "$author" == 'dependabot[bot]' && "$files" == 'Cargo.lock' ]]; then
+            echo 'Tested Cargo lockfile update.'
+          elif [[ "$author" == 'github-actions[bot]' && "$branch" == 'automation/nixpkgs' && \
+            ( "$files" == 'flake.lock' || "$files" == $'flake.lock\nflake.nix' ) ]]; then
+            echo 'Tested nixpkgs update.'
+          else
+            echo 'This PR needs a manual merge.'
+            exit 0
+          fi
+          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --auto --squash --match-head-commit "$TESTED_HEAD"
