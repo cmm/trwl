@@ -4,7 +4,7 @@ updates:
     directory: /
     schedule:
       interval: monthly
-    # Cargo's constraints also bound incompatible 0.x and prerelease upgrades.
+    # Keep lockfile updates within Cargo.toml version requirements.
     versioning-strategy: lockfile-only
     allow:
       - dependency-type: all

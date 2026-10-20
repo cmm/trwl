@@ -13,15 +13,16 @@ hex = "0.4"
 gix-discover = { version = "0.57", features = ["sha1", "sha256"] }
 globset = "0.4"
 libc = "0.2"
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "api-24", "cuda", "openvino"] }
+# Release candidates can change the API incompatibly; upgrade ort explicitly.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "api-24", "cuda", "openvino"] }
 rmp-serde = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-tantivy = { version = "0.26", default-features = false, features = ["mmap", "lz4-compression"] }
+sha2 = "0.11.1"
+tantivy = { version = "0.27.0", default-features = false, features = ["mmap", "lz4-compression"] }
 tempfile = "3"
-tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
-toml_edit = { version = "0.22", features = ["serde"] }
-ureq = { version = "2", features = ["json"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
+toml_edit = { version = "0.25.17", features = ["serde"] }
+ureq = { version = "3.4.2", features = ["json"] }
 walkdir = "2"

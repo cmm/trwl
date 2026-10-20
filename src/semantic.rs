@@ -39,6 +39,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use ort::{
+    environment::Environment,
     ep::{ArbitrarilyConfigurableExecutionProvider, ExecutionProvider, ExecutionProviderDispatch},
     session::Session,
     value::Tensor,
@@ -419,26 +420,16 @@ impl Executor {
         if selection.directory.is_some() {
             Ok(Self::Shared(server::Client::new(&config.root, selection)))
         } else {
-            Self::new(selection)
-        }
-    }
-
-    fn new(selection: &Selection) -> Result<Self> {
-        if let Some(directory) = &selection.directory {
-            load_runtime()?;
-            let session = builtin_session(&directory.join("onnx/model.onnx"), None)
-                .with_context(|| format!("loading model in {}", directory.display()))?;
-            Ok(Self::Builtin {
-                session,
-                tokenizer: Box::new(inference_tokenizer(directory)?),
-            })
-        } else {
-            let agent = ureq::AgentBuilder::new()
-                .redirects(0)
-                .timeout_connect(HTTP_CONNECT_TIMEOUT)
-                .timeout_read(HTTP_IO_TIMEOUT)
-                .timeout_write(HTTP_IO_TIMEOUT)
-                .build();
+            let agent = ureq::Agent::config_builder()
+                .max_redirects(0)
+                .proxy(None)
+                .timeout_connect(Some(HTTP_CONNECT_TIMEOUT))
+                .timeout_send_request(Some(HTTP_IO_TIMEOUT))
+                .timeout_send_body(Some(HTTP_IO_TIMEOUT))
+                .timeout_recv_response(Some(HTTP_IO_TIMEOUT))
+                .timeout_recv_body(Some(HTTP_IO_TIMEOUT))
+                .build()
+                .into();
             Ok(Self::Http {
                 agent,
                 endpoint: format!("{}/embeddings", selection.executor.trim_end_matches('/')),
@@ -448,19 +439,28 @@ impl Executor {
         }
     }
 
+    fn builtin(directory: &Path, environment: &Environment) -> Result<Self> {
+        let session = builtin_session(environment, &directory.join("onnx/model.onnx"), None)
+            .with_context(|| format!("loading model in {}", directory.display()))?;
+        Ok(Self::Builtin {
+            session,
+            tokenizer: Box::new(inference_tokenizer(directory)?),
+        })
+    }
+
     fn accelerated(selection: &Selection) -> Result<Option<(Self, Accelerator)>> {
         let directory = selection
             .directory
             .as_ref()
             .context("worker requires a built-in model")?;
-        load_runtime()?;
+        let environment = load_runtime()?;
         let tokenizer = inference_tokenizer(directory)?;
         // GetAvailableProviders does not initialize CUDA.
         let mut providers = Vec::new();
-        if ort::ep::CUDA::default().is_available()? {
+        if ort::ep::CUDA::is_available()? {
             providers.push((Accelerator::Cuda, ort::ep::CUDA::default().build()));
         }
-        if intel_render_device_available() && ort::ep::OpenVINO::default().is_available()? {
+        if intel_render_device_available() && ort::ep::OpenVINO::is_available()? {
             providers.push((
                 Accelerator::OpenvinoGpu,
                 ort::ep::OpenVINO::default()
@@ -475,7 +475,11 @@ impl Executor {
             ));
         }
         for (device, provider) in providers {
-            match builtin_session(&directory.join("onnx/model.onnx"), Some(provider)) {
+            match builtin_session(
+                &environment,
+                &directory.join("onnx/model.onnx"),
+                Some(provider),
+            ) {
                 Ok(session) => {
                     return Ok(Some((
                         Self::Builtin {
@@ -508,15 +512,17 @@ impl Executor {
                 model,
                 token,
             } => {
-                let mut request = agent.post(endpoint);
+                let mut request = agent.post(endpoint.as_str());
                 if let Some(token) = token {
-                    request = request.set("Authorization", &format!("Bearer {token}"));
+                    request = request.header("Authorization", format!("Bearer {token}"));
                 }
-                let response: Value = request
+                let mut response = request
                     .send_json(json!({"model": model, "input": texts, "encoding_format": "float"}))
-                    .context("HTTP embedding request failed")?
-                    .into_json()
-                    .context("invalid embedding response JSON")?;
+                    .context("HTTP embedding request failed")?;
+                // Embedding dimensions are server-defined; do not impose read_json's size limit.
+                let response: Value =
+                    serde_json::from_reader(response.body_mut().with_config().reader())
+                        .context("invalid embedding response JSON")?;
                 http_vectors(&response, texts.len())?
             }
             Self::Builtin {
@@ -640,13 +646,12 @@ impl Accelerator {
     }
 }
 
-fn load_runtime() -> Result<()> {
+fn load_runtime() -> Result<Environment> {
     let runtime = std::env::var("ORT_DYLIB_PATH")
         .ok()
         .or_else(|| option_env!("ORT_LIB_PATH").map(|path| format!("{path}/libonnxruntime.so")))
         .context("ONNX runtime library path is unavailable")?;
-    ort::init_from(&runtime)?.commit();
-    Ok(())
+    Ok(ort::init_from(&runtime)?.build()?)
 }
 
 fn inference_tokenizer(directory: &Path) -> Result<Tokenizer> {
@@ -668,8 +673,12 @@ fn inference_tokenizer(directory: &Path) -> Result<Tokenizer> {
     Ok(tokenizer)
 }
 
-fn builtin_session(model: &Path, provider: Option<ExecutionProviderDispatch>) -> Result<Session> {
-    let mut builder = Session::builder()?
+fn builtin_session(
+    environment: &Environment,
+    model: &Path,
+    provider: Option<ExecutionProviderDispatch>,
+) -> Result<Session> {
+    let mut builder = Session::builder(environment)?
         .with_intra_threads(INFERENCE_THREADS)
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .with_inter_threads(1) // Execute graph nodes sequentially; parallelize each node.
@@ -1287,7 +1296,9 @@ pub(crate) mod tests {
         })
         .unwrap();
         let selection = Selection::from_config(&config).unwrap();
-        let mut executor = Executor::new(&selection).unwrap();
+        let environment = load_runtime().unwrap();
+        let mut executor =
+            Executor::builtin(selection.directory.as_ref().unwrap(), &environment).unwrap();
         let model = selection
             .directory
             .as_ref()
@@ -1296,6 +1307,7 @@ pub(crate) mod tests {
         let texts = ["database connection pool".into(), "日本語の検索".into()];
         let cpu = executor.embed(&texts, QUERY_PREFIX).unwrap();
         let session = builtin_session(
+            &environment,
             &model,
             Some(ort::ep::OpenVINO::default().with_device_type("CPU").build()),
         )
@@ -1322,6 +1334,7 @@ pub(crate) mod tests {
         // construct a CPU session that the worker would report as accelerated.
         assert!(
             builtin_session(
+                &environment,
                 &model,
                 Some(
                     ort::ep::OpenVINO::default()

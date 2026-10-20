@@ -400,6 +400,8 @@ pub(crate) fn run(root: &Path) -> Result<()> {
     let listener = UnixListener::bind(path.join("socket"))?;
     listener.set_nonblocking(true)?;
     fs::write(path.join("pid"), std::process::id().to_string())?;
+    // ONNX Runtime permits one environment per process, shared across model changes.
+    let mut environment = None;
     let mut executor: Option<(Selection, Executor)> = None;
     let watchdog = Watchdog::new();
     let mut last = Instant::now();
@@ -438,14 +440,18 @@ pub(crate) fn run(root: &Path) -> Result<()> {
                 }
                 Request::Select(selection) => {
                     let initialized = (|| -> Result<()> {
-                        ensure!(
-                            selection.directory.is_some(),
-                            "inference server requires a built-in model"
-                        );
+                        let directory = selection
+                            .directory
+                            .as_ref()
+                            .context("inference server requires a built-in model")?;
                         if executor.as_ref().is_none_or(|(old, _)| old != &selection) {
                             let _deadline = watchdog.arm(INITIALIZE);
                             executor = None;
-                            let loaded = Executor::new(&selection)?;
+                            let environment = match &environment {
+                                Some(environment) => environment,
+                                None => environment.insert(super::load_runtime()?),
+                            };
+                            let loaded = Executor::builtin(directory, environment)?;
                             executor = Some((selection, loaded));
                         }
                         Ok(())
