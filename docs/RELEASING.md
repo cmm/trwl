@@ -44,7 +44,10 @@ After CI succeeds, a separate workflow enables squash auto-merge for:
 
 It checks that the PR still has the tested head commit. GitHub's required
 checks control when the merge can complete if the base branch has moved.
-The auto-merge workflow does not check out PR code.
+The dependency workflow does not check out PR code. If CI fails or times out
+for either kind of dependency PR, it posts a comment mentioning the repository
+owner and linking the failed run. It posts at most one failure notification per
+head commit and ignores results for commits the PR no longer uses.
 
 ## Releases
 
