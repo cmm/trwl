@@ -8,6 +8,7 @@ additional dependencies for the [HTTP model server](#http-embeddings).
 
 - [Cases and formats](#cases-and-formats)
 - [HTTP embeddings](#http-embeddings)
+- [Manual GPU check](#manual-gpu-check)
 - [Results](#results)
 - [Performance comparison](#performance-comparison)
   - [Semantic measurements](#semantic-measurements)
@@ -111,6 +112,73 @@ and endpoint during fills, and stops/restarts the updater before publication.
 Both model names use E5 inference; recorded request inputs verify that each
 selection embeds every document. The restart check interrupts inference and
 verifies that the next updater completes the fill.
+
+## Manual GPU check
+
+`gpu.py` is an explicit hardware check, separate from the default e2e run and CI.
+The ordinary `semantic-device-policy` case checks worker execution and accepts
+CPU. This command fails if the requested device is unavailable, the worker falls
+back to CPU, or no model operation runs on the requested provider. `--device`
+asserts the device; it does not change the executable's device selection.
+
+For an already-built package containing the requested execution provider,
+using its compiled-in model and runtime:
+
+```sh
+python3 tests/gpu.py --binary /path/to/gpu-package/bin/trwl --device openvino-gpu
+```
+
+For a Cargo-built binary, supply the model and ONNX Runtime library:
+
+```sh
+python3 tests/gpu.py --binary /path/to/target/release/trwl --device cuda \
+  --model-dir /path/to/model \
+  --ort-dylib /path/to/libonnxruntime.so
+```
+
+Replace the paths with existing files/directories. For Intel GPU checking, use
+`--device openvino-gpu`; add `--opencl-vendors /path/to/OpenCL/vendors` when an
+explicit OpenCL ICD location is needed. `--ort-dylib` and `--opencl-vendors` set
+`ORT_DYLIB_PATH` and `OCL_ICD_VENDORS` in both cases. The cases do not inherit
+those variables or other runtime overrides from the invoking shell.
+
+For Intel inference, the runtime must include OpenVINO. To use a different
+nixpkgs input, set `GPU_NIXPKGS` to its flake reference. Build and test in the
+same environment; this leaves `flake.lock` unchanged:
+
+```sh
+nix develop \
+  --override-input nixpkgs "$GPU_NIXPKGS" \
+  --no-write-lock-file -c bash -euc '
+    cargo build --locked
+    python3 tests/gpu.py --binary target/debug/trwl --device openvino-gpu \
+      --model-dir "$TRWL_SEMANTIC_MODEL_DIR" \
+      --ort-dylib "$ORT_LIB_PATH/libonnxruntime.so" \
+      --opencl-vendors "$OCL_ICD_VENDORS"
+  '
+```
+
+The harness imports nine fixture documents into separate CPU/GPU workspaces,
+rebuilds embeddings, and checks ready semantic retrieval of the paraphrase target
+among the top three results. The CPU baseline sets `TRWL_SEMANTIC_CPU_ONLY=1`;
+the GPU case has no CPU override. Both use the same runtime paths and each
+case's isolated GPU lock directory. Cached vectors must have identical nonempty
+key sets, equal nonempty dimensions, finite normalized GPU values (squared norm
+within `1e-5` of one), and CPU/GPU dot products greater than `0.999`.
+
+Both cases set `TRWL_SEMANTIC_PROFILE_DIR` to an existing artifact directory.
+This opt-in diagnostic profiles the first inference batch of each built-in
+session and flushes the ONNX Runtime trace before returning embeddings, before
+the GPU worker can be killed. The harness reads these traces and requires a
+model-operation kernel event from the requested execution provider; registration,
+initialization and memory transfers do not count. CPU-only execution fails the
+GPU check. Unsupported operations may still run on CPU. Profiling is off when
+the variable is unset.
+
+Commands have timeouts. Artifacts remain under `.cache/assistant/tmp/trwl-gpu-*`,
+including traces and per-case command logs. The command prints the artifact path,
+compared-vector count and minimum CPU/GPU cosine, and exits nonzero on failure
+or missing hardware.
 
 ## Results
 

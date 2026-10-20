@@ -406,6 +406,7 @@ enum Executor {
     Builtin {
         session: Session,
         tokenizer: Box<Tokenizer>,
+        profile_pending: bool,
     },
     Http {
         agent: ureq::Agent,
@@ -440,11 +441,13 @@ impl Executor {
     }
 
     fn builtin(directory: &Path, environment: &Environment) -> Result<Self> {
-        let session = builtin_session(environment, &directory.join("onnx/model.onnx"), None)
-            .with_context(|| format!("loading model in {}", directory.display()))?;
+        let (session, profile_pending) =
+            builtin_session(environment, &directory.join("onnx/model.onnx"), None)
+                .with_context(|| format!("loading model in {}", directory.display()))?;
         Ok(Self::Builtin {
             session,
             tokenizer: Box::new(inference_tokenizer(directory)?),
+            profile_pending,
         })
     }
 
@@ -480,11 +483,12 @@ impl Executor {
                 &directory.join("onnx/model.onnx"),
                 Some(provider),
             ) {
-                Ok(session) => {
+                Ok((session, profile_pending)) => {
                     return Ok(Some((
                         Self::Builtin {
                             session,
                             tokenizer: Box::new(tokenizer),
+                            profile_pending,
                         },
                         device,
                     )));
@@ -526,7 +530,9 @@ impl Executor {
                 http_vectors(&response, texts.len())?
             }
             Self::Builtin {
-                session, tokenizer, ..
+                session,
+                tokenizer,
+                profile_pending,
             } => {
                 let encoded = tokenizer
                     .encode_batch(
@@ -594,6 +600,15 @@ impl Executor {
                         *value /= count as f32;
                     }
                     result.push(vector);
+                }
+                drop(outputs);
+                if *profile_pending {
+                    // Flush the first batch before replying: the GPU worker is
+                    // killed after the build, so session destruction cannot do it.
+                    session
+                        .end_profiling()
+                        .context("flushing ONNX execution profile")?;
+                    *profile_pending = false;
                 }
                 result
             }
@@ -677,7 +692,7 @@ fn builtin_session(
     environment: &Environment,
     model: &Path,
     provider: Option<ExecutionProviderDispatch>,
-) -> Result<Session> {
+) -> Result<(Session, bool)> {
     let mut builder = Session::builder(environment)?
         .with_intra_threads(INFERENCE_THREADS)
         .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -692,7 +707,13 @@ fn builtin_session(
             .with_execution_providers([provider.error_on_failure()])
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    Ok(builder.commit_from_file(model)?)
+    let profile_directory = std::env::var_os("TRWL_SEMANTIC_PROFILE_DIR");
+    if let Some(directory) = &profile_directory {
+        builder = builder
+            .with_profiling(Path::new(directory).join(format!("ort-{}", std::process::id())))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok((builder.commit_from_file(model)?, profile_directory.is_some()))
 }
 
 fn http_vectors(value: &Value, count: usize) -> Result<Vec<Vec<f32>>> {
@@ -1306,7 +1327,7 @@ pub(crate) mod tests {
             .join("onnx/model.onnx");
         let texts = ["database connection pool".into(), "日本語の検索".into()];
         let cpu = executor.embed(&texts, QUERY_PREFIX).unwrap();
-        let session = builtin_session(
+        let (session, profile_pending) = builtin_session(
             &environment,
             &model,
             Some(ort::ep::OpenVINO::default().with_device_type("CPU").build()),
@@ -1314,6 +1335,7 @@ pub(crate) mod tests {
         .unwrap();
         let mut openvino = Executor::Builtin {
             session,
+            profile_pending,
             tokenizer: Box::new(
                 inference_tokenizer(selection.directory.as_ref().unwrap()).unwrap(),
             ),

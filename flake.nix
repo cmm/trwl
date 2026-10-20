@@ -105,6 +105,7 @@
                 pkgs.clippy
               ];
               inherit (trwl) ORT_LIB_PATH TRWL_SEMANTIC_MODEL_DIR;
+              OCL_ICD_VENDORS = "${pkgs.intel-compute-runtime}/etc/OpenCL/vendors";
             }).overrideAttrs
               {
                 # mkShell's documentation lookup builds dependencies during evaluation.
