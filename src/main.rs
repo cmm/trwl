@@ -178,9 +178,16 @@ fn remove_if_present(path: &Path) -> Result<()> {
 /// unchanged configuration waits for a backoff delay before the next attempt.
 #[derive(Default)]
 struct EmbeddingUpdater {
-    job: Option<(String, String, thread::JoinHandle<Result<()>>)>,
+    job: Option<EmbeddingJob>,
+    planner: semantic::Planner,
     completed: Option<String>,
     failure: Option<Failure>,
+}
+
+struct EmbeddingJob {
+    state: String,
+    configuration: String,
+    thread: thread::JoinHandle<(semantic::Planner, Result<()>)>,
 }
 
 struct Failure {
@@ -194,12 +201,20 @@ impl EmbeddingUpdater {
         if !self
             .job
             .as_ref()
-            .is_some_and(|(_, _, job)| job.is_finished())
+            .is_some_and(|job| job.thread.is_finished())
         {
             return;
         }
-        let (state, configuration, job) = self.job.take().unwrap();
-        let error = match job.join() {
+        let EmbeddingJob {
+            state,
+            configuration,
+            thread,
+        } = self.job.take().unwrap();
+        let result = thread.join().map(|(planner, result)| {
+            self.planner = planner;
+            result
+        });
+        let error = match result {
             Ok(Ok(())) => {
                 self.completed = Some(state);
                 self.failure = None;
@@ -208,6 +223,10 @@ impl EmbeddingUpdater {
             Ok(Err(error)) => format!("{error:#}"),
             Err(_) => "worker panicked".into(),
         };
+        self.record_failure(configuration, &error);
+    }
+
+    fn record_failure(&mut self, configuration: String, error: &str) {
         let count = match &self.failure {
             Some(failure) if failure.configuration == configuration => failure.count + 1,
             _ => 1,
@@ -225,24 +244,35 @@ impl EmbeddingUpdater {
         if self.job.is_some() {
             return;
         }
-        let configuration = config.document.to_string();
-        let state = record::digest(&[content_version, &configuration]);
-        if self.completed.as_ref() == Some(&state) {
-            return;
-        }
+        let configuration = record::digest(&[&config.document.to_string()]);
         if self.failure.as_ref().is_some_and(|failure| {
             failure.configuration == configuration && Instant::now() < failure.retry_at
         }) {
             return;
         }
+        let selection = match semantic::Planner::selection_key(config) {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.record_failure(configuration, &format!("{error:#}"));
+                return;
+            }
+        };
+        let state = record::digest(&[content_version, &configuration, &selection]);
+        if self.completed.as_ref() == Some(&state) {
+            return;
+        }
         let worker_config = config.clone();
         // Remember the state this worker started with. A later index commit or
         // configuration edit schedules another fill after it finishes.
-        self.job = Some((
+        let mut planner = std::mem::take(&mut self.planner);
+        self.job = Some(EmbeddingJob {
             state,
             configuration,
-            thread::spawn(move || semantic::refresh(&worker_config)),
-        ));
+            thread: thread::spawn(move || {
+                let result = planner.refresh(&worker_config);
+                (planner, result)
+            }),
+        });
     }
 }
 

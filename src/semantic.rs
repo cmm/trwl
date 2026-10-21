@@ -78,7 +78,7 @@ const INFERENCE_THREADS: usize = 2;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct ChunkInput {
     text: String,
     tokens: usize,
@@ -208,6 +208,14 @@ fn model_hash(config: &Config, directory: &Path) -> Result<String> {
 struct EmbeddingDocument {
     record: Record,
     keys: Vec<String>,
+    #[serde(default)]
+    prepared: Option<PreparedDocument>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PreparedDocument {
+    input: String,
+    chunks: Vec<(String, ChunkInput)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -237,34 +245,51 @@ fn chunk_tokenizer(selection: &Selection) -> Result<Option<Tokenizer>> {
 }
 
 enum PlanningTokenizer {
-    Local(Option<Box<Tokenizer>>),
+    Local {
+        selection: Option<String>,
+        loaded: Option<Box<Tokenizer>>,
+    },
     Shared(server::Client),
 }
 
 impl Default for PlanningTokenizer {
     fn default() -> Self {
-        Self::Local(None)
+        Self::Local {
+            selection: None,
+            loaded: None,
+        }
     }
 }
 
 impl PlanningTokenizer {
     fn materialize(
         &mut self,
+        config: &Config,
         selection: &Selection,
         index: &ReadIndex,
     ) -> Result<(Vec<EmbeddingDocument>, ChunkInputs)> {
-        match self {
-            Self::Local(loaded) => {
-                if loaded.is_none() {
-                    *loaded = chunk_tokenizer(selection)?.map(Box::new);
+        let reusable = cache::prepared(config, &selection.key)?;
+        plan_records(&index.messages()?, &reusable, |texts| match self {
+            Self::Local {
+                selection: key,
+                loaded,
+            } => {
+                if key.as_ref() != Some(&selection.key) {
+                    *loaded = None;
+                    *key = None;
                 }
-                materialize(index, loaded.as_deref_mut())
+                if key.is_none() {
+                    *loaded = chunk_tokenizer(selection)?.map(Box::new);
+                    *key = Some(selection.key.clone());
+                }
+                prepare_chunks(texts, loaded.as_deref())
             }
-            Self::Shared(client) => plan_records(&index.messages()?, |texts| client.prepare(texts)),
-        }
+            Self::Shared(client) => client.prepare(texts),
+        })
     }
 }
 
+#[cfg(test)]
 fn materialize(
     index: &ReadIndex,
     tokenizer: Option<&mut Tokenizer>,
@@ -298,15 +323,19 @@ fn with_document_tokenizer<T>(
     result
 }
 
+#[cfg(test)]
 fn materialize_documents(
     records: &[(Record, String)],
     tokenizer: Option<&Tokenizer>,
 ) -> Result<(Vec<EmbeddingDocument>, ChunkInputs)> {
-    plan_records(records, |texts| prepare_chunks(texts, tokenizer))
+    plan_records(records, &HashMap::new(), |texts| {
+        prepare_chunks(texts, tokenizer)
+    })
 }
 
 fn plan_records(
     records: &[(Record, String)],
+    reusable: &HashMap<String, PreparedDocument>,
     mut prepare: impl FnMut(&[String]) -> Result<Vec<Vec<ChunkInput>>>,
 ) -> Result<(Vec<EmbeddingDocument>, ChunkInputs)> {
     let mut inputs = BTreeMap::new();
@@ -318,18 +347,47 @@ fn plan_records(
             .iter()
             .map(|(_, text)| text.chars().take(DOCUMENT_MAX_CHARS).collect())
             .collect();
-        let prepared = prepare(&texts)?;
-        ensure!(prepared.len() == batch.len(), "planning batch size differs");
-        for ((record, _), chunks) in batch.iter().zip(prepared) {
+        // Pairing and result metadata come from this commit. Reuse only the
+        // capped composed input: a later reply can change an older user's plan.
+        let identities: Vec<_> = texts.iter().map(|text| digest(&[text])).collect();
+        let missing: Vec<_> = texts
+            .iter()
+            .zip(&identities)
+            .filter(|(_, input)| !reusable.contains_key(*input))
+            .map(|(text, _)| text.clone())
+            .collect();
+        let prepared = if missing.is_empty() {
+            Vec::new()
+        } else {
+            prepare(&missing)?
+        };
+        ensure!(
+            prepared.len() == missing.len(),
+            "planning batch size differs"
+        );
+        let mut prepared = prepared.into_iter();
+        for ((record, _), input) in batch.iter().zip(identities) {
+            let prepared = match reusable.get(&input) {
+                Some(prepared) => prepared.clone(),
+                None => PreparedDocument {
+                    input,
+                    chunks: prepared
+                        .next()
+                        .unwrap()
+                        .into_iter()
+                        .map(|chunk| (digest(&[&chunk.text]), chunk))
+                        .collect(),
+                },
+            };
             let mut keys = Vec::new();
-            for chunk in chunks {
-                let key = digest(&[&chunk.text]);
+            for (key, chunk) in &prepared.chunks {
                 keys.push(key.clone());
-                inputs.entry(key).or_insert(chunk);
+                inputs.entry(key.clone()).or_insert_with(|| chunk.clone());
             }
             plan.push(EmbeddingDocument {
                 record: (**record).clone(),
                 keys,
+                prepared: Some(prepared),
             });
         }
     }
@@ -346,7 +404,7 @@ fn document_plan(
     if let Some(documents) = cache::documents(config, &selection.key, &version)? {
         return Ok((documents, None));
     }
-    let (documents, inputs) = tokenizer.materialize(selection, index)?;
+    let (documents, inputs) = tokenizer.materialize(config, selection, index)?;
     cache::publish(
         config,
         &selection.key,
@@ -713,7 +771,10 @@ fn builtin_session(
             .with_profiling(Path::new(directory).join(format!("ort-{}", std::process::id())))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    Ok((builder.commit_from_file(model)?, profile_directory.is_some()))
+    Ok((
+        builder.commit_from_file(model)?,
+        profile_directory.is_some(),
+    ))
 }
 
 fn http_vectors(value: &Value, count: usize) -> Result<Vec<Vec<f32>>> {
@@ -971,7 +1032,7 @@ fn fill(
 struct FillPlan<'a> {
     documents: &'a [EmbeddingDocument],
     inputs: Option<ChunkInputs>,
-    tokenizer: PlanningTokenizer,
+    tokenizer: &'a mut PlanningTokenizer,
 }
 
 #[derive(PartialEq, Eq)]
@@ -991,7 +1052,7 @@ fn fill_locked(
     let FillPlan {
         documents,
         inputs,
-        mut tokenizer,
+        tokenizer,
     } = plan;
     let mut cache = cache::load(config, &selection.key)?;
     if documents
@@ -1004,14 +1065,13 @@ fn fill_locked(
     }
     let inputs = match inputs {
         Some(inputs) => inputs,
-        None => tokenizer.materialize(selection, index)?.1,
+        None => tokenizer.materialize(config, selection, index)?.1,
     };
     let missing = inputs
         .into_iter()
         .filter(|(key, _)| !cache.vectors.contains_key(key))
         .collect();
     let missing = ordered_inputs(missing);
-    drop(tokenizer);
     let mut worker = if mode == FillMode::Update
         && selection.directory.is_some()
         && (cache::full_build(config, &selection.key)? || heavy_incremental(&missing))
@@ -1077,7 +1137,23 @@ pub fn refresh(config: &Config) -> Result<()> {
     if !config.semantic() {
         return Ok(());
     }
-    refresh_inner(config, false)
+    Planner::default().refresh(config)
+}
+
+/// One vocabulary per updater; prepared history remains in the bounded cache.
+#[derive(Default)]
+pub struct Planner {
+    tokenizer: PlanningTokenizer,
+}
+
+impl Planner {
+    pub fn selection_key(config: &Config) -> Result<String> {
+        Ok(Selection::from_config(config)?.key)
+    }
+
+    pub fn refresh(&mut self, config: &Config) -> Result<()> {
+        refresh_inner(config, false, &mut self.tokenizer)
+    }
 }
 
 pub fn rebuild(config: &Config) -> Result<()> {
@@ -1085,10 +1161,10 @@ pub fn rebuild(config: &Config) -> Result<()> {
         config.semantic(),
         "semantic retrieval is disabled; run trwl semantic enable"
     );
-    refresh_inner(config, true)
+    refresh_inner(config, true, &mut PlanningTokenizer::default())
 }
 
-fn refresh_inner(config: &Config, rebuild: bool) -> Result<()> {
+fn refresh_inner(config: &Config, rebuild: bool, tokenizer: &mut PlanningTokenizer) -> Result<()> {
     let _lock = lock(&config.root, "semantic.lock")?;
     let Some(index) = ReadIndex::open(&config.root)? else {
         return Ok(());
@@ -1099,8 +1175,7 @@ fn refresh_inner(config: &Config, rebuild: bool) -> Result<()> {
         cache::reset(config, &selection.key)?;
     }
     // Chunking and batch ordering share a vocabulary, loaded only on a cache miss.
-    let mut tokenizer = PlanningTokenizer::default();
-    let (documents, inputs) = document_plan(config, &selection, &index, &mut tokenizer)?;
+    let (documents, inputs) = document_plan(config, &selection, &index, tokenizer)?;
     fill_locked(
         config,
         &selection,
@@ -1252,7 +1327,7 @@ pub fn search(
             FillPlan {
                 documents: &documents,
                 inputs,
-                tokenizer,
+                tokenizer: &mut tokenizer,
             },
             &mut executor,
         )?,
@@ -1576,12 +1651,56 @@ pub(crate) mod tests {
             FillPlan {
                 documents: &documents,
                 inputs: None,
-                tokenizer: PlanningTokenizer::default(),
+                tokenizer: &mut PlanningTokenizer::default(),
             },
             &mut None,
         )
         .unwrap();
         assert_eq!(cached.vectors, vectors.vectors);
+
+        // A different commit map forces planning, but unchanged composed input
+        // is reusable even by a fresh planner with no tokenizer file available.
+        cache::publish(
+            &config,
+            &selection.key,
+            "other-commit",
+            &documents,
+            &vectors,
+        )
+        .unwrap();
+        let (reused, _) = document_plan(
+            &config,
+            &selection,
+            &index,
+            &mut PlanningTokenizer::default(),
+        )
+        .unwrap();
+        assert_eq!(reused[0].keys, documents[0].keys);
+
+        // An appended reply changes the earlier user's input, not its identity.
+        let reply = codex_message("assistant", "limit the number of clients");
+        fs::write(&path, format!("{header}\n{row}\n{reply}\n")).unwrap();
+        let next = import(&config, Provider::Codex, &path);
+        assert!(
+            document_plan(
+                &config,
+                &selection,
+                &next,
+                &mut PlanningTokenizer::default()
+            )
+            .is_err()
+        );
+        let (paired, _) = document_plan(&config, &selection, &next, &mut vocabulary).unwrap();
+        assert_ne!(paired[0].keys, documents[0].keys);
+        assert_eq!(paired[0].record.event_id, documents[0].record.event_id);
+
+        // Neither a previous selection's plans nor its loaded vocabulary may
+        // satisfy a different model/tokenizer identity.
+        let changed = Selection {
+            key: "changed-tokenizer".into(),
+            ..selection
+        };
+        assert!(document_plan(&config, &changed, &next, &mut vocabulary).is_err());
     }
 
     #[test]

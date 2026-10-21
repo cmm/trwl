@@ -15,7 +15,7 @@ from e2e_semantic import (
     _show,
     model_prerequisites,
 )
-from e2e_support import MissingPrerequisite, OpenCodeFixture, require, write_json
+from e2e_support import MissingPrerequisite, OpenCodeFixture, git, require, write_json
 
 MODEL = "e5-fixture"
 TOKEN = "fixture-only-token"
@@ -283,6 +283,7 @@ def hybrid_grouping(case):
 
 
 def semantic_cache(case):
+    git(case.work, "init", "--quiet")
     fixture = OpenCodeFixture(case.providers / "cache.db", case.work)
     fixture.session("cache")
     fixture.message("cache", "first", "cachebeacon first")
@@ -364,6 +365,142 @@ def semantic_cache(case):
             ready["retrieval"]["semantic_status"] == "ready"
             and len(ready["results"]) == 2,
             "refill did not recover coverage",
+        )
+
+        def refresh():
+            case.json_command(
+                "import", "--provider", "opencode", "--path", fixture.path
+            )
+            case.command("setup", "--wait")
+
+        def plans():
+            with sqlite3.connect(database) as db:
+                return dict(db.execute("SELECT event,input FROM prepared"))
+
+        original = plans()
+        require(len(original) == 2, "prepared plans were not persisted")
+        with sqlite3.connect(database) as db:
+            db.execute("CREATE TABLE test_plan_writes (kind TEXT)")
+            for table in ("documents", "chunks", "prepared"):
+                for operation in ("INSERT", "UPDATE", "DELETE"):
+                    db.execute(f"""CREATE TRIGGER test_{table}_{operation}
+                        AFTER {operation} ON {table} BEGIN
+                        INSERT INTO test_plan_writes VALUES ('{table}_{operation}'); END""")
+        before = len(api.requests)
+        fixture.part(
+            "cache",
+            "first",
+            "tool",
+            {
+                "type": "tool",
+                "tool": "shell",
+                "callID": "call",
+                "state": {
+                    "status": "completed",
+                    "input": {"command": "true"},
+                    "output": "done",
+                },
+            },
+        )
+        refresh()
+        require(
+            len(api.requests) == before, "tool-only update embedded conversation text"
+        )
+        require(plans() == original, "tool-only update changed composed input")
+        with sqlite3.connect(database) as db:
+            require(
+                db.execute("SELECT count(*) FROM test_plan_writes").fetchone()[0] == 0,
+                "unchanged plan rows were rewritten",
+            )
+
+        fixture.message("cache", "reply", "use a bounded pool", role="assistant")
+        refresh()
+        paired = plans()
+        require(
+            set(paired) == set(original),
+            "reply changed the paired user's result identity",
+        )
+        require(
+            sum(paired[key] != original[key] for key in original) == 1,
+            "reply did not invalidate exactly its paired input",
+        )
+        require(
+            [req["texts"] for req in api.requests[before:]]
+            == [["user:\ncachebeacon second\n\nassistant:\nuse a bounded pool"]],
+            "reply reused a stale user-only vector",
+        )
+
+        moved = case.root / "moved-workspace"
+        moved.mkdir()
+        git(moved, "init", "--quiet")
+        before = len(api.requests)
+        with sqlite3.connect(fixture.path) as db:
+            db.execute(
+                "UPDATE session SET directory=?, time_updated=?",
+                (str(moved), fixture.stamp()),
+            )
+        refresh()
+        require(
+            plans() == paired and len(api.requests) == before,
+            "metadata edit re-embedded unchanged input",
+        )
+        moved_hits = case.search(
+            "cachebeacon",
+            "--events",
+            "--workspace",
+            moved,
+            backend="semantic",
+            refresh="off",
+        )["results"]
+        require(
+            len(moved_hits) == 2
+            and all(hit["workspace_root"] == str(moved) for hit in moved_hits),
+            "reused plans kept stale workspace metadata",
+        )
+        require(
+            not case.search(
+                "cachebeacon",
+                "--events",
+                "--workspace",
+                case.work,
+                backend="semantic",
+                refresh="off",
+            )["results"],
+            "old workspace retained semantic results",
+        )
+
+        with sqlite3.connect(fixture.path) as db:
+            db.execute("DELETE FROM part WHERE message_id='first'")
+            db.execute("DELETE FROM message WHERE id='first'")
+        refresh()
+        require(len(plans()) == 1, "deleted message retained its prepared input")
+        remaining = case.search(
+            "cachebeacon",
+            "--events",
+            "--workspace",
+            moved,
+            backend="semantic",
+            refresh="off",
+        )["results"]
+        require(len(remaining) == 1, "deleted message retained its semantic result")
+        with sqlite3.connect(database) as db:
+            require(
+                db.execute("SELECT count(*) FROM vectors").fetchone()[0] == 1,
+                "deleted message retained unreferenced vectors",
+            )
+            db.execute("DELETE FROM test_plan_writes")
+            db.execute("UPDATE selections SET touched=0")
+        case.json_command("semantic", "status")
+        with sqlite3.connect(database) as db:
+            require(
+                db.execute(
+                    "SELECT count(*) FROM test_plan_writes WHERE kind='prepared_DELETE'"
+                ).fetchone()[0]
+                == 1,
+                "selection eviction retained prepared input",
+            )
+        case.check(
+            "prepared plans reuse unchanged inputs while replies, metadata, deletions and eviction stay fresh"
         )
     case.check(
         "cache eviction reports partial/unavailable coverage and preserves history; waited fill recovers"

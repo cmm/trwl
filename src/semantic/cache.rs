@@ -1,4 +1,4 @@
-//! SQLite storage for vectors, document records and chunk mappings.
+//! SQLite storage for vectors, prepared inputs, document records and chunk mappings.
 //!
 //! Each executor/model/input-version selection keeps one index-commit mapping.
 //! Replacing it removes unreferenced vectors. Retention is limited to four
@@ -84,7 +84,12 @@ impl Database {
                  PRIMARY KEY(selection,key));
              CREATE TABLE IF NOT EXISTS builds (
                  selection TEXT PRIMARY KEY REFERENCES selections ON DELETE CASCADE,
-                 complete INTEGER NOT NULL);",
+                 complete INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS prepared (
+                 selection TEXT NOT NULL, event TEXT NOT NULL,
+                 input TEXT NOT NULL, chunks BLOB NOT NULL,
+                 PRIMARY KEY(selection,event),
+                 FOREIGN KEY(selection,event) REFERENCES documents ON DELETE CASCADE);",
         )?;
         schema.commit()?;
         db.checkpoint()?;
@@ -198,6 +203,8 @@ impl Database {
                 tx.prepare("SELECT event,record FROM documents WHERE selection=? ORDER BY event")?;
             let mut keys = tx
                 .prepare("SELECT key FROM chunks WHERE selection=? AND event=? ORDER BY ordinal")?;
+            let mut prepared_inputs =
+                tx.prepare("SELECT input,chunks FROM prepared WHERE selection=? AND event=?")?;
             let mut rows = query.query([selection])?;
             while let Some(row) = rows.next()? {
                 let event: String = row.get(0)?;
@@ -207,6 +214,18 @@ impl Database {
                     keys: keys
                         .query_map(params![selection, event], |r| r.get(0))?
                         .collect::<rusqlite::Result<Vec<_>>>()?,
+                    prepared: prepared_inputs
+                        .query_row(params![selection, event], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                        })
+                        .optional()?
+                        .map(|(input, chunks)| -> Result<_> {
+                            Ok(super::PreparedDocument {
+                                input,
+                                chunks: rmp_serde::from_slice(&chunks)?,
+                            })
+                        })
+                        .transpose()?,
                 });
             }
         }
@@ -236,29 +255,79 @@ impl Database {
             params![selection, version],
         )?;
         if let Some(documents) = documents {
-            tx.execute("DELETE FROM documents WHERE selection=?", [selection])?;
-            let mut insert = tx.prepare("INSERT INTO documents VALUES (?,?,?)")?;
+            // Keep unchanged rows in place, including their prepared chunks.
+            // The current pinned snapshot still decides metadata and deletions.
+            let mut stale: std::collections::HashSet<String> = tx
+                .prepare("SELECT event FROM documents WHERE selection=?")?
+                .query_map([selection], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut insert = tx.prepare(
+                "INSERT INTO documents VALUES (?,?,?)
+                ON CONFLICT(selection,event) DO UPDATE SET record=excluded.record
+                WHERE documents.record!=excluded.record",
+            )?;
             let mut chunk = tx.prepare("INSERT INTO chunks VALUES (?,?,?,?)")?;
+            let mut old_keys = tx
+                .prepare("SELECT key FROM chunks WHERE selection=? AND event=? ORDER BY ordinal")?;
+            let mut old_input =
+                tx.prepare("SELECT input FROM prepared WHERE selection=? AND event=?")?;
             for document in documents {
+                stale.remove(&document.record.event_id);
                 insert.execute(params![
                     selection,
                     document.record.event_id,
                     rmp_serde::to_vec_named(&document.record)?
                 ])?;
-                for (ordinal, key) in document.keys.iter().enumerate() {
-                    chunk.execute(params![
-                        selection,
-                        document.record.event_id,
-                        ordinal as i64,
-                        key
-                    ])?;
+                let previous = old_keys
+                    .query_map(params![selection, document.record.event_id], |r| r.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                if previous != document.keys {
+                    tx.execute(
+                        "DELETE FROM chunks WHERE selection=? AND event=?",
+                        params![selection, document.record.event_id],
+                    )?;
+                    for (ordinal, key) in document.keys.iter().enumerate() {
+                        chunk.execute(params![
+                            selection,
+                            document.record.event_id,
+                            ordinal as i64,
+                            key
+                        ])?;
+                    }
                 }
+                if let Some(prepared) = &document.prepared {
+                    let previous: Option<String> = old_input
+                        .query_row(params![selection, document.record.event_id], |r| r.get(0))
+                        .optional()?;
+                    if previous.as_ref() != Some(&prepared.input) {
+                        tx.execute("INSERT INTO prepared VALUES (?,?,?,?)
+                            ON CONFLICT(selection,event) DO UPDATE SET input=excluded.input,chunks=excluded.chunks",
+                            params![selection, document.record.event_id, prepared.input, rmp_serde::to_vec(&prepared.chunks)?])?;
+                    }
+                } else {
+                    tx.execute(
+                        "DELETE FROM prepared WHERE selection=? AND event=?",
+                        params![selection, document.record.event_id],
+                    )?;
+                }
+            }
+            for event in stale {
+                tx.execute(
+                    "DELETE FROM documents WHERE selection=? AND event=?",
+                    params![selection, event],
+                )?;
             }
         }
         {
             // Keys identify model and input content; a stored vector is reusable.
             let mut insert = tx.prepare("INSERT OR IGNORE INTO vectors VALUES (?,?,?)")?;
+            let mut exists = tx.prepare("SELECT 1 FROM vectors WHERE selection=? AND key=?")?;
             for (key, vector) in &vectors.vectors {
+                // Final pinned-reader repair must restore evicted batches, but
+                // need not serialize vectors still present in this transaction.
+                if exists.exists(params![selection, key])? {
+                    continue;
+                }
                 let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
                 insert.execute(params![selection, key, bytes])?;
             }
@@ -272,6 +341,7 @@ impl Database {
         tx.execute("UPDATE selections SET bytes=
             (SELECT coalesce(sum(length(record)+length(event)+128),0) FROM documents WHERE selection=?1) +
             (SELECT coalesce(sum(length(key)+length(event)+128),0) FROM chunks WHERE selection=?1) +
+            (SELECT coalesce(sum(length(input)+length(event)+length(chunks)+128),0) FROM prepared WHERE selection=?1) +
             (SELECT coalesce(sum(length(key)+length(vector)+128),0) FROM vectors WHERE selection=?1)
             WHERE selection=?1", [selection])?;
         Self::trim(&tx, self.budget, Some(selection))?;
@@ -394,6 +464,34 @@ pub(super) fn documents(
     with_database(config, selection, |db| db.documents(selection, version))
 }
 
+pub(super) fn prepared(
+    config: &Config,
+    selection: &str,
+) -> Result<HashMap<String, super::PreparedDocument>> {
+    with_database(config, selection, |db| {
+        let mut query = db
+            .connection
+            .prepare("SELECT input,chunks FROM prepared WHERE selection=?")?;
+        let mut rows = query.query([selection])?;
+        let mut prepared = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let input: String = row.get(0)?;
+            if !prepared.contains_key(&input) {
+                let bytes: Vec<u8> = row.get(1)?;
+                prepared.insert(
+                    input.clone(),
+                    super::PreparedDocument {
+                        input,
+                        chunks: rmp_serde::from_slice(&bytes)
+                            .context("invalid prepared document")?,
+                    },
+                );
+            }
+        }
+        Ok(prepared)
+    })
+}
+
 pub(super) fn publish(
     config: &Config,
     selection: &str,
@@ -500,6 +598,7 @@ mod tests {
             vec![EmbeddingDocument {
                 record,
                 keys: vec![key.into()],
+                prepared: None,
             }],
             Cache {
                 vectors: [(key.into(), vec![1.0; dimensions])].into(),
@@ -546,10 +645,21 @@ mod tests {
     fn final_snapshot_restores_vectors_evicted_by_another_mapping() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load(dir.path()).unwrap();
-        let (first_documents, first) = fixture("first", 2);
+        let (mut first_documents, first) = fixture("first", 2);
+        first_documents[0].prepared = Some(super::super::PreparedDocument {
+            input: "first-input".into(),
+            chunks: vec![(
+                "first".into(),
+                super::super::ChunkInput {
+                    text: "first".into(),
+                    tokens: 1,
+                },
+            )],
+        });
         let (second_documents, second) = fixture("second", 2);
         publish_batch(&config, "model", "v1", &first_documents, &first).unwrap();
         publish(&config, "model", "v2", &second_documents, &second).unwrap();
+        assert!(prepared(&config, "model").unwrap().is_empty());
         assert!(
             !load(&config, "model")
                 .unwrap()
@@ -563,6 +673,8 @@ mod tests {
             ["first"]
         );
         assert!(documents(&config, "model", "v2").unwrap().is_none());
+        let restored = prepared(&config, "model").unwrap();
+        assert_eq!(restored["first-input"].chunks[0].1.text, "first");
     }
 
     #[test]
@@ -666,6 +778,22 @@ mod tests {
             .query_row("SELECT count(*) FROM selections", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, MAX_SELECTIONS);
+        // Prepared text shares the vector budget, even when vectors are tiny.
+        let (mut documents, vectors) = fixture("oversized", 2);
+        documents[0].prepared = Some(super::super::PreparedDocument {
+            input: "oversized-input".into(),
+            chunks: vec![(
+                "oversized".into(),
+                super::super::ChunkInput {
+                    text: "x".repeat(180_000),
+                    tokens: 1,
+                },
+            )],
+        });
+        assert!(
+            db.publish("oversized", "commit", Some(&documents), &vectors)
+                .is_err()
+        );
     }
 
     #[test]
