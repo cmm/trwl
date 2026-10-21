@@ -1,4 +1,4 @@
-//! A full build owns one inference process. The worker owns the shared GPU
+//! An eligible update fill owns one inference process. The worker owns the shared GPU
 //! lock; the parent owns index/cache writes and persists every completed batch.
 //! Socket deadlines bound initialization (120 s) and each inference batch
 //! (60 s) separately. A worker that fails, crashes or times out is killed once
@@ -119,7 +119,7 @@ impl Client {
             send(client.stream.get_mut(), selection).and_then(|()| receive(&mut client.stream));
         match reply {
             Ok(Initialization::Ready(device)) => {
-                eprintln!("trwl: full embedding build using {}", device.as_str());
+                eprintln!("trwl: embedding update using {}", device.as_str());
                 client
                     .stream
                     .get_ref()
@@ -135,7 +135,7 @@ impl Client {
                 Ok(None)
             }
             Ok(Initialization::Cpu) => {
-                eprintln!("trwl: full embedding build using cpu");
+                eprintln!("trwl: embedding update using cpu");
                 Ok(None)
             }
             Ok(Initialization::Failed(message)) => bail!("embedding initialization: {message}"),

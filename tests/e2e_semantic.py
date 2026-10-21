@@ -192,7 +192,7 @@ def _show(case, expected):
 
 
 def device_policy(case):
-    """Full builds use workers; queries/catch-up avoid GPU even on a new cache."""
+    """Full builds and heavy updates use workers; queries and small updates use CPU."""
     model_prerequisites(case)
     fixture, expected = _fixture(case, refreshable=True)
     case.command("semantic", "enable", "--executor", "builtin")
@@ -220,7 +220,7 @@ def device_policy(case):
     case.command("setup", "--wait")
     query()
     case.check(
-        "queries and incremental setup never open the GPU lock, including initial waited search"
+        "queries and small incremental setup never open the GPU lock, including initial waited search"
     )
 
     # A filesystem error is not reclassified as a GPU failure and hidden by CPU.
@@ -232,7 +232,7 @@ def device_policy(case):
     rebuilt = case.command("semantic", "rebuild", "--format", "json", timeout=180)
     require(json.loads(rebuilt.stdout)["state"] == "ready", "rebuild did not complete")
     require(
-        "full embedding build using " in rebuilt.stderr,
+        "embedding update using " in rebuilt.stderr,
         "full rebuild did not start its worker",
     )
     query()
@@ -263,7 +263,7 @@ def device_policy(case):
         """)
     resumed = case.command("semantic", "rebuild", timeout=180)
     require(
-        "full embedding build using " in resumed.stderr,
+        "embedding update using " in resumed.stderr,
         "resumed build lost GPU eligibility",
     )
     with sqlite3.connect(database) as connection:
@@ -296,13 +296,44 @@ def device_policy(case):
     )
     changed = case.command("setup", "--wait", timeout=180)
     require(
-        "full embedding build using " in changed.stderr,
+        "embedding update using " in changed.stderr,
         "new model selection was not a full build",
     )
     query()
     _show(case, expected)
     case.check(
         "first fill of a new model selection uses a worker and preserves retrieval"
+    )
+
+    # Many documents sharing one chunk remain a small fill. Distinct long
+    # inputs then cross the work threshold; poison the lock to observe the
+    # decision before loading a GPU model or running the heavy inference.
+    case.env["TRWL_GPU_LOCK_DIR"] = str(poison)
+    text = "database " * 430
+    for number in range(40):
+        fixture.message(SESSION, f"msg_heavy_{number}", text)
+    case.command("setup", "--wait", timeout=180)
+    with sqlite3.connect(fixture.path) as db:
+        for number in range(40):
+            db.execute(
+                "UPDATE part SET data=?, time_updated=? WHERE id=?",
+                (
+                    json.dumps({"type": "text", "text": text + str(number)}),
+                    fixture.stamp(),
+                    f"part_msg_heavy_{number}",
+                ),
+            )
+    heavy = case.command("setup", "--wait", expect_failure=True, timeout=180)
+    require(
+        "opening GPU lock" in heavy.stderr, "heavy incremental fill did not try GPU"
+    )
+    with sqlite3.connect(fixture.path) as db:
+        db.execute("DELETE FROM part WHERE message_id LIKE 'msg_heavy_%'")
+        db.execute("DELETE FROM message WHERE id LIKE 'msg_heavy_%'")
+    case.command("setup", "--wait")
+    query()
+    case.check(
+        "incremental GPU work counts distinct missing chunks and their token lengths"
     )
 
 

@@ -1,4 +1,4 @@
-//! Reusable CPU inference, separate from index updates and full-build GPU workers.
+//! Reusable CPU inference, separate from index updates and GPU workers.
 //! One process per data root and executable serves clients serially. It keeps
 //! one model selection, exits after 30 idle seconds, and stores no input text.
 use super::{

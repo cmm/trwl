@@ -218,8 +218,10 @@ full transcripts.
 ### Executors
 
 - `builtin` uses the configured multilingual-E5-small model; queries
-  and incremental fills use CPU, bulk fills (initial history imports
-  and full rebuilds) attempt to use GPU first.
+  and small incremental fills use CPU. Initial history fills, full
+  rebuilds and large incremental fills attempt to use GPU first.
+  [GPU selection](docs/GPU.md) accounts for missing chunks and their
+  token lengths.
 - `http` uses an OpenAI-compatible endpoint:
 
   ```sh

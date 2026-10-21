@@ -933,13 +933,28 @@ fn prepare_chunks(texts: &[String], tokenizer: Option<&Tokenizer>) -> Result<Vec
         .collect()
 }
 
-fn ordered_inputs(inputs: ChunkInputs) -> Vec<(String, String)> {
+fn ordered_inputs(inputs: ChunkInputs) -> Vec<(String, ChunkInput)> {
     let mut inputs: Vec<_> = inputs.into_iter().collect();
     inputs.sort_by_key(|(_, input)| input.tokens);
     inputs
-        .into_iter()
-        .map(|(key, input)| (key, input.text))
-        .collect()
+}
+
+fn heavy_incremental(inputs: &[(String, ChunkInput)]) -> bool {
+    // Sorted batches pay for padding to their longest input. The work budget
+    // amortizes worker/model startup; device costs vary, so it is not a
+    // hardware-independent latency prediction.
+    inputs
+        .chunks(BATCH_SIZE)
+        .map(|batch| {
+            batch
+                .iter()
+                .map(|(_, input)| input.tokens)
+                .max()
+                .unwrap_or(0)
+                .saturating_mul(batch.len())
+        })
+        .fold(0usize, usize::saturating_add)
+        >= 16_384
 }
 
 fn fill(
@@ -999,7 +1014,7 @@ fn fill_locked(
     drop(tokenizer);
     let mut worker = if mode == FillMode::Update
         && selection.directory.is_some()
-        && cache::full_build(config, &selection.key)?
+        && (cache::full_build(config, &selection.key)? || heavy_incremental(&missing))
         && std::env::var_os("TRWL_SEMANTIC_CPU_ONLY").is_none_or(|v| v != "1")
     {
         worker::Client::start(selection)?
@@ -1011,7 +1026,7 @@ fn fill_locked(
     while let Some(batch) = batches.next() {
         let texts: Vec<_> = prefetched
             .take()
-            .unwrap_or_else(|| batch.iter().map(|(_, text)| text.clone()).collect());
+            .unwrap_or_else(|| batch.iter().map(|(_, input)| input.text.clone()).collect());
         let accelerated = match worker.as_mut() {
             Some(worker) => worker.embed(&texts)?,
             None => None,
@@ -1038,7 +1053,7 @@ fn fill_locked(
         // Let the GPU compute the next batch while this one commits. No cache
         // transaction is held while submitting or waiting for inference.
         if let (Some(worker), Some(next)) = (worker.as_mut(), batches.peek()) {
-            let texts: Vec<_> = next.iter().map(|(_, text)| text.clone()).collect();
+            let texts: Vec<_> = next.iter().map(|(_, input)| input.text.clone()).collect();
             worker.prefetch(&texts);
             prefetched = Some(texts);
         }

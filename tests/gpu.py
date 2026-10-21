@@ -75,7 +75,7 @@ def run_case(root, mode, args):
         built = case.command("semantic", "rebuild", "--format", "json", timeout=240)
         require(json.loads(built.stdout)["state"] == "ready", "rebuild was not ready")
         if mode == "gpu":
-            prefix = "trwl: full embedding build using "
+            prefix = "trwl: embedding update using "
             devices = [
                 line.removeprefix(prefix)
                 for line in built.stderr.splitlines()
