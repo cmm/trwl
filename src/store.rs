@@ -1706,6 +1706,9 @@ fn update_with_parser(
         let mut commit = writer.prepare_commit()?;
         commit.set_payload(&serde_json::to_string(&manifest)?);
         commit.commit()?;
+        // Dropping a writer prevents its merges from publishing but does not stop
+        // their work. Finish them so later updates do not repeat discarded merges.
+        writer.wait_merging_threads()?;
     }
     Ok(ImportReport {
         outcome: if failed {
