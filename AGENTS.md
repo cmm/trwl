@@ -15,8 +15,8 @@ trwl, a coding agent session history search tool.
 # Development checks
 
 - For Rust changes, use Cargo to compile and test during development, reusing
-  the local target directory. Use `nix develop -c cargo ...` when the Nix build
-  environment is needed.
+  the local target directory. Use `direnv exec . <command>` when a local `.envrc`
+  supplies the devshell but the command does not inherit it.
 - Run Nix package and regression builds after Cargo checks pass and the changes
   are ready for integration. Do not use Nix builds as the edit/compile loop:
   changed sources cause a fresh package build, including its dependencies.

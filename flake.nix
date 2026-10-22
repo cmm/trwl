@@ -25,6 +25,15 @@
         (pkgsFor system).callPackage ./default.nix {
           trwlEmbeddingModelSource = embedding-model;
         };
+      testInputs = pkgs: [
+        (pkgs.python3.withPackages (p: [
+          p.numpy
+          p.onnxruntime
+          p.tokenizers
+        ]))
+        pkgs.git
+        pkgs.time
+      ];
     in
     {
       packages = forAllSystems (
@@ -59,21 +68,12 @@
         let
           pkgs = pkgsFor system;
           trwl = (packageFor system).override { enableGpu = false; };
-          python = pkgs.python3.withPackages (p: [
-            p.numpy
-            p.onnxruntime
-            p.tokenizers
-          ]);
         in
         {
           regression =
             pkgs.runCommand "trwl-regression"
               {
-                nativeBuildInputs = [
-                  python
-                  pkgs.git
-                  pkgs.time
-                ];
+                nativeBuildInputs = testInputs pkgs;
               }
               ''
                 # The harness writes artifacts beside tests and selects CPU inference.
@@ -103,7 +103,9 @@
               packages = [
                 pkgs.rustfmt
                 pkgs.clippy
-              ];
+                pkgs.nixfmt
+              ]
+              ++ testInputs pkgs;
               inherit (trwl) ORT_LIB_PATH TRWL_SEMANTIC_MODEL_DIR;
               OCL_ICD_VENDORS = "${pkgs.intel-compute-runtime}/etc/OpenCL/vendors";
             }).overrideAttrs
