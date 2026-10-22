@@ -9,8 +9,8 @@
 //!
 //! Built-in chunks use the model's token budget; HTTP chunks use a character
 //! budget. SQLite stores one document-to-chunk mapping per selection and vectors
-//! keyed by chunk content. Cache hits do not load transcripts. Readers of other
-//! commits rebuild mappings from their pinned index. Selection includes the input
+//! keyed by chunk content. Cache hits do not load transcripts. Readers with different
+//! conversation inputs rebuild mappings from their pinned index. Selection includes the input
 //! version and executor/model; built-in selection includes a hash of the model
 //! files. File hashes are cached by path, inode, size, mtime and ctime.
 //! Unchanged chunks reuse vectors. Obsolete mappings and unreferenced vectors
@@ -33,7 +33,7 @@
 
 use crate::{
     config::{Config, atomic_write, is_locked, lock},
-    record::{Record, digest},
+    record::{ConversationMessage, Record, digest},
     report::{Coverage, SemanticStatus, State},
     store::ReadIndex,
 };
@@ -325,7 +325,7 @@ fn with_document_tokenizer<T>(
 
 #[cfg(test)]
 fn materialize_documents(
-    records: &[(Record, String)],
+    records: &[ConversationMessage],
     tokenizer: Option<&Tokenizer>,
 ) -> Result<(Vec<EmbeddingDocument>, ChunkInputs)> {
     plan_records(records, &HashMap::new(), |texts| {
@@ -334,7 +334,7 @@ fn materialize_documents(
 }
 
 fn plan_records(
-    records: &[(Record, String)],
+    records: &[ConversationMessage],
     reusable: &HashMap<String, PreparedDocument>,
     mut prepare: impl FnMut(&[String]) -> Result<Vec<Vec<ChunkInput>>>,
 ) -> Result<(Vec<EmbeddingDocument>, ChunkInputs)> {
@@ -825,10 +825,10 @@ fn normalize(vector: &mut [f32]) -> Result<()> {
 }
 
 /// Pair each user message with the last nonempty reply before the next user.
-fn documents(records: &[(Record, String)]) -> Vec<(&Record, String)> {
+fn documents(records: &[ConversationMessage]) -> Vec<(&Record, String)> {
     let mut messages: Vec<_> = records
         .iter()
-        .map(|(record, text)| (record, text.clone()))
+        .map(|record| (record, record.text.clone()))
         .collect();
     messages.sort_by(|(a, _), (b, _)| {
         a.session_id.cmp(&b.session_id).then_with(|| {
@@ -840,13 +840,13 @@ fn documents(records: &[(Record, String)]) -> Vec<(&Record, String)> {
     });
     // OpenCode emits one record per part. Merge visible parts before pairing
     // turns, keeping the first part as the result's event reference.
-    let mut merged: Vec<(&Record, String)> = Vec::new();
+    let mut merged: Vec<(&ConversationMessage, String)> = Vec::new();
     let mut positions = HashMap::new();
     for (record, text) in messages {
         if let Some(message) = &record.provider_message_id {
-            let key = (&record.session_id, &record.source.path, message);
+            let key = (&record.session_id, &record.source, message);
             if let Some(&position) = positions.get(&key) {
-                let (_, combined): &mut (&Record, String) = &mut merged[position];
+                let (_, combined): &mut (&ConversationMessage, String) = &mut merged[position];
                 if !combined.is_empty() && !text.is_empty() {
                     combined.push('\n');
                 }
@@ -867,14 +867,14 @@ fn documents(records: &[(Record, String)]) -> Vec<(&Record, String)> {
             assistant = None;
         }
         let text = text.trim();
-        if record.role.as_ref().map(crate::record::Role::as_str) == Some("user") {
+        if let Some(request) = &record.request {
             // These user-role records are harness notices, not requests.
             if !text.is_empty() && !crate::providers::is_control_message(text) {
                 let mut document = format!("user:\n{text}");
                 if let Some(reply) = assistant {
                     document.push_str(&format!("\n\nassistant:\n{reply}"));
                 }
-                result.push((*record, document));
+                result.push((request, document));
             }
             assistant = None;
         } else if !text.is_empty() && assistant.is_none() {
@@ -1704,7 +1704,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn document_keys_are_cached_for_the_pinned_commit() {
+    fn document_plans_track_relevant_native_edits() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::edit(&dir.path().join("data"), |doc| {
             doc["search"]["semantic"] = toml_edit::value(true);
@@ -1713,76 +1713,125 @@ pub(crate) mod tests {
             Ok(())
         })
         .unwrap();
-        let path = dir.path().join("input.jsonl");
-        let source = source(Provider::Codex, &path);
-        let write = |text| {
-            let header = json!({"type":"session_meta", "payload":{"id":"native"}});
-            let row = codex_message("user", text);
-            fs::write(&path, format!("{header}\n{row}\n")).unwrap();
-            crate::store::update(&config, std::slice::from_ref(&source), false).unwrap();
+        let path = dir.path().join("history.jsonl");
+        let source = source(Provider::Claude, &path);
+        let write = |user: &Value, assistant: Option<&Value>| {
+            let mut lines = format!("{user}\n");
+            if let Some(assistant) = assistant {
+                lines.push_str(&format!("{assistant}\n"));
+            }
+            fs::write(&path, lines).unwrap();
+            assert!(
+                crate::store::update(&config, std::slice::from_ref(&source), false)
+                    .unwrap()
+                    .completed()
+            );
+            ReadIndex::open(&config.root).unwrap().unwrap()
         };
-        write("first");
-        let index = ReadIndex::open(&config.root).unwrap().unwrap();
         let selection = Selection::from_config(&config).unwrap();
-        let (first, _) = document_plan(
-            &config,
-            &selection,
-            &index,
-            &mut PlanningTokenizer::default(),
-        )
-        .unwrap();
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].keys, vec![digest(&["user:\nfirst"])]);
-        assert_eq!(index.record_decodes.get(), 1);
-        index.record_decodes.set(0);
-        let (cached, inputs) = document_plan(
-            &config,
-            &selection,
-            &index,
-            &mut PlanningTokenizer::default(),
-        )
-        .unwrap();
-        assert!(inputs.is_none());
-        assert_eq!(cached[0].keys, first[0].keys);
-        assert_eq!(index.record_decodes.get(), 0);
-        write("edited");
-        let next = ReadIndex::open(&config.root).unwrap().unwrap();
-        let (edited, _) = document_plan(
-            &config,
-            &selection,
-            &next,
-            &mut PlanningTokenizer::default(),
-        )
-        .unwrap();
-        assert_ne!(next.version(), index.version());
-        assert_eq!(edited[0].keys, vec![digest(&["user:\nedited"])]);
-        index.record_decodes.set(0);
-        let (pinned, _) = document_plan(
-            &config,
-            &selection,
-            &index,
-            &mut PlanningTokenizer::default(),
-        )
-        .unwrap();
-        assert_eq!(pinned[0].keys, first[0].keys);
-        assert_eq!(index.record_decodes.get(), 1);
-        let directory = config.root.join("semantic");
-        let legacy = directory.join(format!("documents-{}-old.msgpack", selection.key));
-        fs::write(&legacy, b"obsolete mapping").unwrap();
-        for text in ["second edit", "third edit", "fourth edit"] {
-            write(text);
-            let current = ReadIndex::open(&config.root).unwrap().unwrap();
-            let (plan, _) = document_plan(
+        let plan = |index: &ReadIndex| {
+            index.record_decodes.set(0);
+            document_plan(
                 &config,
                 &selection,
-                &current,
+                index,
                 &mut PlanningTokenizer::default(),
             )
-            .unwrap();
-            assert_eq!(plan[0].keys, vec![digest(&[&format!("user:\n{text}")])]);
-            assert!(!legacy.exists());
-            assert!(directory.join("cache.sqlite3").exists());
-        }
+            .unwrap()
+        };
+        let mut user = json!({
+            "type":"user", "uuid":"11111111-1111-4111-8111-111111111111",
+            "sessionId":"native", "timestamp":"2026-01-01T00:00:00.000Z",
+            "cwd":"/workspace/first", "message":{"role":"user", "content":"question"}
+        });
+        let mut assistant = json!({
+            "type":"assistant", "uuid":"22222222-2222-4222-8222-222222222222",
+            "sessionId":"native", "timestamp":"2026-01-01T00:01:00.000Z",
+            "cwd":"/workspace/first", "message":{"role":"assistant", "usage":{"input_tokens":10},
+                "content":[
+                    {"type":"thinking", "thinking":"private reasoning"},
+                    {"type":"text", "text":"answer"},
+                    {"type":"tool_use", "id":"tool", "name":"read", "input":{"path":"first"}}
+                ]}
+        });
+        let index = write(&user, Some(&assistant));
+        let assistant_id = index
+            .all()
+            .unwrap()
+            .into_iter()
+            .find(|record| {
+                record.provider_event_id == assistant["uuid"].as_str().unwrap()
+                    && record.is_conversation_message()
+            })
+            .unwrap()
+            .event_id;
+        let (first, inputs) = plan(&index);
+        assert!(inputs.is_some());
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].keys,
+            vec![digest(&["user:\nquestion\n\nassistant:\nanswer"])]
+        );
+        assert_eq!(index.record_decodes.get(), 2);
+
+        assistant["message"]["content"][0]["thinking"] = json!("revised private reasoning");
+        assistant["message"]["content"][2]["input"]["path"] = json!("second");
+        assistant["message"]["usage"]["input_tokens"] = json!(20);
+        let irrelevant = write(&user, Some(&assistant));
+        assert_eq!(irrelevant.version(), index.version());
+        let latest = irrelevant.event_reference(&assistant_id).unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].text, "revised private reasoning\nanswer");
+        assert_eq!(latest[0].structured_content, assistant["message"]);
+        let legacy = config
+            .root
+            .join("semantic")
+            .join(format!("documents-{}-old.msgpack", selection.key));
+        fs::write(&legacy, b"obsolete mapping").unwrap();
+        let (cached, inputs) = plan(&irrelevant);
+        assert!(inputs.is_none());
+        assert_eq!(cached[0].keys, first[0].keys);
+        assert_eq!(irrelevant.record_decodes.get(), 0);
+        assert!(!legacy.exists());
+
+        assistant["message"]["content"][1]["text"] = json!("edited answer");
+        let visible = write(&user, Some(&assistant));
+        assert_ne!(visible.version(), irrelevant.version());
+        let (edited, inputs) = plan(&visible);
+        assert!(inputs.is_some());
+        assert_eq!(edited.len(), 1);
+        assert_eq!(
+            edited[0].keys,
+            vec![digest(&["user:\nquestion\n\nassistant:\nedited answer"])]
+        );
+        assert_eq!(visible.record_decodes.get(), 2);
+
+        user["cwd"] = json!("/workspace/second");
+        user["timestamp"] = json!("2026-01-01T00:00:30.000Z");
+        let metadata = write(&user, Some(&assistant));
+        assert_ne!(metadata.version(), visible.version());
+        let (updated, inputs) = plan(&metadata);
+        assert!(inputs.is_some());
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].keys, edited[0].keys);
+        assert_eq!(updated[0].record.workspace, "/workspace/second");
+        assert_eq!(updated[0].record.occurred_at, "2026-01-01T00:00:30.000Z");
+        assert_eq!(metadata.record_decodes.get(), 2);
+
+        let deleted = write(&user, None);
+        assert_ne!(deleted.version(), metadata.version());
+        let (unanswered, inputs) = plan(&deleted);
+        assert!(inputs.is_some());
+        assert_eq!(unanswered.len(), 1);
+        assert_eq!(unanswered[0].keys, vec![digest(&["user:\nquestion"])]);
+        assert_eq!(deleted.record_decodes.get(), 1);
+
+        let (pinned, _) = plan(&irrelevant);
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].keys, first[0].keys);
+        assert_eq!(pinned[0].record.workspace, "/workspace/first");
+        assert_eq!(pinned[0].record.occurred_at, "2026-01-01T00:00:00.000Z");
+        assert_eq!(irrelevant.record_decodes.get(), 2);
     }
 
     #[test]
@@ -1915,8 +1964,8 @@ pub(crate) mod tests {
         fs::write(&path, lines).unwrap();
         let mut records = Vec::new();
         crate::providers::parse(Provider::Claude, &path, None, |record| {
-            if let Some(text) = record.message_text() {
-                records.push((record.clone(), text.into_owned()));
+            if let Some(message) = ConversationMessage::new(record) {
+                records.push(message);
             }
             Ok(())
         })

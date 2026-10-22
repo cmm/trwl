@@ -194,6 +194,42 @@ pub struct SourceLocation {
     pub path: PathBuf,
 }
 
+/// The input to conversation pairing. Only user messages supply result metadata;
+/// assistant payloads contribute visible text, grouping and ordering.
+#[derive(Serialize)]
+pub struct ConversationMessage {
+    pub session_id: String,
+    pub occurred_at: String,
+    pub sequence: u64,
+    pub event_id: String,
+    pub provider_message_id: Option<String>,
+    pub source: PathBuf,
+    pub text: String,
+    pub request: Option<Record>,
+}
+
+impl ConversationMessage {
+    pub fn new(record: &Record) -> Option<Self> {
+        let text = record.message_text()?.into_owned();
+        let request = matches!(record.role, Some(Role::User)).then(|| {
+            let mut request = record.clone();
+            request.text = request.text.chars().take(SEARCH_SNIPPET_CHARS).collect();
+            request.structured_content = Value::Null;
+            request
+        });
+        Some(Self {
+            session_id: record.session_id.clone(),
+            occurred_at: record.occurred_at.clone(),
+            sequence: record.sequence,
+            event_id: record.event_id.clone(),
+            provider_message_id: record.provider_message_id.clone(),
+            source: record.source.path.clone(),
+            text,
+            request,
+        })
+    }
+}
+
 impl Record {
     pub fn is_conversation_message(&self) -> bool {
         self.event_type == EventType::Message

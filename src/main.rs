@@ -159,7 +159,7 @@ fn update_iteration(config: &Config, embedding: &mut EmbeddingUpdater) -> Result
         eprintln!("{}", serde_json::to_string(&report)?);
     }
     if config.semantic()
-        && let Some(version) = store::content_version(&config.root)?
+        && let Some(version) = store::semantic_version(&config.root)?
     {
         embedding.schedule(config, &version);
     }
@@ -173,7 +173,7 @@ fn remove_if_present(path: &Path) -> Result<()> {
     }
 }
 
-/// One background embedding fill at a time. A fill runs when the index commit
+/// One background embedding fill at a time. A fill runs when conversation inputs
 /// or configuration differs from the last successful fill. After a failure,
 /// unchanged configuration waits for a backoff delay before the next attempt.
 #[derive(Default)]
@@ -240,7 +240,7 @@ impl EmbeddingUpdater {
         });
     }
 
-    fn schedule(&mut self, config: &Config, content_version: &str) {
+    fn schedule(&mut self, config: &Config, semantic_version: &str) {
         if self.job.is_some() {
             return;
         }
@@ -257,12 +257,12 @@ impl EmbeddingUpdater {
                 return;
             }
         };
-        let state = record::digest(&[content_version, &configuration, &selection]);
+        let state = record::digest(&[semantic_version, &configuration, &selection]);
         if self.completed.as_ref() == Some(&state) {
             return;
         }
         let worker_config = config.clone();
-        // Remember the state this worker started with. A later index commit or
+        // Remember the state this worker started with. A conversation change or
         // configuration edit schedules another fill after it finishes.
         let mut planner = std::mem::take(&mut self.planner);
         self.job = Some(EmbeddingJob {

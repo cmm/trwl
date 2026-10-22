@@ -1,6 +1,7 @@
 //! Tantivy index of complete records, and its import.
 //!
-//! Each commit's payload is the manifest: per-input source stamps. Each input
+//! Each commit's payload is the manifest: per-input source stamps and a semantic
+//! revision that changes with conversation inputs and result metadata. Each input
 //! also has a checkpoint document in the same commit, so a reader pinned to a
 //! commit sees records, stamps and parser state of one import. Checkpoint
 //! documents are excluded from record scans, counts and semantic input. An
@@ -24,7 +25,7 @@ use crate::{
     cli::Filters,
     config::{Config, Source, is_locked, lock},
     providers,
-    record::{Provider, Record, digest},
+    record::{ConversationMessage, Provider, Record, digest},
     report::{Diagnostic, ImportReport, ImportSource, LexicalStatus, Outcome, State},
     workspace,
 };
@@ -132,6 +133,8 @@ struct Manifest {
     inputs: BTreeMap<String, InputState>,
     #[serde(default)]
     workspace_roots: workspace::Roots,
+    #[serde(default)]
+    semantic_version: Option<String>,
 }
 impl Default for Manifest {
     fn default() -> Self {
@@ -139,12 +142,9 @@ impl Default for Manifest {
             record_version: RECORD_VERSION,
             inputs: BTreeMap::new(),
             workspace_roots: workspace::Roots::default(),
+            semantic_version: Some(digest(&["empty conversation"])),
         }
     }
-}
-
-fn manifest(index: &Index) -> Result<Manifest> {
-    decode_manifest(index.load_metas()?.payload.as_deref())
 }
 
 fn decode_manifest(payload: Option<&str>) -> Result<Manifest> {
@@ -209,6 +209,7 @@ pub struct ReadIndex {
     index: Index,
     searcher: Searcher,
     fields: Fields,
+    semantic_version: String,
     #[cfg(test)]
     pub(crate) record_decodes: std::rc::Rc<std::cell::Cell<usize>>,
     #[cfg(test)]
@@ -561,22 +562,9 @@ impl SegmentWinners {
 }
 
 impl ReadIndex {
-    /// Identify this reader's commit, not a newer commit at the same path.
+    /// Identify this reader's conversation inputs and result metadata.
     pub fn version(&self) -> String {
-        let mut segments: Vec<_> = self
-            .searcher
-            .segment_readers()
-            .iter()
-            .map(|segment| {
-                format!(
-                    "{}:{}",
-                    segment.segment_id().uuid_string(),
-                    segment.max_doc() - segment.num_docs()
-                )
-            })
-            .collect();
-        segments.sort();
-        digest(&segments.iter().map(String::as_str).collect::<Vec<_>>())
+        self.semantic_version.clone()
     }
 
     pub fn open(root: &Path) -> Result<Option<Self>> {
@@ -591,17 +579,43 @@ impl ReadIndex {
             "incompatible history index at {}; move that directory aside, then re-import your sources",
             path.display()
         );
-        manifest(&index)?;
-        let searcher = index.reader()?.searcher();
-        Ok(Some(Self {
-            index,
-            searcher,
-            fields,
-            #[cfg(test)]
-            record_decodes: RECORD_DECODES.with(Clone::clone),
-            #[cfg(test)]
-            summary_decodes: std::cell::Cell::new(0),
-        }))
+        let reader: tantivy::IndexReader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        loop {
+            let meta = index.load_metas()?;
+            let manifest = decode_manifest(meta.payload.as_deref())?;
+            let version = segment_version(
+                meta.segments
+                    .iter()
+                    .map(|s| (s.id().uuid_string(), s.num_deleted_docs())),
+            );
+            let searcher = reader.searcher();
+            // The manifest and searcher must describe the same published records.
+            // Retry a concurrent commit without holding up the importer.
+            if version
+                != segment_version(
+                    searcher
+                        .segment_readers()
+                        .iter()
+                        .map(|s| (s.segment_id().uuid_string(), s.max_doc() - s.num_docs())),
+                )
+            {
+                reader.reload()?;
+                continue;
+            }
+            return Ok(Some(Self {
+                index,
+                searcher,
+                fields,
+                semantic_version: manifest.semantic_version.unwrap_or(version),
+                #[cfg(test)]
+                record_decodes: RECORD_DECODES.with(Clone::clone),
+                #[cfg(test)]
+                summary_decodes: std::cell::Cell::new(0),
+            }));
+        }
     }
 
     fn addresses(&self, query: &dyn Query) -> Result<Vec<DocAddress>> {
@@ -615,17 +629,7 @@ impl ReadIndex {
     fn record(&self, address: DocAddress) -> Result<Record> {
         #[cfg(test)]
         self.record_decodes.set(self.record_decodes.get() + 1);
-        let doc: TantivyDocument = self.searcher.doc(address)?;
-        let bytes = doc
-            .get_first(self.fields.record)
-            .and_then(|v| v.as_bytes())
-            .context("record missing from index")?;
-        let stored: StoredRecord = serde_json::from_slice(bytes)?;
-        stored.restore(
-            doc.get_first(self.fields.text)
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-        )
+        read_record(&self.searcher, self.fields, address)
     }
 
     fn query(&self, query: &dyn Query) -> Result<Vec<(f32, Record)>> {
@@ -915,7 +919,7 @@ impl ReadIndex {
         Ok((page, next))
     }
 
-    pub fn messages(&self) -> Result<Vec<(Record, String)>> {
+    pub fn messages(&self) -> Result<Vec<ConversationMessage>> {
         let mut records = Vec::new();
         for (segment_ord, segment) in self.searcher.segment_readers().iter().enumerate() {
             let messages = segment.fast_fields().bool("conversation_message")?;
@@ -925,18 +929,8 @@ impl ReadIndex {
                 if !messages.first(doc_id).context("message marker missing")? {
                     continue;
                 }
-                let mut record = self.record(DocAddress::new(segment_ord as u32, doc_id))?;
-                let text = record
-                    .message_text()
-                    .context("invalid message marker")?
-                    .into_owned();
-                record.text = record
-                    .text
-                    .chars()
-                    .take(crate::record::SEARCH_SNIPPET_CHARS)
-                    .collect();
-                record.structured_content = Value::Null;
-                records.push((record, text));
+                let record = self.record(DocAddress::new(segment_ord as u32, doc_id))?;
+                records.push(ConversationMessage::new(&record).context("invalid message marker")?);
             }
         }
         Ok(records)
@@ -1208,29 +1202,76 @@ pub fn records(root: &Path) -> Result<Vec<Record>> {
     ReadIndex::open(root)?.map_or_else(|| Ok(Vec::new()), |index| index.all())
 }
 
-/// Identify the published records, ignoring commits that only update source
-/// stamps. `None` without an index.
-pub fn content_version(root: &Path) -> Result<Option<String>> {
+fn segment_version(segments: impl IntoIterator<Item = (String, u32)>) -> String {
+    let mut segments: Vec<_> = segments
+        .into_iter()
+        .map(|(id, deleted)| format!("{id}:{deleted}"))
+        .collect();
+    segments.sort();
+    digest(&segments.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// Changes to lexical-only content, parser state and segment layout do not
+/// invalidate conversation planning. `None` without an index.
+pub fn semantic_version(root: &Path) -> Result<Option<String>> {
     let path = root.join("index");
     if !path.join("meta.json").try_exists()? {
         return Ok(None);
     }
-    let mut segments: Vec<_> = Index::open_in_dir(&path)?
-        .load_metas()?
-        .segments
-        .iter()
-        .map(|segment| {
-            format!(
-                "{}:{}",
-                segment.id().uuid_string(),
-                segment.num_deleted_docs()
-            )
-        })
-        .collect();
-    // Commits may list unchanged segments in a different order.
-    segments.sort();
-    let segments: Vec<_> = segments.iter().map(String::as_str).collect();
-    Ok(Some(digest(&segments)))
+    let meta = Index::open_in_dir(&path)?.load_metas()?;
+    Ok(Some(
+        decode_manifest(meta.payload.as_deref())?
+            .semantic_version
+            .unwrap_or_else(|| {
+                segment_version(
+                    meta.segments
+                        .iter()
+                        .map(|s| (s.id().uuid_string(), s.num_deleted_docs())),
+                )
+            }),
+    ))
+}
+
+fn read_record(searcher: &Searcher, fields: Fields, address: DocAddress) -> Result<Record> {
+    let doc: TantivyDocument = searcher.doc(address)?;
+    let bytes = doc
+        .get_first(fields.record)
+        .and_then(|v| v.as_bytes())
+        .context("record missing from index")?;
+    let stored: StoredRecord = serde_json::from_slice(bytes)?;
+    stored.restore(
+        doc.get_first(fields.text)
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    )
+}
+
+fn message_hash(record: &Record) -> Result<Option<String>> {
+    ConversationMessage::new(record)
+        .map(|message| Ok(digest(&[&serde_json::to_string(&message)?])))
+        .transpose()
+}
+
+fn removed_message_hashes(
+    searcher: &Searcher,
+    fields: Fields,
+    query: &dyn Query,
+    hashes: &mut Vec<String>,
+) -> Result<()> {
+    for address in searcher.search(query, &DocSetCollector)? {
+        let messages = searcher
+            .segment_reader(address.segment_ord)
+            .fast_fields()
+            .bool("conversation_message")?;
+        if messages
+            .first(address.doc_id)
+            .context("message marker missing")?
+        {
+            let record = read_record(searcher, fields, address)?;
+            hashes.push(message_hash(&record)?.context("invalid message marker")?);
+        }
+    }
+    Ok(())
 }
 
 fn term_query(term: Term) -> Box<dyn Query> {
@@ -1508,7 +1549,15 @@ fn update_with_parser(
         "incompatible history index at {}; move that directory aside, then re-import your sources",
         path.display()
     );
-    let mut manifest = manifest(&index)?;
+    let meta = index.load_metas()?;
+    let mut manifest = decode_manifest(meta.payload.as_deref())?;
+    let previous_version = manifest.semantic_version.clone().unwrap_or_else(|| {
+        segment_version(
+            meta.segments
+                .iter()
+                .map(|s| (s.id().uuid_string(), s.num_deleted_docs())),
+        )
+    });
     // Checkpoints load from the commit the manifest belongs to; the update
     // lock excludes other writers.
     let searcher = index
@@ -1613,11 +1662,19 @@ fn update_with_parser(
         // The budget is split across workers. Small per-worker buffers cause
         // frequent segment flushes and merges for content-heavy transcripts.
         let mut writer = index.writer_with_num_threads(WRITER_THREADS, WRITER_MEMORY_BYTES)?;
+        let mut removed_messages = Vec::new();
+        let mut added_messages = Vec::new();
         for (key, change) in changes {
             let source = Term::from_field_text(fields.source, &key);
             match &change.replace {
                 // Also deletes the checkpoint document.
                 providers::Replace::All => {
+                    removed_message_hashes(
+                        &searcher,
+                        fields,
+                        &*term_query(source.clone()),
+                        &mut removed_messages,
+                    )?;
                     writer.delete_term(source.clone());
                 }
                 providers::Replace::Append => {}
@@ -1627,7 +1684,7 @@ fn update_with_parser(
                             fields.session,
                             &crate::record::session_id(change.provider, &suffix.native_session),
                         );
-                        writer.delete_query(Box::new(BooleanQuery::new(vec![
+                        let query = BooleanQuery::new(vec![
                             (Occur::Must, term_query(source.clone())),
                             (Occur::Must, term_query(session)),
                             (
@@ -1640,7 +1697,9 @@ fn update_with_parser(
                                     std::ops::Bound::Unbounded,
                                 )),
                             ),
-                        ])))?;
+                        ]);
+                        removed_message_hashes(&searcher, fields, &query, &mut removed_messages)?;
+                        writer.delete_query(Box::new(query))?;
                     }
                 }
             }
@@ -1665,6 +1724,9 @@ fn update_with_parser(
                 record.workspace_root = manifest
                     .workspace_roots
                     .resolve(&record.session_id, &record.workspace);
+                if let Some(hash) = message_hash(&record)? {
+                    added_messages.push(hash);
+                }
                 let full = serde_json::to_vec(&StoredRecord::new(record.clone()))?;
                 let message = record.is_conversation_message();
                 let mut summary = record.clone();
@@ -1701,6 +1763,18 @@ fn update_with_parser(
                 writer.add_document(document)?;
             }
         }
+        // Compare the actual pairing inputs, including result metadata. Sorting
+        // makes suffix replay and segment order irrelevant while retaining duplicates.
+        removed_messages.sort();
+        added_messages.sort();
+        manifest.semantic_version = Some(if removed_messages == added_messages {
+            previous_version
+        } else {
+            digest(&[
+                &previous_version,
+                &serde_json::to_string(&(removed_messages, added_messages))?,
+            ])
+        });
         // Checkpoints and records become visible together; an interrupted writer
         // cannot mark input as processed without publishing its records.
         let mut commit = writer.prepare_commit()?;
@@ -1939,9 +2013,11 @@ pub(crate) mod tests {
                 .payload
                 .unwrap()
         };
-        // The manifest without stamps, whose numbers vary in width.
+        // Stamps vary in width; compare the content revision's size, not its value.
         let unstamped = || {
             let mut manifest: Value = serde_json::from_str(&payload()).unwrap();
+            manifest["semantic_version"] =
+                json!(manifest["semantic_version"].as_str().unwrap().len());
             for input in manifest["inputs"].as_object_mut().unwrap().values_mut() {
                 input.as_object_mut().unwrap().remove("stamp");
             }
@@ -2004,19 +2080,20 @@ pub(crate) mod tests {
         assert_full_parse(&config, &path);
 
         // A stamp change without new content keeps the published records.
-        let version = content_version(&config.root).unwrap();
+        let version = semantic_version(&config.root).unwrap();
         let file = File::options().write(true).open(&path).unwrap();
         file.set_modified(std::time::SystemTime::UNIX_EPOCH)
             .unwrap();
         drop(file);
         let report = update(&config, std::slice::from_ref(&source), false).unwrap();
         assert_eq!(source_stats(&report).0, 51);
-        assert_eq!(content_version(&config.root).unwrap(), version);
+        assert_eq!(semantic_version(&config.root).unwrap(), version);
 
         // A manifest from an earlier version, with inline checkpoints, causes
         // one full reparse that replaces every record and checkpoint.
         let index = Index::open_in_dir(config.root.join("index")).unwrap();
         let mut old: Value = serde_json::from_str(&payload()).unwrap();
+        old.as_object_mut().unwrap().remove("semantic_version");
         for input in old["inputs"].as_object_mut().unwrap().values_mut() {
             let input = input.as_object_mut().unwrap();
             input.remove("checkpointed");
@@ -2029,6 +2106,7 @@ pub(crate) mod tests {
         commit.set_payload(&old.to_string());
         commit.commit().unwrap();
         drop(writer);
+        let old_version = ReadIndex::open(&config.root).unwrap().unwrap().version();
         let mut previous = Vec::new();
         update_with_parser(
             &config,
@@ -2042,6 +2120,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(previous, [false]);
+        assert_eq!(semantic_version(&config.root).unwrap(), Some(old_version));
         assert_full_parse(&config, &path);
         let searcher = index.reader().unwrap().searcher();
         let checkpoints = searcher
@@ -2286,7 +2365,7 @@ pub(crate) mod tests {
         let messages = index.messages().unwrap();
         assert_eq!(index.record_decodes.get(), 1);
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].1, "needle");
+        assert_eq!(messages[0].text, "needle");
         index.record_decodes.set(0);
         crate::semantic::refresh(&config).unwrap();
         assert_eq!(index.record_decodes.get(), 1);
@@ -2556,12 +2635,17 @@ pub(crate) mod tests {
         let pinned = ReadIndex::open(&config.root).unwrap().unwrap();
         let messages = pinned.messages().unwrap();
         assert_eq!(messages.len(), 3);
-        assert!(messages.iter().any(|(_, text)| text.is_empty()));
-        let (user, visible) = messages
+        assert!(messages.iter().any(|message| message.text.is_empty()));
+        let user = messages
             .iter()
-            .find(|(record, _)| record.provider_event_id == "user")
+            .find(|message| {
+                message
+                    .request
+                    .as_ref()
+                    .is_some_and(|record| record.provider_event_id == "user")
+            })
             .unwrap();
-        assert_eq!(visible, &text);
+        assert_eq!(user.text, text);
         assert_eq!(
             pinned.event_reference(&user.event_id).unwrap()[0].text,
             text
@@ -2574,18 +2658,20 @@ pub(crate) mod tests {
         .unwrap();
         db.execute("DELETE FROM part WHERE id IN ('answer', 'empty')", [])
             .unwrap();
-        update(&config, &[source], false).unwrap();
+        update(&config, std::slice::from_ref(&source), false).unwrap();
+        let version = semantic_version(&config.root).unwrap().unwrap();
+        assert_ne!(version, pinned.version());
         let check = || {
-            let current = ReadIndex::open(&config.root)
-                .unwrap()
-                .unwrap()
-                .messages()
-                .unwrap();
+            let index = ReadIndex::open(&config.root).unwrap().unwrap();
+            assert_eq!(index.version(), version);
+            let current = index.messages().unwrap();
             assert_eq!(current.len(), 1);
-            assert_eq!(current[0].1, "edited");
-            assert_eq!(current[0].0.event_id, user.event_id);
+            assert_eq!(current[0].text, "edited");
+            assert_eq!(current[0].event_id, user.event_id);
             assert_eq!(pinned.messages().unwrap().len(), 3);
         };
+        check();
+        update_full(&config, &[source], false).unwrap();
         check();
         let index = Index::open_in_dir(config.root.join("index")).unwrap();
         let mut writer = index
