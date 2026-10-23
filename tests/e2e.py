@@ -26,6 +26,7 @@ from e2e_semantic import (
     semantic,
     unavailable,
 )
+from e2e_storage import index_storage
 from e2e_support import SCRATCH, Case, MissingPrerequisite, require, sha256, write_json
 from e2e_workflows import (
     benchmark_restore,
@@ -46,6 +47,7 @@ CASES = {
     "selection": selection,
     "workspaces": workspaces,
     "updates": updates,
+    "index-storage": index_storage,
     "busy-source": busy_source,
     "many-inputs": many_inputs,
     "jsonl-updates": jsonl_updates,

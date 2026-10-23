@@ -45,7 +45,9 @@ use tantivy::{
     DocAddress, DocSet, Index, ReloadPolicy, Searcher, SegmentReader, TERMINATED, TantivyDocument,
     Term,
     collector::{Collector, Count, DocSetCollector, SegmentCollector, TopDocs},
+    directory::{Directory, INDEX_WRITER_LOCK, META_LOCK},
     doc,
+    index::{SegmentComponent, SegmentId},
     query::{
         AllQuery, BooleanQuery, ConstScoreQuery, Occur, PhraseQuery, Query, RangeQuery, RegexQuery,
         TermQuery, TermSetQuery,
@@ -1517,6 +1519,65 @@ pub fn update_full(config: &Config, sources: &[Source], progress: bool) -> Resul
     )
 }
 
+fn segment_file_id(name: &str) -> Option<SegmentId> {
+    let (prefix, suffix) = name.split_once('.')?;
+    let id = SegmentId::from_uuid_string(prefix).ok()?;
+    if id.uuid_string() != prefix {
+        return None;
+    }
+    match suffix {
+        "store.temp" => {}
+        _ if suffix.ends_with(".del") => {
+            let generation = suffix.strip_suffix(".del")?;
+            if generation.parse::<u64>().ok()?.to_string() != generation {
+                return None;
+            }
+        }
+        _ => match SegmentComponent::try_from(suffix).ok()? {
+            SegmentComponent::Custom(_)
+            | SegmentComponent::TempStore
+            | SegmentComponent::Delete => {
+                return None;
+            }
+            _ => {}
+        },
+    }
+    Some(id)
+}
+
+/// Files lost from Tantivy's registry are invisible to its garbage collector.
+/// Published segments still own their files even when the registry omits them.
+fn remove_orphaned_files(index: &Index, path: &Path) -> Result<()> {
+    let _writer_lock = index.directory().acquire_lock(&INDEX_WRITER_LOCK)?;
+    // A reader of an older commit must finish opening its files before deletion.
+    // Subsequent readers load the current commit, which this scan preserves.
+    let meta_lock = index.directory().acquire_lock(&META_LOCK)?;
+    let published: HashSet<_> = index
+        .load_metas()?
+        .segments
+        .iter()
+        .map(|s| s.id())
+        .collect();
+    drop(meta_lock);
+    let managed = index.directory().list_managed_files();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(segment_file_id) else {
+            continue;
+        };
+        if !published.contains(&id)
+            && !managed.contains(Path::new(&name))
+            && entry.file_type()?.is_file()
+        {
+            fs::remove_file(entry.path()).with_context(|| {
+                format!("removing orphaned index file {}", entry.path().display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn update_with_parser(
     config: &Config,
     sources: &[Source],
@@ -1551,6 +1612,8 @@ fn update_with_parser(
     );
     let meta = index.load_metas()?;
     let mut manifest = decode_manifest(meta.payload.as_deref())?;
+    // Also collect forgotten files when no source has changed and no writer is needed.
+    remove_orphaned_files(&index, &path)?;
     let previous_version = manifest.semantic_version.clone().unwrap_or_else(|| {
         segment_version(
             meta.segments
