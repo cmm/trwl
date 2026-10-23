@@ -1,6 +1,7 @@
 //! Reusable CPU inference, separate from index updates and GPU workers.
-//! One process per data root and executable serves clients serially. It keeps
-//! one model selection, exits after 30 idle seconds, and stores no input text.
+//! One process per runtime/data/cache directory combination and executable serves
+//! clients serially. It keeps one model selection, exits after 30 idle seconds,
+//! and stores no input text.
 use super::{
     BATCH_SIZE, ChunkInput, DOCUMENT_PREFIX, Executor, QUERY_PREFIX, Selection, prepare_chunks,
     with_document_tokenizer,
@@ -97,17 +98,21 @@ impl Directory {
     }
 }
 
-fn directory(root: &Path) -> Result<Directory> {
+fn directory(directories: &crate::directories::Directories) -> Result<Directory> {
     let executable = fs::metadata(std::env::current_exe()?)?;
+    fs::create_dir_all(&directories.cache)?;
+    let cache = fs::metadata(&directories.cache)?;
     let identity = digest(&[&format!(
-        "{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}",
         executable.dev(),
         executable.ino(),
         executable.len(),
         executable.ctime(),
-        executable.ctime_nsec()
+        executable.ctime_nsec(),
+        cache.dev(),
+        cache.ino()
     )]);
-    let parent = root.join("inference");
+    let parent = directories.index_runtime()?.join("inference");
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -172,20 +177,26 @@ fn connect(directory: &Directory, timeout: Duration) -> Result<UnixStream> {
 }
 
 pub(super) struct Client {
-    root: PathBuf,
+    directories: crate::directories::Directories,
     selection: Selection,
 }
 impl Client {
-    pub(super) fn new(root: &Path, selection: &Selection) -> Self {
+    pub(super) fn new(
+        directories: &crate::directories::Directories,
+        selection: &Selection,
+    ) -> Self {
         Self {
-            root: root.to_owned(),
+            directories: directories.clone(),
             selection: selection.clone(),
         }
     }
 
-    fn connection(root: &Path, selection: &Selection) -> Result<UnixStream> {
+    fn connection(
+        directories: &crate::directories::Directories,
+        selection: &Selection,
+    ) -> Result<UnixStream> {
         for attempt in 0..2 {
-            let mut stream = Self::connect_or_start(root)?;
+            let mut stream = Self::connect_or_start(directories)?;
             let reply = send(&mut stream, &Request::Select(selection.clone()))
                 .and_then(|()| receive(&mut stream));
             match reply {
@@ -214,8 +225,8 @@ impl Client {
         unreachable!()
     }
 
-    fn connect_or_start(root: &Path) -> Result<UnixStream> {
-        let directory = directory(root)?;
+    fn connect_or_start(directories: &crate::directories::Directories) -> Result<UnixStream> {
+        let directory = directory(directories)?;
         let stream = match connect(&directory, INITIALIZE) {
             Ok(stream) => stream,
             Err(_) => {
@@ -234,9 +245,8 @@ impl Client {
                     Ok(stream) => stream,
                     Err(_) => {
                         let mut command = Command::new(std::env::current_exe()?);
+                        directories.inference_environment(&mut command)?;
                         command
-                            .arg("--data-root")
-                            .arg(root)
                             .arg("embedding-server")
                             .stdin(Stdio::null())
                             .stdout(Stdio::null())
@@ -281,7 +291,7 @@ impl Client {
     fn request(&self, request: &Request) -> Result<Reply> {
         // Do not hold a server connection while acquiring an index/cache lock.
         // Updaters can hold that lock while waiting for their own inference.
-        let mut stream = Self::connection(&self.root, &self.selection)?;
+        let mut stream = Self::connection(&self.directories, &self.selection)?;
         send(&mut stream, request)?;
         match receive(&mut stream)? {
             Reply::Failed(message) => bail!("inference failed: {message}"),
@@ -317,8 +327,8 @@ impl Client {
     }
 }
 
-pub(crate) fn stop(root: &Path) -> Result<()> {
-    let path = root.join("inference");
+pub(crate) fn stop(directories: &crate::directories::Directories) -> Result<()> {
+    let path = directories.index_runtime()?.join("inference");
     if !path.try_exists()? {
         return Ok(());
     }
@@ -389,8 +399,8 @@ impl Drop for Deadline<'_> {
     }
 }
 
-pub(crate) fn run(root: &Path) -> Result<()> {
-    let directory = directory(root)?;
+pub(crate) fn run(directories: &crate::directories::Directories) -> Result<()> {
+    let directory = directory(directories)?;
     let Some(_guard) = config::try_lock(&directory.path(), "server.lock")? else {
         return Ok(());
     };

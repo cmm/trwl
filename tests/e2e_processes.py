@@ -113,7 +113,7 @@ def refresh_restart(case):
 
     # Writing the documented mode avoids the mode setter's daemon autostart. The
     # only persistent worker we launch directly is an owned foreground process.
-    config = case.data / "config.toml"
+    config = case.config / "config.toml"
     manual_config = config.read_text()
     config.write_text(manual_config.replace('mode = "manual"', 'mode = "auto"', 1))
     daemon = None
@@ -218,15 +218,15 @@ def refresh_restart(case):
     )
 
     copied = case.root / "reopened-data"
-    shutil.copytree(case.data, copied)
-    previous_root = case.env["TRWL_DATA_ROOT"]
-    case.env["TRWL_DATA_ROOT"] = str(copied)
+    shutil.copytree(case.data, copied / "trwl")
+    previous_root = case.env["XDG_DATA_HOME"]
+    case.env["XDG_DATA_HOME"] = str(copied)
     try:
         for marker, text, identity in records:
             _message(case, marker, text, "opencode", session, identity=identity)
         _listed_messages(case, old_id[1], [old, waited, background, restarted])
     finally:
-        case.env["TRWL_DATA_ROOT"] = previous_root
+        case.env["XDG_DATA_HOME"] = previous_root
     case.check(
         "copied data directory reopens the same IDs and full text without import"
     )

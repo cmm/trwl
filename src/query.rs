@@ -60,7 +60,7 @@ pub(crate) fn bound(value: &str, until: bool) -> Result<String> {
 }
 
 pub fn search(config: &Config, args: &Search) -> Result<SearchReport> {
-    let index = ReadIndex::open(&config.root)?;
+    let index = ReadIndex::open(&config.directories.data)?;
     search_index(config, args, index.as_ref())
 }
 
@@ -580,7 +580,7 @@ mod tests {
             rows.push_str(&format!("{row}\n"));
         }
         std::fs::write(&path, rows).unwrap();
-        let config = Config::load(&dir.path().join("data")).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let index = import(&config, Provider::Codex, &path);
         (dir, index)
     }
@@ -606,7 +606,7 @@ mod tests {
             rows.push_str(&format!("{header}\n{message}\n"));
         }
         std::fs::write(&path, rows).unwrap();
-        let config = Config::load(&dir.path().join("data")).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         import(&config, Provider::Codex, &path);
         let mut args = Search {
             query: "needle".into(),
@@ -748,7 +748,7 @@ mod tests {
             },
         });
         std::fs::write(&path, format!("{header}\n{message}\n")).unwrap();
-        let config = Config::load(&dir.path().join("data")).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let next = import(&config, Provider::Pi, &path);
         assert!(
             resolve_in(&next, Entity::Session, "native")

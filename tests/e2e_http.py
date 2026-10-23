@@ -289,7 +289,7 @@ def semantic_cache(case):
     fixture.message("cache", "first", "cachebeacon first")
     fixture.message("cache", "second", "cachebeacon second")
     case.json_command("import", "--provider", "opencode", "--path", fixture.path)
-    database = case.data / "semantic" / "cache.sqlite3"
+    database = case.cache / "semantic" / "cache.sqlite3"
     with EmbeddingServer(embed=lambda texts: [[1.0, 0.0] for _ in texts]) as api:
         api.enable(case)
 

@@ -146,10 +146,8 @@ indexing problem. Use these checks according to what is missing:
 - **History from a particular source:** run `trwl sources list` and check for the
   expected input path. Refresh reads only configured and discovered inputs;
   report any missing source that prevents answering the question.
-- **A different history collection than expected:** run `trwl status` and check
-  `data_root`. `--data-root` and `TRWL_DATA_ROOT` select the collection. Status
-  includes both indexes and updater activity; updater liveness alone does not
-  establish readiness.
+- **A different history collection than expected:** run `trwl status --format json`
+  and check `directories.data`, which is selected by `XDG_DATA_HOME`.
 
 Use `trwl --help` and `trwl COMMAND --help` for command syntax.
 

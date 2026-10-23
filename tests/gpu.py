@@ -67,7 +67,7 @@ def run_case(root, mode, args):
         profiles.mkdir()
         case.env["TRWL_SEMANTIC_PROFILE_DIR"] = str(profiles)
         _, expected = _fixture(case)
-        config = case.data / "config.toml"
+        config = case.config / "config.toml"
         config.write_text(
             config.read_text() + "[semantic]\nbuiltin_throttling = false\n"
         )
@@ -119,7 +119,7 @@ def run_case(root, mode, args):
                 "openvino-gpu": "OpenVINOExecutionProvider",
             }[args.device],
         )
-        database = case.data / "semantic/cache.sqlite3"
+        database = case.cache / "semantic/cache.sqlite3"
         vectors = {}
         with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
             for key, blob in connection.execute("SELECT key, vector FROM vectors"):

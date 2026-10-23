@@ -1410,7 +1410,7 @@ fn stage_input(
     input: &PlannedInput,
     previous: Option<providers::Checkpoint>,
     spool: &mut Option<BufWriter<File>>,
-    root: &Path,
+    directories: &crate::directories::Directories,
     parse: &mut impl FnMut(
         Provider,
         &Path,
@@ -1421,7 +1421,8 @@ fn stage_input(
     // Stage records on disk. Failed sources leave unused byte ranges;
     // one unlinked file bounds memory and open descriptors.
     if spool.is_none() {
-        *spool = Some(BufWriter::new(tempfile::tempfile_in(root)?));
+        fs::create_dir_all(&directories.cache)?;
+        *spool = Some(BufWriter::new(tempfile::tempfile_in(&directories.cache)?));
     }
     let spool = spool.as_mut().unwrap();
     let start = spool.stream_position()?;
@@ -1447,7 +1448,7 @@ fn stage_input(
 }
 
 pub fn status(config: &Config) -> Result<LexicalStatus> {
-    let path = config.root.join("index");
+    let path = config.directories.data.join("index");
     let initialized = path.join("meta.json").try_exists()?;
     let (manifest, events) = if initialized {
         let index = Index::open_in_dir(&path)?;
@@ -1472,7 +1473,7 @@ pub fn status(config: &Config) -> Result<LexicalStatus> {
     };
     let plan = plan_inputs(&config.sources()?, &manifest);
     let pending = plan.inputs.iter().filter(|input| input.changed).count();
-    let active = is_locked(&config.root, "update.lock")?;
+    let active = is_locked(&config.directories.data, "update.lock")?;
     let state = if !plan.errors.is_empty() {
         State::Blocked
     } else if active {
@@ -1590,14 +1591,14 @@ fn update_with_parser(
         &mut dyn FnMut(&Record) -> Result<()>,
     ) -> Result<providers::Parsed>,
 ) -> Result<ImportReport> {
-    let _guard = lock(&config.root, "update.lock")?;
+    let _guard = lock(&config.directories.data, "update.lock")?;
     if progress {
         eprintln!(
             "{}",
             json!({"type": "trwl_progress", "operation": "import", "status": "started"})
         );
     }
-    let path = config.root.join("index");
+    let path = config.directories.data.join("index");
     fs::create_dir_all(&path)?;
     let (schema, fields) = schema();
     let index = if path.join("meta.json").exists() {
@@ -1658,7 +1659,13 @@ fn update_with_parser(
             _ => Ok(None),
         };
         let parsed = previous.and_then(|previous| {
-            stage_input(&input, previous, &mut spool, &config.root, &mut parse)
+            stage_input(
+                &input,
+                previous,
+                &mut spool,
+                &config.directories,
+                &mut parse,
+            )
         });
         match parsed {
             Ok((parsed, range, unchanged)) => {
@@ -1937,15 +1944,15 @@ pub(crate) mod tests {
     #[test]
     fn incompatible_indexes_remain_untouched_and_explain_reimport() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(dir.path()).unwrap();
-        let path = dir.path().join("index");
-        fs::create_dir(&path).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
+        let path = config.directories.data.join("index");
+        fs::create_dir_all(&path).unwrap();
         let mut old = Schema::builder();
         old.add_text_field("obsolete", TEXT);
         Index::create_in_dir(&path, old.build()).unwrap();
         let metadata = fs::read(path.join("meta.json")).unwrap();
         for error in [
-            ReadIndex::open(dir.path()).err().unwrap(),
+            ReadIndex::open(&config.directories.data).err().unwrap(),
             status(&config).err().unwrap(),
             update(&config, &[], false).err().unwrap(),
         ] {
@@ -1965,7 +1972,7 @@ pub(crate) mod tests {
             Ok(())
         })
         .unwrap();
-        let mut actual = records(&config.root).unwrap();
+        let mut actual = records(&config.directories.data).unwrap();
         actual.sort_by_key(|record| record.sequence);
         assert_eq!(
             serde_json::to_value(&actual).unwrap(),
@@ -1983,7 +1990,7 @@ pub(crate) mod tests {
         fs::write(&path, format!("{HEADER}{row}{survivor}")).unwrap();
         let source = source(Provider::Codex, &path);
         update(&config, std::slice::from_ref(&source), false).unwrap();
-        let pinned = ReadIndex::open(&config.root).unwrap().unwrap();
+        let pinned = ReadIndex::open(&config.directories.data).unwrap().unwrap();
         let survivor_id = assert_full_parse(&config, &path)[1].event_id.clone();
         // Edit the old prefix while growing the file, then rewrite at the same
         // length, truncate, and replace its inode. None may reuse stale records.
@@ -2029,7 +2036,7 @@ pub(crate) mod tests {
         let row = fs::read_to_string(&path).unwrap()[HEADER.len()..].to_owned();
         let source = source(Provider::Codex, &path);
         update(&config, std::slice::from_ref(&source), false).unwrap();
-        let pinned = ReadIndex::open(&config.root).unwrap().unwrap();
+        let pinned = ReadIndex::open(&config.directories.data).unwrap().unwrap();
         fs::write(
             &path,
             format!("{HEADER}{row}{row}{{\"type\":\"session_meta\",\"payload\":{{}}}}\n"),
@@ -2037,7 +2044,7 @@ pub(crate) mod tests {
         .unwrap();
         let report = update(&config, std::slice::from_ref(&source), false).unwrap();
         assert!(!report.completed());
-        let current = ReadIndex::open(&config.root).unwrap().unwrap();
+        let current = ReadIndex::open(&config.directories.data).unwrap().unwrap();
         assert_eq!(current.all().unwrap().len(), 1);
         fs::write(&path, format!("{HEADER}{row}{row}")).unwrap();
         update(&config, std::slice::from_ref(&source), false).unwrap();
@@ -2069,7 +2076,7 @@ pub(crate) mod tests {
         let (_dir, config, path) = crate::test_support::history_file("rollout.jsonl");
         let source = source(Provider::Codex, &path);
         let payload = || {
-            Index::open_in_dir(config.root.join("index"))
+            Index::open_in_dir(config.directories.data.join("index"))
                 .unwrap()
                 .load_metas()
                 .unwrap()
@@ -2089,7 +2096,7 @@ pub(crate) mod tests {
         // An input with session metadata but no records still has a checkpoint.
         fs::write(&path, HEADER).unwrap();
         update(&config, std::slice::from_ref(&source), false).unwrap();
-        let index = ReadIndex::open(&config.root).unwrap().unwrap();
+        let index = ReadIndex::open(&config.directories.data).unwrap().unwrap();
         assert!(index.is_empty().unwrap());
         assert!(index.all().unwrap().is_empty());
         assert!(index.messages().unwrap().is_empty());
@@ -2143,18 +2150,18 @@ pub(crate) mod tests {
         assert_full_parse(&config, &path);
 
         // A stamp change without new content keeps the published records.
-        let version = semantic_version(&config.root).unwrap();
+        let version = semantic_version(&config.directories.data).unwrap();
         let file = File::options().write(true).open(&path).unwrap();
         file.set_modified(std::time::SystemTime::UNIX_EPOCH)
             .unwrap();
         drop(file);
         let report = update(&config, std::slice::from_ref(&source), false).unwrap();
         assert_eq!(source_stats(&report).0, 51);
-        assert_eq!(semantic_version(&config.root).unwrap(), version);
+        assert_eq!(semantic_version(&config.directories.data).unwrap(), version);
 
         // A manifest from an earlier version, with inline checkpoints, causes
         // one full reparse that replaces every record and checkpoint.
-        let index = Index::open_in_dir(config.root.join("index")).unwrap();
+        let index = Index::open_in_dir(config.directories.data.join("index")).unwrap();
         let mut old: Value = serde_json::from_str(&payload()).unwrap();
         old.as_object_mut().unwrap().remove("semantic_version");
         for input in old["inputs"].as_object_mut().unwrap().values_mut() {
@@ -2169,7 +2176,10 @@ pub(crate) mod tests {
         commit.set_payload(&old.to_string());
         commit.commit().unwrap();
         drop(writer);
-        let old_version = ReadIndex::open(&config.root).unwrap().unwrap().version();
+        let old_version = ReadIndex::open(&config.directories.data)
+            .unwrap()
+            .unwrap()
+            .version();
         let mut previous = Vec::new();
         update_with_parser(
             &config,
@@ -2183,7 +2193,10 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(previous, [false]);
-        assert_eq!(semantic_version(&config.root).unwrap(), Some(old_version));
+        assert_eq!(
+            semantic_version(&config.directories.data).unwrap(),
+            Some(old_version)
+        );
         assert_full_parse(&config, &path);
         let searcher = index.reader().unwrap().searcher();
         let checkpoints = searcher
@@ -2347,12 +2360,15 @@ pub(crate) mod tests {
     fn hybrid_fallback_before_record_decoding(enabled: bool, cache: Option<&[u8]>, reason: &str) {
         use crate::cli::{Backend, Filters, Refresh, Search};
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::edit(dir.path(), |doc| {
-            doc["search"]["semantic"] = toml_edit::value(enabled);
-            doc["semantic"]["executor"] = toml_edit::value("http://127.0.0.1:1/v1");
-            doc["semantic"]["model"] = toml_edit::value("test");
-            Ok(())
-        })
+        let config = Config::edit(
+            &crate::directories::Directories::isolated(dir.path()),
+            |doc| {
+                doc["search"]["semantic"] = toml_edit::value(enabled);
+                doc["semantic"]["executor"] = toml_edit::value("http://127.0.0.1:1/v1");
+                doc["semantic"]["model"] = toml_edit::value("test");
+                Ok(())
+            },
+        )
         .unwrap();
         if let Some(cache) = cache {
             crate::semantic::tests::write_cache(&config, cache);
@@ -2400,12 +2416,15 @@ pub(crate) mod tests {
     #[test]
     fn cached_semantic_refresh_skips_excluded_record_payloads() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::edit(dir.path(), |doc| {
-            doc["search"]["semantic"] = toml_edit::value(true);
-            doc["semantic"]["executor"] = toml_edit::value("http://127.0.0.1:1/v1");
-            doc["semantic"]["model"] = toml_edit::value("test");
-            Ok(())
-        })
+        let config = Config::edit(
+            &crate::directories::Directories::isolated(dir.path()),
+            |doc| {
+                doc["search"]["semantic"] = toml_edit::value(true);
+                doc["semantic"]["executor"] = toml_edit::value("http://127.0.0.1:1/v1");
+                doc["semantic"]["model"] = toml_edit::value("test");
+                Ok(())
+            },
+        )
         .unwrap();
         let cache = rmp_serde::to_vec(&HashMap::from([(
             "vectors",
@@ -2503,7 +2522,7 @@ pub(crate) mod tests {
                 Ok(())
             })
             .unwrap();
-            let mut actual: Vec<_> = records(&config.root)
+            let mut actual: Vec<_> = records(&config.directories.data)
                 .unwrap()
                 .into_iter()
                 .map(|r| r.text)
@@ -2558,7 +2577,7 @@ pub(crate) mod tests {
         write(insert, "p2", "two");
         let source = source(Provider::Opencode, &path);
         let texts = || {
-            let mut texts: Vec<_> = records(&config.root)
+            let mut texts: Vec<_> = records(&config.directories.data)
                 .unwrap()
                 .into_iter()
                 .map(|r| r.text)
@@ -2613,7 +2632,7 @@ pub(crate) mod tests {
             update(&config, std::slice::from_ref(&source), false).unwrap();
         }
         let check = || {
-            let index = ReadIndex::open(&config.root).unwrap().unwrap();
+            let index = ReadIndex::open(&config.directories.data).unwrap().unwrap();
             let hits = index
                 .lexical(
                     &["needle".into()],
@@ -2644,7 +2663,7 @@ pub(crate) mod tests {
             }
         };
         check();
-        let index = Index::open_in_dir(config.root.join("index")).unwrap();
+        let index = Index::open_in_dir(config.directories.data.join("index")).unwrap();
         let mut writer = index
             .writer_with_num_threads::<TantivyDocument>(1, 15_000_000)
             .unwrap();
@@ -2695,7 +2714,7 @@ pub(crate) mod tests {
         }
         let source = source(Provider::Opencode, &path);
         update(&config, std::slice::from_ref(&source), false).unwrap();
-        let pinned = ReadIndex::open(&config.root).unwrap().unwrap();
+        let pinned = ReadIndex::open(&config.directories.data).unwrap().unwrap();
         let messages = pinned.messages().unwrap();
         assert_eq!(messages.len(), 3);
         assert!(messages.iter().any(|message| message.text.is_empty()));
@@ -2722,10 +2741,10 @@ pub(crate) mod tests {
         db.execute("DELETE FROM part WHERE id IN ('answer', 'empty')", [])
             .unwrap();
         update(&config, std::slice::from_ref(&source), false).unwrap();
-        let version = semantic_version(&config.root).unwrap().unwrap();
+        let version = semantic_version(&config.directories.data).unwrap().unwrap();
         assert_ne!(version, pinned.version());
         let check = || {
-            let index = ReadIndex::open(&config.root).unwrap().unwrap();
+            let index = ReadIndex::open(&config.directories.data).unwrap().unwrap();
             assert_eq!(index.version(), version);
             let current = index.messages().unwrap();
             assert_eq!(current.len(), 1);
@@ -2736,7 +2755,7 @@ pub(crate) mod tests {
         check();
         update_full(&config, &[source], false).unwrap();
         check();
-        let index = Index::open_in_dir(config.root.join("index")).unwrap();
+        let index = Index::open_in_dir(config.directories.data.join("index")).unwrap();
         let mut writer = index
             .writer_with_num_threads::<TantivyDocument>(1, 15_000_000)
             .unwrap();
@@ -2764,7 +2783,7 @@ pub(crate) mod tests {
             .unwrap();
         }
         tx.commit().unwrap();
-        let config = Config::load(&dir.path().join("data")).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let source = source(Provider::Opencode, &path);
         update(&config, std::slice::from_ref(&source), false).unwrap();
         db.execute(
@@ -2803,7 +2822,7 @@ pub(crate) mod tests {
         );
         assert!(wrote_during_snapshot, "changed source was not parsed");
         assert!(result.unwrap().completed());
-        let before_catchup = records(&config.root).unwrap();
+        let before_catchup = records(&config.directories.data).unwrap();
         assert_eq!(before_catchup.len(), 2);
         let visible = before_catchup
             .iter()
@@ -2819,7 +2838,7 @@ pub(crate) mod tests {
             "one import must not mix source transactions"
         );
         update(&config, &[source], false).unwrap();
-        let after = ReadIndex::open(&config.root)
+        let after = ReadIndex::open(&config.directories.data)
             .unwrap()
             .unwrap()
             .event_reference(&visible.event_id)
@@ -2850,7 +2869,7 @@ pub(crate) mod tests {
         let source = source(Provider::Opencode, &path);
         replace("first", 1);
         update(&config, std::slice::from_ref(&source), false).unwrap();
-        let pinned = ReadIndex::open(&config.root).unwrap().unwrap();
+        let pinned = ReadIndex::open(&config.directories.data).unwrap().unwrap();
         let id = pinned.all().unwrap()[0].event_id.clone();
         replace("other", 2);
         assert!(
@@ -2858,7 +2877,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .completed()
         );
-        assert_eq!(records(&config.root).unwrap()[0].text, "other");
+        assert_eq!(records(&config.directories.data).unwrap()[0].text, "other");
         {
             let db = rusqlite::Connection::open(&path).unwrap();
             db.execute(
@@ -2875,7 +2894,7 @@ pub(crate) mod tests {
                 .completed()
         );
         assert_eq!(
-            records(&config.root).unwrap()[0].text,
+            records(&config.directories.data).unwrap()[0].text,
             "other",
             "a later parse error must discard earlier spooled records"
         );
@@ -2887,10 +2906,10 @@ pub(crate) mod tests {
                 .unwrap()
                 .completed()
         );
-        assert_eq!(records(&config.root).unwrap()[0].text, "other");
+        assert_eq!(records(&config.directories.data).unwrap()[0].text, "other");
         replace("third", 3);
         update(&config, &[source], false).unwrap();
-        let current = records(&config.root).unwrap();
+        let current = records(&config.directories.data).unwrap();
         assert_eq!(current[0].event_id, id);
         assert_eq!(current[0].text, "third");
         assert_eq!(pinned.all().unwrap()[0].text, "first");
@@ -2899,21 +2918,21 @@ pub(crate) mod tests {
     #[test]
     fn pinned_reader_survives_replacement_and_directory_deletion() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(&dir.path().join("data")).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let root = dir.path().join("sessions");
         fs::create_dir(&root).unwrap();
         let path = root.join("rollout.jsonl");
         input(&path, "before");
         let source = source(Provider::Codex, &root);
         update(&config, std::slice::from_ref(&source), false).unwrap();
-        let pinned = ReadIndex::open(&config.root).unwrap().unwrap();
+        let pinned = ReadIndex::open(&config.directories.data).unwrap().unwrap();
         input(&path, "after");
         update(&config, std::slice::from_ref(&source), false).unwrap();
-        assert_eq!(records(&config.root).unwrap()[0].text, "after");
+        assert_eq!(records(&config.directories.data).unwrap()[0].text, "after");
         assert_eq!(pinned.all().unwrap()[0].text, "before");
         fs::remove_file(path).unwrap();
         update(&config, &[source], false).unwrap();
-        assert!(records(&config.root).unwrap().is_empty());
+        assert!(records(&config.directories.data).unwrap().is_empty());
         assert_eq!(pinned.all().unwrap()[0].text, "before");
     }
 }

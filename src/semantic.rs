@@ -135,8 +135,8 @@ struct ModelHash {
 }
 
 fn model_hash(config: &Config, directory: &Path) -> Result<String> {
-    let _lock = lock(&config.root, "semantic-cache.lock")?;
-    let path = config.root.join("semantic/model-hashes.json");
+    let _lock = lock(&config.directories.cache, "semantic-cache.lock")?;
+    let path = config.directories.cache.join("semantic/model-hashes.json");
     let mut cached: BTreeMap<PathBuf, ModelHash> = match fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes).context("invalid model hash cache")?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
@@ -477,7 +477,10 @@ enum Executor {
 impl Executor {
     fn shared(config: &Config, selection: &Selection) -> Result<Self> {
         if selection.directory.is_some() {
-            Ok(Self::Shared(server::Client::new(&config.root, selection)))
+            Ok(Self::Shared(server::Client::new(
+                &config.directories,
+                selection,
+            )))
         } else {
             let agent = ureq::Agent::config_builder()
                 .max_redirects(0)
@@ -1025,7 +1028,7 @@ fn fill(
     plan: FillPlan<'_>,
     executor: &mut Option<Executor>,
 ) -> Result<Cache> {
-    let _lock = lock(&config.root, "semantic.lock")?;
+    let _lock = lock(&config.directories.cache, "semantic.lock")?;
     fill_locked(config, selection, index, plan, executor, FillMode::Query)
 }
 
@@ -1077,7 +1080,7 @@ fn fill_locked(
         && (cache::full_build(config, &selection.key)? || heavy_incremental(&missing))
         && std::env::var_os("TRWL_SEMANTIC_CPU_ONLY").is_none_or(|v| v != "1")
     {
-        worker::Client::start(selection)?
+        worker::Client::start(&config.directories, selection)?
     } else {
         None
     };
@@ -1165,8 +1168,8 @@ pub fn rebuild(config: &Config) -> Result<()> {
 }
 
 fn refresh_inner(config: &Config, rebuild: bool, tokenizer: &mut PlanningTokenizer) -> Result<()> {
-    let _lock = lock(&config.root, "semantic.lock")?;
-    let Some(index) = ReadIndex::open(&config.root)? else {
+    let _lock = lock(&config.directories.cache, "semantic.lock")?;
+    let Some(index) = ReadIndex::open(&config.directories.data)? else {
         return Ok(());
     };
     let selection = Selection::from_config(config)?;
@@ -1192,7 +1195,7 @@ fn refresh_inner(config: &Config, rebuild: bool, tokenizer: &mut PlanningTokeniz
 }
 
 pub fn status(config: &Config) -> Result<SemanticStatus> {
-    let active = is_locked(&config.root, "semantic.lock")?;
+    let active = is_locked(&config.directories.cache, "semantic.lock")?;
     let mut report = SemanticStatus {
         enabled: config.semantic(),
         active,
@@ -1220,7 +1223,7 @@ pub fn status(config: &Config) -> Result<SemanticStatus> {
 }
 
 fn coverage(config: &Config, report: &mut SemanticStatus) -> Result<()> {
-    let Some(index) = ReadIndex::open(&config.root)? else {
+    let Some(index) = ReadIndex::open(&config.directories.data)? else {
         report.state = State::Uninitialized;
         return Ok(());
     };
@@ -1287,7 +1290,11 @@ pub fn search(
     // Without a cache directory, passive search cannot reuse any vectors. Check
     // this before hashing the built-in model files to determine cache identity.
     let empty = index.is_empty()?;
-    if !fill_missing && !empty && config.semantic() && !config.root.join("semantic").try_exists()? {
+    if !fill_missing
+        && !empty
+        && config.semantic()
+        && !config.directories.cache.join("semantic").try_exists()?
+    {
         bail!("semantic index has no embeddings for current history; use --refresh wait");
     }
     let selection = Selection::from_config(config)?;
@@ -1313,7 +1320,7 @@ pub fn search(
     let mut executor = Some(Executor::shared(config, &selection)?);
     let queries = executor.as_mut().unwrap().embed(terms, QUERY_PREFIX)?;
     let mut tokenizer = if selection.directory.is_some() {
-        PlanningTokenizer::Shared(server::Client::new(&config.root, &selection))
+        PlanningTokenizer::Shared(server::Client::new(&config.directories, &selection))
     } else {
         PlanningTokenizer::default()
     };
@@ -1390,7 +1397,7 @@ pub(crate) mod tests {
     };
 
     pub fn write_cache(config: &Config, bytes: &[u8]) {
-        let path = config.root.join("semantic").join(format!(
+        let path = config.directories.cache.join("semantic").join(format!(
             "{}.msgpack",
             Selection::from_config(config).unwrap().key
         ));
@@ -1401,10 +1408,13 @@ pub(crate) mod tests {
     #[ignore = "requires the built-in model and ONNX Runtime with the OpenVINO provider"]
     fn builtin_providers_produce_equivalent_normalized_embeddings() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::edit(dir.path(), |doc| {
-            doc["search"]["semantic"] = toml_edit::value(true);
-            Ok(())
-        })
+        let config = Config::edit(
+            &crate::directories::Directories::isolated(dir.path()),
+            |doc| {
+                doc["search"]["semantic"] = toml_edit::value(true);
+                Ok(())
+            },
+        )
         .unwrap();
         let selection = Selection::from_config(&config).unwrap();
         let environment = load_runtime().unwrap();
@@ -1473,7 +1483,7 @@ pub(crate) mod tests {
     #[test]
     fn model_hash_cache_reads_only_files_with_changed_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(&dir.path().join("data")).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let model = dir.path().join("model");
         fs::create_dir_all(model.join("onnx")).unwrap();
         for name in [
@@ -1595,7 +1605,7 @@ pub(crate) mod tests {
     #[test]
     fn planning_reuses_its_vocabulary_and_cached_maps_need_no_tokenizer_file() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(&dir.path().join("data")).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let path = dir.path().join("input.jsonl");
         let header = json!({"type":"session_meta", "payload":{"id":"native"}});
         let row = codex_message("user", "database connection pool");
@@ -1706,12 +1716,15 @@ pub(crate) mod tests {
     #[test]
     fn document_plans_track_relevant_native_edits() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::edit(&dir.path().join("data"), |doc| {
-            doc["search"]["semantic"] = toml_edit::value(true);
-            doc["semantic"]["executor"] = toml_edit::value("http://127.0.0.1:1/v1");
-            doc["semantic"]["model"] = toml_edit::value("test");
-            Ok(())
-        })
+        let config = Config::edit(
+            &crate::directories::Directories::isolated(dir.path()),
+            |doc| {
+                doc["search"]["semantic"] = toml_edit::value(true);
+                doc["semantic"]["executor"] = toml_edit::value("http://127.0.0.1:1/v1");
+                doc["semantic"]["model"] = toml_edit::value("test");
+                Ok(())
+            },
+        )
         .unwrap();
         let path = dir.path().join("history.jsonl");
         let source = source(Provider::Claude, &path);
@@ -1726,7 +1739,7 @@ pub(crate) mod tests {
                     .unwrap()
                     .completed()
             );
-            ReadIndex::open(&config.root).unwrap().unwrap()
+            ReadIndex::open(&config.directories.data).unwrap().unwrap()
         };
         let selection = Selection::from_config(&config).unwrap();
         let plan = |index: &ReadIndex| {
@@ -1784,7 +1797,8 @@ pub(crate) mod tests {
         assert_eq!(latest[0].text, "revised private reasoning\nanswer");
         assert_eq!(latest[0].structured_content, assistant["message"]);
         let legacy = config
-            .root
+            .directories
+            .cache
             .join("semantic")
             .join(format!("documents-{}-old.msgpack", selection.key));
         fs::write(&legacy, b"obsolete mapping").unwrap();
@@ -1860,7 +1874,7 @@ pub(crate) mod tests {
             db.execute("INSERT INTO part (id,message_id,session_id,data,time_created) VALUES (?,?, 'session',?,?)",
                 rusqlite::params![format!("part-{n}"), message, json!({"type":kind,"text":text}).to_string(),n as i64]).unwrap();
         }
-        let config = Config::load(&dir.path().join("data")).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let index = import(&config, Provider::Opencode, &path);
         let messages = index.messages().unwrap();
         assert_eq!(messages.len(), 5);

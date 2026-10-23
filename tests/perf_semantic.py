@@ -96,7 +96,7 @@ class PreparedSemantic:
         )
         case.command("import", "--all", "--progress", "none", timeout=self.timeout)
         self.identities = verify_corpus(case, self.corpus)
-        config = case.data / "config.toml"
+        config = case.config / "config.toml"
         config.write_text(
             config.read_text() + "[semantic]\nbuiltin_throttling = false\n"
         )
@@ -113,9 +113,12 @@ class PreparedSemantic:
             verify_semantic(case, self.corpus, self.identities, result, "semantic")
         # Snapshots belong to this executable and keep the same absolute source paths.
         # Copying and source restoration are outside every measured operation.
-        if (case.data / "inference").exists():
+        if case.runtime.exists():
             case.command("daemon", "stop", timeout=self.timeout)
-        shutil.copytree(case.data, self.snapshot)
+        for name in ("data", "config", "cache"):
+            path = getattr(case, name)
+            if path.exists():
+                shutil.copytree(path, self.snapshot / name)
         shutil.copy2(self.corpus.path, self.before_source)
         if self.profile == "semantic-query":
             self.corpus.append()
@@ -125,17 +128,24 @@ class PreparedSemantic:
             self.after = self.before
         self.preparation.update(before=self.before, after=self.after)
         self.preparation["query_input"] = {
-            "data_root": str(case.data),
+            "directories": {
+                name: str(getattr(case, name))
+                for name in ("data", "config", "cache", "runtime")
+            },
             "query": QUERY,
             "workspace": str(self.corpus.workspace),
             "corpus": self.after,
         }
 
     def restore(self):
-        if (self.case.data / "inference").exists():
+        if self.case.runtime.exists():
             self.case.command("daemon", "stop", timeout=self.timeout)
-        shutil.rmtree(self.case.data)
-        shutil.copytree(self.snapshot, self.case.data)
+        for name in ("data", "config", "cache"):
+            path = getattr(self.case, name)
+            if path.exists():
+                shutil.rmtree(path)
+            if (self.snapshot / name).exists():
+                shutil.copytree(self.snapshot / name, path)
         shutil.copy2(self.before_source, self.corpus.path)
         # copy2 restores mtime, but ctime changes. Reconcile the source stamp
         # before timing queries against unchanged history.
@@ -188,5 +198,8 @@ class PreparedSemantic:
     def close(self, keep_data):
         self.case.close()
         if not keep_data:
-            shutil.rmtree(self.case.data)
+            for name in ("data", "config", "cache"):
+                path = getattr(self.case, name)
+                if path.exists():
+                    shutil.rmtree(path)
             shutil.rmtree(self.snapshot)

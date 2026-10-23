@@ -512,7 +512,7 @@ def trial(root, args, parts):
             cursor_args = ("--cursor", cursor)
 
         if args.semantic:
-            config = case.data / "config.toml"
+            config = case.config / "config.toml"
             config.write_text(
                 config.read_text() + "[semantic]\nbuiltin_throttling = false\n"
             )

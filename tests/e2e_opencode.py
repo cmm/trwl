@@ -260,7 +260,7 @@ def opencode_v2(case):
         for table in ("part", "message", "session"):
             db.execute(f"DROP TABLE {table}")
     require(imported() == after, "dropping legacy tables changed v2 history")
-    case.env["TRWL_DATA_ROOT"] = str(case.root / "fresh-data")
+    case.env["XDG_DATA_HOME"] = str(case.root / "fresh-data")
     require(imported() == after, "incremental v2 output differs from a fresh import")
     case.check(
         "v2-only and mixed databases agree; incremental results match a fresh import"

@@ -18,13 +18,13 @@ pub struct Source {
 
 #[derive(Clone)]
 pub struct Config {
-    pub root: PathBuf,
+    pub directories: crate::directories::Directories,
     pub document: DocumentMut,
 }
 
 impl Config {
-    pub fn load(root: &Path) -> Result<Self> {
-        let path = root.join("config.toml");
+    pub fn load(directories: &crate::directories::Directories) -> Result<Self> {
+        let path = directories.config.join("config.toml");
         let document: DocumentMut = match fs::read_to_string(&path) {
             Ok(text) => text
                 .parse()
@@ -38,7 +38,7 @@ impl Config {
                 .parse::<IndexMode>()?;
         }
         Ok(Self {
-            root: root.into(),
+            directories: directories.clone(),
             document,
         })
     }
@@ -70,19 +70,25 @@ impl Config {
         self.flag("search", "semantic", false)
     }
 
-    pub fn edit(root: &Path, edit: impl FnOnce(&mut DocumentMut) -> Result<()>) -> Result<Self> {
-        let _lock = lock(root, "config.lock")?;
-        let mut config = Self::load(root)?;
+    pub fn edit(
+        directories: &crate::directories::Directories,
+        edit: impl FnOnce(&mut DocumentMut) -> Result<()>,
+    ) -> Result<Self> {
+        let _lock = lock(&directories.config, "config.lock")?;
+        let mut config = Self::load(directories)?;
         edit(&mut config.document)?;
         atomic_write(
-            &root.join("config.toml"),
+            &directories.config.join("config.toml"),
             config.document.to_string().as_bytes(),
         )?;
         Ok(config)
     }
 
-    pub fn set_mode(root: &Path, mode: IndexMode) -> Result<Self> {
-        Self::edit(root, |doc| {
+    pub fn set_mode(
+        directories: &crate::directories::Directories,
+        mode: IndexMode,
+    ) -> Result<Self> {
+        Self::edit(directories, |doc| {
             doc["indexing"]["mode"] = value(mode.as_str());
             Ok(())
         })
@@ -98,6 +104,7 @@ impl Config {
             |name, fallback| {
                 std::env::var_os(name)
                     .map(PathBuf::from)
+                    .filter(|path| name != "XDG_DATA_HOME" || path.is_absolute())
                     .unwrap_or(fallback)
             },
         )
@@ -253,7 +260,7 @@ mod tests {
                 fs::create_dir_all(path).unwrap();
             }
         }
-        let config = Config::load(&dir.path().join("data")).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let env = |name: &str, fallback: PathBuf| match name {
             "XDG_DATA_HOME" => xdg.clone(),
             "CODEX_HOME" => codex.clone(),
@@ -275,7 +282,7 @@ mod tests {
             defaults.iter().map(|s| s.provider).collect::<Vec<_>>(),
             [Provider::Pi, Provider::CopilotCli]
         );
-        let configured = Config::edit(&config.root, |doc| {
+        let configured = Config::edit(&config.directories, |doc| {
             *doc = "[sources]
 automatic = false
 [[sources.roots]]

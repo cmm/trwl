@@ -46,10 +46,11 @@ repository fixtures. The trwl executable discovers roots without invoking Git.
 
 | Cases | Provider input and behavior |
 | --- | --- |
+| `xdg-storage` | Independent XDG directories and home defaults; runtime permissions and fallback, cache regeneration from imported history, data isolation, and daemon coordination across runtime directories |
 | `hybrid-grouping` | Controlled HTTP vectors and 120 strong matches in one session; grouped retrieval still returns the ten other matching sessions; different event anchors reinforce session scores but remain separate in event mode |
 | `semantic-cache` | Controlled HTTP vectors; unchanged fills reuse embeddings, inference holds no SQLite transaction, eviction reports partial/unavailable coverage without losing history, and waited queries refill |
 | `benchmark-restore` | Prepared benchmark history survives restoration and its next import reports unchanged sources |
-| `discovery` | Data-root flag and environment override, XDG/home defaults; setup discovers OpenCode, Codex, Pi, Claude Code and Copilot CLI histories; repeating setup preserves content and references |
+| `discovery` | Setup discovers OpenCode, Codex, Pi, Claude Code and Copilot CLI histories; repeating setup preserves content and references |
 | `retrieval` | OpenCode SQLite messages, tool input/output, parent/child sessions, windows, list, locate, text and Markdown transcripts |
 | `opencode-v2` | Hand-built OpenCode v1/v2 SQLite; mixed and v2-only databases, streaming tools, output/errors, metadata, children, edits/deletions, migration precedence, and incremental/fresh-import agreement |
 | `selection` | OpenCode SQLite and Codex rollout JSONL; matching counterexamples for filters, grouping, children and current-session exclusion |
@@ -183,7 +184,7 @@ or missing hardware.
 ## Results
 
 Each run prints its artifact directory under `.cache/trwl-e2e-*`.
-Each case has an independent home, configuration, input and data directory. The
+Each case has an isolated home, XDG directories and provider inputs. The
 runner copies the executable into each workspace, outside the data directory,
 and records the original path, invoked path, SHA-256 and version.
 

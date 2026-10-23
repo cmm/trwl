@@ -1,6 +1,9 @@
 """File-focused retrieval, large records, and updates to a growing JSONL history."""
 
 import json
+import os
+import shutil
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -48,34 +51,188 @@ def benchmark_restore(case):
     )
 
 
-def discovery(case):
+def xdg_storage(case):
+    from e2e_http import EmbeddingServer
+
+    expected = {
+        name: str(getattr(case, name))
+        for name in ("config", "data", "cache", "state", "runtime")
+    }
     require(
-        case.json_command("status")["data_root"] == str(case.data),
-        "TRWL_DATA_ROOT did not select the data directory",
+        case.json_command("status")["directories"] == expected,
+        "XDG directories were not separated",
     )
-    override = case.root / "other-data"
-    require(
-        case.json_command("--data-root", override, "status")["data_root"]
-        == str(override),
-        "--data-root did not override TRWL_DATA_ROOT",
+    for name, path in expected.items():
+        require(
+            f"{name.title()} directory: {path}" in case.command("status").stdout,
+            f"text status omitted {name}",
+        )
+    original = dict(case.env)
+    try:
+        for name, default in (
+            ("config", ".config"),
+            ("data", ".local/share"),
+            ("cache", ".cache"),
+            ("state", ".local/state"),
+        ):
+            variable = f"XDG_{name.upper()}_HOME"
+            for value in (None, "", "relative"):
+                case.env.pop(variable, None)
+                if value is not None:
+                    case.env[variable] = value
+                directories = case.json_command("status")["directories"]
+                require(
+                    directories
+                    == {**expected, name: str(case.home / default / "trwl")},
+                    f"invalid {variable} did not use its HOME default",
+                )
+            case.env[variable] = original[variable]
+
+        for value in (None, "", "relative", str(case.root / "missing-runtime")):
+            case.env.pop("XDG_RUNTIME_DIR", None)
+            if value is not None:
+                case.env["XDG_RUNTIME_DIR"] = value
+            result = case.command("status", "--format", "json")
+            runtime = Path(json.loads(result.stdout)["directories"]["runtime"])
+            require(
+                "XDG_RUNTIME_DIR is unavailable" in result.stderr,
+                "runtime fallback was silent",
+            )
+            require(
+                runtime
+                == Path(case.env["TMPDIR"]) / f"trwl-runtime-{os.geteuid()}" / "trwl",
+                "fallback was not per-user temporary storage",
+            )
+            require(
+                runtime.stat().st_mode & 0o777 == 0o700
+                and runtime.stat().st_uid == os.geteuid(),
+                "runtime fallback was not private",
+            )
+        fallback = Path(case.env["TMPDIR"]) / f"trwl-runtime-{os.geteuid()}"
+        case.env.pop("XDG_RUNTIME_DIR", None)
+        fallback.chmod(0o755)
+        try:
+            case.command("status", expect_failure=True)
+        finally:
+            fallback.chmod(0o700)
+        real_fallback = fallback.with_name("saved-runtime")
+        fallback.rename(real_fallback)
+        fallback.symlink_to(real_fallback)
+        try:
+            case.command("status", expect_failure=True)
+        finally:
+            fallback.unlink()
+            real_fallback.rename(fallback)
+        unsafe = case.root / "unsafe-runtime"
+        unsafe.mkdir(mode=0o755)
+        unsafe.chmod(0o755)
+        case.env["XDG_RUNTIME_DIR"] = str(unsafe)
+        case.command("status", expect_failure=True)
+        link = case.root / "runtime-link"
+        link.symlink_to(original["XDG_RUNTIME_DIR"])
+        case.env["XDG_RUNTIME_DIR"] = str(link)
+        case.command("status", expect_failure=True)
+    finally:
+        case.env = dict(original)
+    case.check(
+        "independent XDG defaults, empty/relative values and private runtime fallback; unsafe runtime paths rejected"
     )
-    data_root = case.env.pop("TRWL_DATA_ROOT")
+
+    fixture = OpenCodeFixture(case.providers / "storage.db", case.work)
+    fixture.session("xdg")
+    fixture.message(
+        "xdg",
+        "first",
+        "xdgstoragebeacon imported history survives native input and cache deletion",
+    )
+    case.command("import", "--provider", "opencode", "--path", fixture.path)
+    with EmbeddingServer(embed=lambda texts: [[1.0, 0.0] for _ in texts]) as api:
+        api.enable(case)
+        case.search("xdgstoragebeacon", backend="semantic", refresh="wait")
+        require(
+            (case.cache / "semantic/cache.sqlite3").is_file(),
+            "semantic cache escaped XDG_CACHE_HOME",
+        )
+        before = case.json_command("list", "events")["events"]
+        config = (case.config / "config.toml").read_bytes()
+        fixture.path.unlink()
+        shutil.rmtree(case.cache)
+        require(
+            case.json_command("list", "events")["events"] == before,
+            "cache deletion lost imported history",
+        )
+        require(
+            (case.config / "config.toml").read_bytes() == config,
+            "cache deletion changed config",
+        )
+        case.search("xdgstoragebeacon", backend="semantic", refresh="wait")
+        require(
+            (case.cache / "semantic/cache.sqlite3").is_file(),
+            "semantic cache did not regenerate from imported history",
+        )
+    case.check(
+        "cache discard preserves config and one-time imported history after native input disappears"
+    )
+
+    # Changing only data must not change the selected configuration or reuse its index.
     data_home = case.env["XDG_DATA_HOME"]
+    case.env["XDG_DATA_HOME"] = str(case.root / "second-data")
     try:
         require(
-            case.json_command("status")["data_root"] == str(Path(data_home) / "trwl"),
-            "XDG data directory did not use the trwl name",
+            case.json_command("list", "events")["events"] == [],
+            "different XDG data homes shared an index",
         )
-        del case.env["XDG_DATA_HOME"]
         require(
-            case.json_command("status")["data_root"]
-            == str(case.home / ".local/share/trwl"),
-            "home data directory did not use the trwl name",
+            case.json_command("status")["semantic"]["enabled"],
+            "changing data changed config",
         )
     finally:
-        case.env["TRWL_DATA_ROOT"] = data_root
         case.env["XDG_DATA_HOME"] = data_home
-    case.check("data-root flag, environment override, XDG default and home default")
+
+    case.command("semantic", "disable")
+    try:
+        case.env["XDG_RUNTIME_DIR"] = ""
+        case.command("index", "mode", "auto")
+        deadline = time.monotonic() + 10
+        while not case.json_command("daemon", "status")["running"]:
+            require(time.monotonic() < deadline, "detached daemon did not start")
+            time.sleep(0.05)
+        require(
+            (case.state / "daemon.log").is_file(), "daemon log escaped XDG_STATE_HOME"
+        )
+        require(
+            "XDG_RUNTIME_DIR is unavailable"
+            not in (case.state / "daemon.log").read_text(),
+            "daemon did not receive the resolved runtime fallback",
+        )
+        other_runtime = case.root / "other-runtime"
+        other_runtime.mkdir(mode=0o700)
+        case.env["XDG_RUNTIME_DIR"] = str(other_runtime)
+        require(
+            case.json_command("daemon", "status")["running"],
+            "runtime change split the persistent index lock",
+        )
+        case.command("daemon", "run")
+        case.command("daemon", "stop")
+        require(
+            not case.json_command("daemon", "status")["running"],
+            "stop through another runtime directory did not reach the daemon",
+        )
+    finally:
+        case.env["XDG_RUNTIME_DIR"] = original["XDG_RUNTIME_DIR"]
+        case.command("index", "mode", "manual")
+    require(
+        not (case.data / "config.toml").exists()
+        and not (case.data / "semantic").exists()
+        and not (case.data / "daemon.log").exists(),
+        "non-data files remain in data storage",
+    )
+    case.check(
+        "data isolation, detached daemon configuration/log propagation and shared-data coordination across runtime directories"
+    )
+
+
+def discovery(case):
 
     database = Path(case.env["XDG_DATA_HOME"]) / "opencode/opencode.db"
     database.parent.mkdir(parents=True)
@@ -113,7 +270,7 @@ def discovery(case):
     )
     marker, body, _, _ = expected[0]
     discovered.append((marker, body, "copilot_cli", copilot_session))
-    config = case.data / "config.toml"
+    config = case.config / "config.toml"
     config.write_text(
         config.read_text()
         .replace("automatic = false", "automatic = true")

@@ -30,57 +30,41 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     os::unix::process::CommandExt,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command as Process, Stdio},
     thread,
     time::{Duration, Instant},
 };
 use toml_edit::{ArrayOfTables, Table, value};
 
-fn root(cli: &Cli) -> Result<PathBuf> {
-    let root = if let Some(root) = &cli.data_root {
-        root.clone()
-    } else {
-        let data = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
-            })
-            .context("HOME and XDG_DATA_HOME are unset")?;
-        data.join("trwl")
-    };
-    Ok(if root.is_absolute() {
-        root
-    } else {
-        std::env::current_dir()?.join(root)
-    })
-}
+mod directories;
+use directories::Directories;
 
 fn daemon_running(root: &Path) -> Result<bool> {
     config::is_locked(root, DAEMON_LOCK)
 }
 
 const DAEMON_LOCK: &str = "daemon.lock";
-// A stop request is a file rather than a signal, so it also reaches an updater
-// in another PID namespace that shares the data directory.
-const DAEMON_STOP: &str = "daemon.stop";
+// Resource locks stay with the index so different runtime directories and PID
+// namespaces still coordinate. Holding the stop lock requests shutdown without
+// leaving a stale request after the requesting process exits.
+const DAEMON_STOP: &str = "daemon-stop.lock";
 // Failed fills start with a two-second retry delay and double up to this cap.
 // A configuration edit retries at once.
 const EMBEDDING_RETRY_CAP: Duration = Duration::from_secs(300);
 
 fn start_daemon(config: &Config) -> Result<()> {
-    if !config.automatic() || daemon_running(&config.root)? {
+    if !config.automatic() || daemon_running(&config.directories.data)? {
         return Ok(());
     }
-    fs::create_dir_all(&config.root)?;
+    fs::create_dir_all(&config.directories.state)?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(config.root.join("daemon.log"))?;
+        .open(config.directories.state.join("daemon.log"))?;
     let mut process = Process::new(std::env::current_exe()?);
+    config.directories.child_environment(&mut process);
     process
-        .args(["--data-root"])
-        .arg(&config.root)
         .args(["daemon", "run"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -102,41 +86,36 @@ fn start_daemon(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn stop_daemon(root: &Path) -> Result<()> {
-    // The running daemon polls for this file and removes it before exiting.
-    // Rewrite it while waiting, in case an updater started meanwhile cleared it.
+fn stop_daemon(directories: &Directories) -> Result<()> {
+    let root = &directories.data;
+    let _request = config::lock(root, DAEMON_STOP)?;
     let deadline = Instant::now() + Duration::from_secs(15);
     while daemon_running(root)? {
-        fs::write(root.join(DAEMON_STOP), b"")?;
         ensure!(
             Instant::now() < deadline,
             "background updater is still finishing its current update"
         );
         thread::sleep(Duration::from_millis(50));
     }
-    semantic::server::stop(root)
+    semantic::server::stop(directories)
 }
 
-fn run_daemon(root: &Path, interval: u64) -> Result<()> {
-    let Some(_guard) = config::try_lock(root, DAEMON_LOCK)? else {
+fn run_daemon(directories: &Directories, interval: u64) -> Result<()> {
+    let Some(_guard) = config::try_lock(&directories.data, DAEMON_LOCK)? else {
         return Ok(());
     };
-    let stop = root.join(DAEMON_STOP);
-    // A request left by an updater that exited on its own does not apply to
-    // this one. `stop_daemon` rewrites the file while it waits.
-    remove_if_present(&stop)?;
     let mut embedding = EmbeddingUpdater::default();
     // Exiting ends the embedding thread with the process; an interrupted fill
     // keeps completed batches and the next updater resumes it.
-    while !daemon_stopping(root, &stop)? {
-        let config = Config::load(root)?;
+    while !daemon_stopping(directories)? {
+        let config = Config::load(directories)?;
         embedding.collect();
         if let Err(error) = update_iteration(&config, &mut embedding) {
             eprintln!("background update: {error:#}");
         }
         let deadline = Instant::now() + Duration::from_secs(interval.max(1));
         while Instant::now() < deadline {
-            if daemon_stopping(root, &stop)? {
+            if daemon_stopping(directories)? {
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(100));
@@ -145,12 +124,9 @@ fn run_daemon(root: &Path, interval: u64) -> Result<()> {
     Ok(())
 }
 
-fn daemon_stopping(root: &Path, stop: &Path) -> Result<bool> {
-    if stop.try_exists()? {
-        remove_if_present(stop)?;
-        return Ok(true);
-    }
-    Ok(!Config::load(root)?.automatic())
+fn daemon_stopping(directories: &Directories) -> Result<bool> {
+    Ok(config::is_locked(&directories.data, DAEMON_STOP)?
+        || !Config::load(directories)?.automatic())
 }
 
 fn update_iteration(config: &Config, embedding: &mut EmbeddingUpdater) -> Result<()> {
@@ -159,18 +135,11 @@ fn update_iteration(config: &Config, embedding: &mut EmbeddingUpdater) -> Result
         eprintln!("{}", serde_json::to_string(&report)?);
     }
     if config.semantic()
-        && let Some(version) = store::semantic_version(&config.root)?
+        && let Some(version) = store::semantic_version(&config.directories.data)?
     {
         embedding.schedule(config, &version);
     }
     Ok(())
-}
-
-fn remove_if_present(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
-        _ => Ok(()),
-    }
 }
 
 /// One background embedding fill at a time. A fill runs when conversation inputs
@@ -276,8 +245,9 @@ impl EmbeddingUpdater {
     }
 }
 
-fn dispatch(cli: &Cli, root: &Path) -> Result<Report> {
-    let config = Config::load(root)?;
+fn dispatch(cli: &Cli, directories: &Directories) -> Result<Report> {
+    let root = &directories.data;
+    let config = Config::load(directories)?;
     match &cli.command {
         Command::EmbeddingWorker | Command::EmbeddingServer => {
             unreachable!("handled before command dispatch")
@@ -344,7 +314,7 @@ fn dispatch(cli: &Cli, root: &Path) -> Result<Report> {
                 let source_root = source_root
                     .canonicalize()
                     .with_context(|| format!("opening {}", source_root.display()))?;
-                Config::edit(root, |doc| {
+                Config::edit(directories, |doc| {
                     if doc.get("sources").and_then(|s| s.get("roots")).is_none() {
                         doc["sources"]["roots"] =
                             toml_edit::Item::ArrayOfTables(ArrayOfTables::new());
@@ -367,7 +337,7 @@ fn dispatch(cli: &Cli, root: &Path) -> Result<Report> {
                 }))
             }
             Sources::Remove { name } => {
-                Config::edit(root, |doc| {
+                Config::edit(directories, |doc| {
                     if let Some(roots) = doc
                         .get_mut("sources")
                         .and_then(|s| s.get_mut("roots"))
@@ -385,7 +355,7 @@ fn dispatch(cli: &Cli, root: &Path) -> Result<Report> {
         Command::Semantic { command } => match command {
             Semantic::Enable { executor, model } => {
                 let model = semantic::validate_selection(executor, model.as_deref())?;
-                Config::edit(root, |doc| {
+                Config::edit(directories, |doc| {
                     doc["search"]["semantic"] = value(true);
                     doc["semantic"]["executor"] = value(executor);
                     doc["semantic"]["model"] = value(model);
@@ -398,11 +368,11 @@ fn dispatch(cli: &Cli, root: &Path) -> Result<Report> {
                 })
             }
             Semantic::Disable => {
-                Config::edit(root, |doc| {
+                Config::edit(directories, |doc| {
                     doc["search"]["semantic"] = value(false);
                     Ok(())
                 })?;
-                semantic::server::stop(root)?;
+                semantic::server::stop(directories)?;
                 Ok(Report::SemanticDisabled { semantic: false })
             }
             Semantic::Status => Ok(Report::Semantic(semantic::status(&config).into())),
@@ -418,26 +388,26 @@ fn dispatch(cli: &Cli, root: &Path) -> Result<Report> {
             command: Index::Mode { mode },
         } => {
             if let Some(mode) = mode {
-                let config = Config::set_mode(root, *mode)?;
+                let config = Config::set_mode(directories, *mode)?;
                 if config.automatic() {
                     start_daemon(&config)?;
                 } else {
-                    stop_daemon(root)?;
+                    stop_daemon(directories)?;
                 }
             }
             Ok(Report::Mode {
-                mode: Config::load(root)?.mode(),
+                mode: Config::load(directories)?.mode(),
             })
         }
         Command::Daemon { command } => match command {
             Daemon::Run {
                 loop_interval_seconds,
             } => {
-                run_daemon(root, *loop_interval_seconds)?;
+                run_daemon(directories, *loop_interval_seconds)?;
                 Ok(Report::Stopped { stopped: true })
             }
             Daemon::Stop => {
-                stop_daemon(root)?;
+                stop_daemon(directories)?;
                 Ok(Report::Stopped { stopped: true })
             }
             Daemon::Status => Ok(Report::Daemon(Running {
@@ -461,7 +431,7 @@ fn dispatch(cli: &Cli, root: &Path) -> Result<Report> {
             let ready = matches!(&lexical, Status::Available(status) if status.state == State::Ready)
                 && matches!(&semantic, Status::Available(status) if matches!(status.state, State::Ready | State::Disabled));
             Ok(Report::Status(OverallStatus {
-                data_root: root.into(),
+                directories: directories.clone(),
                 indexing_mode: config.mode(),
                 daemon: Running {
                     running: daemon_running(root)?,
@@ -482,8 +452,8 @@ fn main() {
     }
     let cli = Cli::parse();
     if matches!(cli.command, Command::EmbeddingServer) {
-        if root(&cli)
-            .and_then(|root| semantic::server::run(&root))
+        if Directories::resolve()
+            .and_then(|directories| semantic::server::run(&directories))
             .is_err()
         {
             std::process::exit(1);
@@ -497,8 +467,8 @@ fn main() {
         }
         return;
     }
-    let result = root(&cli)
-        .and_then(|root| dispatch(&cli, &root))
+    let result = Directories::resolve()
+        .and_then(|directories| dispatch(&cli, &directories))
         .and_then(|value| {
             let output = output::render(&value, cli.format)?;
             if let Some(path) = &cli.out {

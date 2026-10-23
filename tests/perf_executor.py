@@ -31,10 +31,13 @@ def main():
     preparations = scenarios[0]["preparation"]
     require(len(preparations) == 1, "prepare with --binary to select one input")
     query_input = next(iter(preparations.values()))["query_input"]
-    prepared = Path(query_input["data_root"])
-    require(prepared.is_dir(), "prepared data missing; prepare with --keep-data")
+    prepared = {name: Path(path) for name, path in query_input["directories"].items()}
     require(
-        not inference_resources(prepared), "stop inference before copying prepared data"
+        prepared["data"].is_dir(), "prepared data missing; prepare with --keep-data"
+    )
+    require(
+        not inference_resources(prepared["runtime"]),
+        "stop inference before copying prepared data",
     )
     scratch = SCRATCH / "assistant/tmp"
     scratch.mkdir(parents=True, exist_ok=True)
@@ -49,7 +52,8 @@ def main():
         measurement="wait4 client resources plus detached inference /proc CPU and block I/O deltas; RSS is the sum of client peak and worker lifetime peak, an upper bound on concurrent RSS. Cold means no executor; filesystem caches are not evicted.",
     ) as (cases, report):
         for case in cases.values():
-            shutil.copytree(prepared, case.data, dirs_exist_ok=True)
+            for name in ("data", "config", "cache"):
+                shutil.copytree(prepared[name], getattr(case, name), dirs_exist_ok=True)
         for name, backend, cold in [
             ("semantic-cold", "semantic", True),
             ("semantic-warm", "semantic", False),

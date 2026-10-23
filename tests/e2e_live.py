@@ -183,7 +183,7 @@ def semantic_live(case):
                     first["retrieval"]["semantic_status"] == "ready",
                     "initial embeddings not ready",
                 )
-                config = case.data / "config.toml"
+                config = case.config / "config.toml"
                 config.write_text(
                     config.read_text().replace('mode = "manual"', 'mode = "auto"')
                 )
@@ -378,7 +378,7 @@ def semantic_recovery(case):
                 case.search(
                     QUERY, "--events", backend="semantic", refresh="wait", timeout=20
                 )
-                config = case.data / "config.toml"
+                config = case.config / "config.toml"
                 config.write_text(
                     config.read_text().replace('mode = "manual"', 'mode = "auto"')
                 )

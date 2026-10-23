@@ -173,7 +173,7 @@ See [Status](#status) for readiness checks and states.
 
 ## Status
 
-- `status` — the data directory, indexing mode, updater activity, both
+- `status` — the resolved directories, indexing mode, updater activity, both
   indexes, and overall `ready`.
 - `index status` — lexical readiness: configured and discovered inputs
   compared with the index's source stamps, including SQLite WAL
@@ -273,12 +273,20 @@ Concurrent updates can change later pages.
 
 ## Data and configuration
 
-The default data directory is `$XDG_DATA_HOME/trwl` or
-`~/.local/share/trwl`. To override it, use `--data-root` or set
-`TRWL_DATA_ROOT`.
+trwl uses the [XDG base directories](https://specifications.freedesktop.org/basedir-spec/latest/):
 
-Configuration is read from `<data-directory>/config.toml`.  It
-controls indexing, source discovery and embeddings. For automatic
+| Contents | Location | Default |
+| --- | --- | --- |
+| Configuration | `$XDG_CONFIG_HOME/trwl/config.toml` | `~/.config/trwl/config.toml` |
+| History index | `$XDG_DATA_HOME/trwl/index/` | `~/.local/share/trwl/index/` |
+| Semantic and compiler caches | `$XDG_CACHE_HOME/trwl/` | `~/.cache/trwl/` |
+| Updater log | `$XDG_STATE_HOME/trwl/daemon.log` | `~/.local/state/trwl/daemon.log` |
+| Sockets and PID files | `$XDG_RUNTIME_DIR/trwl/` | Private per-user temporary directory |
+
+Unset, empty or relative XDG values use the defaults above.
+`trwl status --format json` reports the resolved paths in `directories`.
+
+Configuration controls indexing, source discovery and embeddings. For automatic
 indexing with built-in embeddings:
 
 ```toml

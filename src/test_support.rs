@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 pub fn history_file(name: &str) -> (tempfile::TempDir, Config, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
-    let config = Config::load(&dir.path().join("data")).unwrap();
+    let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
     let path = dir.path().join(name);
     (dir, config, path)
 }
@@ -27,7 +27,7 @@ pub fn import(config: &Config, provider: Provider, path: &Path) -> ReadIndex {
             .unwrap()
             .completed()
     );
-    ReadIndex::open(&config.root).unwrap().unwrap()
+    ReadIndex::open(&config.directories.data).unwrap().unwrap()
 }
 
 pub fn codex_message(role: &str, text: &str) -> Value {

@@ -110,7 +110,6 @@ class Case:
         self.root = root
         self.root.mkdir(mode=0o700)
         self.home = root / "home"
-        self.data = root / "trwl-data"
         self.work = root / "workspace"
         self.providers = root / "providers"
         self.logs = root / "commands"
@@ -133,7 +132,6 @@ class Case:
             "TMPDIR": "tmp",
             "TMP": "tmp",
             "TEMP": "tmp",
-            "TRWL_DATA_ROOT": "trwl-data",
             "CODEX_HOME": "providers/codex",
             "CLAUDE_CONFIG_DIR": "providers/claude",
         }.items():
@@ -144,7 +142,8 @@ class Case:
             path.mkdir(exist_ok=True, mode=0o700)
         if model_dir is not None:
             self.env["TRWL_SEMANTIC_MODEL_DIR"] = str(model_dir)
-        (self.data / "config.toml").write_text(
+        self.config.mkdir(mode=0o700)
+        (self.config / "config.toml").write_text(
             '[indexing]\nmode = "manual"\n'
             "[sources]\nautomatic = false\n"
             "[search]\nsemantic = false\n"
@@ -166,6 +165,26 @@ class Case:
                 "environment": self.env,
             },
         )
+
+    @property
+    def config(self):
+        return Path(self.env["XDG_CONFIG_HOME"]) / "trwl"
+
+    @property
+    def data(self):
+        return Path(self.env["XDG_DATA_HOME"]) / "trwl"
+
+    @property
+    def cache(self):
+        return Path(self.env["XDG_CACHE_HOME"]) / "trwl"
+
+    @property
+    def state(self):
+        return Path(self.env["XDG_STATE_HOME"]) / "trwl"
+
+    @property
+    def runtime(self):
+        return Path(self.env["XDG_RUNTIME_DIR"]) / "trwl"
 
     def check(self, label):
         self.checks.append(label)
@@ -326,9 +345,11 @@ class Case:
                     self.stop(command)
                 except Exception:  # noqa: BLE001 - try every group before reporting errors
                     errors.append(traceback.format_exc())
-            if (self.data / "inference").exists():
+            # The updater creates its log directory before detaching; its data
+            # directory may not exist yet. Disable auto mode to stop late starts.
+            if self.data.exists() or self.state.exists():
                 try:
-                    self.command("daemon", "stop", timeout=125)
+                    self.command("index", "mode", "manual", timeout=125)
                 except Exception:  # noqa: BLE001 - report cleanup failures together
                     errors.append(traceback.format_exc())
         finally:

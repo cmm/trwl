@@ -409,8 +409,8 @@ fn with_database<T>(
     selection: &str,
     operation: impl FnOnce(&mut Database) -> Result<T>,
 ) -> Result<T> {
-    let _lock = lock(&config.root, "semantic-cache.lock")?;
-    let directory = config.root.join("semantic");
+    let _lock = lock(&config.directories.cache, "semantic-cache.lock")?;
+    let directory = config.directories.cache.join("semantic");
     fs::create_dir_all(&directory)?;
     let old = legacy(&directory, selection)?;
     let path = directory.join(DATABASE);
@@ -609,11 +609,12 @@ mod tests {
     #[test]
     fn finishing_a_completed_build_does_not_update_it() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(dir.path()).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let (documents, vectors) = fixture("first", 2);
         publish(&config, "model", "v1", &documents, &vectors).unwrap();
         finish_build(&config, "model").unwrap();
-        let observer = Connection::open(config.root.join("semantic").join(DATABASE)).unwrap();
+        let observer =
+            Connection::open(config.directories.cache.join("semantic").join(DATABASE)).unwrap();
         observer
             .execute_batch(
                 "CREATE TRIGGER no_completed_build_updates BEFORE UPDATE ON builds
@@ -627,10 +628,11 @@ mod tests {
     #[test]
     fn publishing_a_snapshot_does_not_rewrite_existing_vectors() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(dir.path()).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let (documents, vectors) = fixture("first", 2);
         publish_batch(&config, "model", "v1", &documents, &vectors).unwrap();
-        let observer = Connection::open(config.root.join("semantic").join(DATABASE)).unwrap();
+        let observer =
+            Connection::open(config.directories.cache.join("semantic").join(DATABASE)).unwrap();
         observer
             .execute_batch(
                 "CREATE TRIGGER no_vector_rewrites AFTER INSERT ON vectors
@@ -644,7 +646,7 @@ mod tests {
     #[test]
     fn final_snapshot_restores_vectors_evicted_by_another_mapping() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(dir.path()).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let (mut first_documents, first) = fixture("first", 2);
         first_documents[0].prepared = Some(super::super::PreparedDocument {
             input: "first-input".into(),
@@ -680,7 +682,7 @@ mod tests {
     #[test]
     fn full_build_state_survives_partial_batches_and_resets_per_selection() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(dir.path()).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let (mut documents, first) = fixture("first", 2);
         let (second_documents, second) = fixture("second", 2);
         documents.extend(second_documents);
@@ -705,7 +707,7 @@ mod tests {
     #[test]
     fn an_existing_selection_without_a_build_is_incremental() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(dir.path()).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let (documents, vectors) = fixture("first", 2);
         publish(&config, "model", "v1", &documents, &vectors).unwrap();
         with_database(&config, "model", |db| {
@@ -839,7 +841,7 @@ mod tests {
     #[test]
     fn sqlite_full_clears_only_cache_and_next_publication_recovers() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(&dir.path().join("data")).unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let history = dir.path().join("history.jsonl");
         let message = crate::test_support::codex_message("user", "cache recovery history");
         fs::write(
@@ -863,11 +865,20 @@ mod tests {
         })
         .unwrap_err();
         assert!(format!("{error:#}").contains("cache cleared"), "{error:#}");
-        let stored =
-            crate::query::resolve(&config.root, crate::cli::Entity::Event, &event.event_id)
-                .unwrap();
+        let stored = crate::query::resolve(
+            &config.directories.data,
+            crate::cli::Entity::Event,
+            &event.event_id,
+        )
+        .unwrap();
         assert_eq!(stored.text, event.text);
-        assert!(!config.root.join("semantic/cache.sqlite3").exists());
+        assert!(
+            !config
+                .directories
+                .cache
+                .join("semantic/cache.sqlite3")
+                .exists()
+        );
         assert!(load(&config, "model").unwrap().vectors.is_empty());
         publish(&config, "model", "recovered", &documents, &vectors).unwrap();
         assert_eq!(load(&config, "model").unwrap().vectors["first"], [1.0, 1.0]);
@@ -876,8 +887,8 @@ mod tests {
     #[test]
     fn migration_preserves_current_vectors_and_cleans_before_a_failed_write() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(&dir.path().join("data")).unwrap();
-        let directory = config.root.join("semantic");
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
+        let directory = config.directories.cache.join("semantic");
         fs::create_dir_all(&directory).unwrap();
         let (documents, mut vectors) = fixture("useful", 2);
         vectors.vectors.insert("obsolete".into(), vec![1.0, 0.0]);

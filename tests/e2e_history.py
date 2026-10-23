@@ -542,27 +542,18 @@ def updates(case):
         oracle = case.root / "full-import"
         if oracle.exists():
             shutil.rmtree(oracle)
-        shutil.copytree(case.data, oracle)
-        full = case.json_command(
-            "--data-root",
-            oracle,
-            "import",
-            "--provider",
-            "opencode",
-            "--path",
-            fixture.path,
-            "--full",
-        )["sources"][0]
-        expected = case.json_command(
-            "--data-root",
-            oracle,
-            "list",
-            "events",
-            "--workspace",
-            "**",
-            "--limit",
-            "1000",
-        )["events"]
+        shutil.copytree(case.data, oracle / "trwl")
+        previous = case.env["XDG_DATA_HOME"]
+        case.env["XDG_DATA_HOME"] = str(oracle)
+        try:
+            full = case.json_command(
+                "import", "--provider", "opencode", "--path", fixture.path, "--full"
+            )["sources"][0]
+            expected = case.json_command(
+                "list", "events", "--workspace", "**", "--limit", "1000"
+            )["events"]
+        finally:
+            case.env["XDG_DATA_HOME"] = previous
         require(
             actual == expected,
             "incremental import differs from full content, ordering or identities",

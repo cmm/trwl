@@ -117,9 +117,9 @@ class CommandTimeout(Exception):
 
 
 def inference_resources(root):
-    """Read the detached inference processes owned by this benchmark data root."""
+    """Read the detached inference processes in this benchmark runtime directory."""
     workers = {}
-    for path in (root / "inference").glob("*/pid"):
+    for path in root.glob("*/inference/*/pid"):
         try:
             pid = int(path.read_text())
             process = Path("/proc") / str(pid)
@@ -197,12 +197,7 @@ class PerformanceCase(Case):
             "status": "starting",
             "timed_out": False,
         }
-        data = Path(self.env["TRWL_DATA_ROOT"])
-        if "--data-root" in args:
-            data = Path(args[args.index("--data-root") + 1])
-        if not data.is_absolute():
-            data = self.work / data
-        workers_before = inference_resources(data) if workload else {}
+        workers_before = inference_resources(self.runtime) if workload else {}
         write_json(log, record)
         command = process = error = None
         started = ended = None
@@ -297,7 +292,7 @@ class PerformanceCase(Case):
                         involuntary_context_switches=usage.ru_nivcsw,
                     )
                 if workload and usage is not None and "max_rss_kib" in record:
-                    workers_after = inference_resources(data)
+                    workers_after = inference_resources(self.runtime)
                     require(
                         workers_before.keys() <= workers_after.keys(),
                         "inference worker exited during measurement; counters are incomplete",

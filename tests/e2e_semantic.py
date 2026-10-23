@@ -3,6 +3,7 @@
 import fcntl
 import json
 import os
+import shutil
 import signal
 import socket
 import sqlite3
@@ -28,11 +29,12 @@ def executor_reuse(case):
     """Inference survives process boundaries, competing clients and restart."""
     model_prerequisites(case)
     _fixture(case)
+    case.env["CUDA_CACHE_PATH"] = str(case.root / "wrong-compiler-cache")
     case.command("semantic", "enable", "--executor", "builtin")
     expected = case.search(QUERY, "--events", backend="semantic", refresh="wait")
 
     def worker():
-        files = list((case.data / "inference").glob("*/pid"))
+        files = list(case.runtime.glob("*/inference/*/pid"))
         require(len(files) == 1, "expected one inference process")
         return files[0], int(files[0].read_text())
 
@@ -41,8 +43,51 @@ def executor_reuse(case):
         require(result == expected, "reused/restarted inference changed query results")
 
     pid_file, pid = worker()
+    environment = dict(
+        item.split(b"=", 1)
+        for item in (Path("/proc") / str(pid) / "environ").read_bytes().split(b"\0")
+        if b"=" in item
+    )
+    for variable in (
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+    ):
+        require(
+            environment[variable.encode()].decode() == case.env[variable],
+            f"inference child lost {variable}",
+        )
+    require(
+        environment[b"CUDA_CACHE_PATH"].decode() == str(case.cache / "inference/cuda"),
+        "compiled inference cache escaped XDG_CACHE_HOME",
+    )
     query()
     require(worker()[1] == pid, "fresh CLI process did not reuse inference")
+    data_home = case.env["XDG_DATA_HOME"]
+    copied_home = case.root / "copied-data"
+    shutil.copytree(case.data, copied_home / "trwl")
+    case.env["XDG_DATA_HOME"] = str(copied_home)
+    try:
+        query()
+        pids = {
+            int(path.read_text()) for path in case.runtime.glob("*/inference/*/pid")
+        }
+        require(
+            len(pids) == 2 and pid in pids,
+            "different indexes shared inference process state",
+        )
+        case.command("daemon", "stop")
+        require(
+            pid_file.exists(),
+            "stopping another index stopped the original inference server",
+        )
+    finally:
+        case.env["XDG_DATA_HOME"] = data_home
+    case.check(
+        "inference children receive XDG and compiler cache paths; shared runtime/config/cache keep different indexes isolated"
+    )
     if case.model_dir is not None:
         # A reused server keeps its first client's cwd. Model paths belong to the
         # requesting client, including when it runs from another directory.
@@ -64,6 +109,35 @@ def executor_reuse(case):
             case.env["TRWL_SEMANTIC_MODEL_DIR"] = original_model
     case.command("daemon", "stop")
     require(not pid_file.exists(), "daemon stop left inference resident")
+
+    cache_home = case.env["XDG_CACHE_HOME"]
+    case.env["XDG_CACHE_HOME"] = str(case.root / "other-cache")
+    try:
+        require(
+            case.search(QUERY, "--events", backend="semantic", refresh="wait")
+            == expected,
+            "independent cache changed semantic results",
+        )
+        require(
+            (case.cache / "semantic/model-hashes.json").is_file(),
+            "model hashes escaped the selected cache",
+        )
+        _, other_pid = worker()
+        case.env["XDG_CACHE_HOME"] = cache_home
+        query()
+        pids = {
+            int(path.read_text()) for path in case.runtime.glob("*/inference/*/pid")
+        }
+        require(
+            len(pids) == 2 and other_pid in pids,
+            "different cache homes shared an inference server's compiler cache",
+        )
+    finally:
+        case.env["XDG_CACHE_HOME"] = cache_home
+        case.command("daemon", "stop")
+    case.check(
+        "independent cache homes regenerate embeddings and isolate inference compiler caches"
+    )
 
     # All four fresh clients start without a server; startup must not create
     # competing model processes or mix replies between clients.
@@ -249,7 +323,7 @@ def device_policy(case):
     query()
     case.check("worker releases its lock on exit; competing full builds finish on CPU")
 
-    database = case.data / "semantic/cache.sqlite3"
+    database = case.cache / "semantic/cache.sqlite3"
     with sqlite3.connect(database) as connection:
         total = connection.execute("SELECT count(*) FROM vectors").fetchone()[0]
         require(total > 1, "resume fixture needs multiple vectors")
@@ -438,7 +512,7 @@ def passive_semantic(case):
 def background_semantic(case):
     model_prerequisites(case)
     fixture, expected = _fixture(case, refreshable=True)
-    config = case.data / "config.toml"
+    config = case.config / "config.toml"
     config.write_text(config.read_text() + "[semantic]\nbuiltin_throttling = false\n")
     case.command("semantic", "enable", "--executor", "builtin", timeout=180)
     ready = case.search(
@@ -512,7 +586,7 @@ def background_semantic(case):
 def semantic(case):
     model_prerequisites(case)
     fixture, expected = _fixture(case)
-    config = case.data / "config.toml"
+    config = case.config / "config.toml"
     config.write_text(config.read_text() + "[semantic]\nbuiltin_throttling = false\n")
     case.command("semantic", "enable", "--executor", "builtin", timeout=180)
     for backend in ("semantic", "hybrid"):

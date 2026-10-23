@@ -26,10 +26,9 @@ a GPU is selected.
 One per-user lock at `$XDG_RUNTIME_DIR/trwl/gpu.lock` coordinates GPU
 fills between trwl processes across data roots and models; a
 contended lock selects CPU without waiting. `TRWL_GPU_LOCK_DIR`
-overrides the directory. When `XDG_RUNTIME_DIR` is unset, the fallback
-is `<temporary-directory>/<uid>/trwl/gpu.lock`, using `TEMPDIR`, then
-`TMPDIR`, then `/tmp` as the temporary directory and the effective user
-ID as `<uid>`.
+overrides the directory. When `XDG_RUNTIME_DIR` is unavailable, the fallback
+is `$TMPDIR/trwl-runtime-<uid>/trwl/gpu.lock`, using `/tmp` when `TMPDIR` is
+unset and the effective user ID as `<uid>`.
 
 GPU errors, crashes and timeouts cause the fill to finish on CPU; CPU
 failures propagate. `SIGINT`, `SIGTERM` or `SIGHUP` during a GPU fill

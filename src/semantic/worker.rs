@@ -73,8 +73,12 @@ impl Drop for Client {
 }
 
 impl Client {
-    pub(super) fn start(selection: &Selection) -> Result<Option<Self>> {
+    pub(super) fn start(
+        directories: &crate::directories::Directories,
+        selection: &Selection,
+    ) -> Result<Option<Self>> {
         let mut process = Command::new(std::env::current_exe()?);
+        directories.inference_environment(&mut process)?;
         process.arg("embedding-worker");
         Self::start_command(process, selection, INITIALIZATION_TIMEOUT, BATCH_TIMEOUT)
     }
@@ -194,21 +198,11 @@ impl Client {
     }
 }
 
-fn lock_directory() -> PathBuf {
+fn lock_directory() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("TRWL_GPU_LOCK_DIR") {
-        return path.into();
+        return Ok(path.into());
     }
-    // The runtime directory is per-user and cleared at logout, matching a
-    // short-lived build lock; use a per-user temporary directory when unset.
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime).join("trwl");
-    }
-    let temporary = std::env::var_os("TEMPDIR")
-        .or_else(|| std::env::var_os("TMPDIR"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let uid = unsafe { libc::geteuid() };
-    temporary.join(uid.to_string()).join("trwl")
+    crate::directories::runtime_directory()
 }
 
 fn worker_stream() -> Result<UnixStream> {
@@ -220,6 +214,12 @@ fn worker_stream() -> Result<UnixStream> {
 
 pub(crate) fn run() -> Result<()> {
     serve(BufReader::new(worker_stream()?), |selection| {
+        let directories = crate::directories::Directories::resolve()?;
+        // Native compilers can populate their caches during inference as well
+        // as initialization. Keep exclusion through native runtime destruction,
+        // even when another process uses a different runtime directory.
+        let guard = crate::config::lock(&directories.cache, "inference-cache.lock")?;
+        let _lock_fd = guard.into_raw_fd();
         Ok(
             Executor::accelerated(selection)?.map(|(mut executor, device)| {
                 (
@@ -232,7 +232,7 @@ pub(crate) fn run() -> Result<()> {
 }
 
 fn reserve_gpu() -> Result<bool> {
-    let directory = lock_directory();
+    let directory = lock_directory()?;
     let Some(guard) = try_lock(&directory, "gpu.lock")
         .with_context(|| format!("opening GPU lock in {}", directory.display()))?
     else {

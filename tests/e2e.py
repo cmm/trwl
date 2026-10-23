@@ -34,10 +34,12 @@ from e2e_workflows import (
     file_search,
     jsonl_updates,
     long_content,
+    xdg_storage,
 )
 from e2e_workspaces import workspaces
 
 CASES = {
+    "xdg-storage": xdg_storage,
     "hybrid-grouping": hybrid_grouping,
     "semantic-cache": semantic_cache,
     "benchmark-restore": benchmark_restore,

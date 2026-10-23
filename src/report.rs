@@ -180,7 +180,7 @@ pub struct Running {
 }
 #[derive(Serialize)]
 pub struct OverallStatus {
-    pub data_root: PathBuf,
+    pub directories: crate::directories::Directories,
     pub indexing_mode: IndexMode,
     pub daemon: Running,
     pub ready: bool,
