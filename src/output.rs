@@ -1,6 +1,5 @@
 use crate::{
     cli::{Backend, Format},
-    record::Record,
     report::*,
     workspace::Root,
 };
@@ -199,7 +198,7 @@ fn search(r: &SearchReport, heading: &str) -> String {
     }
     output
 }
-fn events(rows: &[Record], cursor: Option<&str>, heading: &str) -> String {
+fn events(rows: &[OutputRecord], cursor: Option<&str>, heading: &str) -> String {
     let mut output = String::new();
     if rows.is_empty() {
         output.push_str("No events.\n");
@@ -359,8 +358,8 @@ mod tests {
     };
     use std::path::Path;
 
-    fn record() -> Record {
-        let mut r = Record::new(
+    fn record() -> crate::record::Record {
+        let mut r = crate::record::Record::new(
             Provider::Codex,
             "native",
             "event",
@@ -378,8 +377,8 @@ mod tests {
         let expected = serde_json::to_value(&r).unwrap();
         let id = r.event_id.clone();
         let report = Report::ShowEvent(SelectedEvents {
-            event: r.clone(),
-            events: vec![r],
+            event: r.clone().project(crate::texture::Mode::Default).unwrap(),
+            events: vec![r.project(crate::texture::Mode::Default).unwrap()],
         });
         let lines: Vec<Value> = render(&report, Format::Jsonl)
             .unwrap()
@@ -406,7 +405,7 @@ mod tests {
     fn pages_and_empty_collections_have_completion_records() {
         let r = record();
         let report = Report::Events(EventsPage {
-            events: vec![r],
+            events: vec![r.project(crate::texture::Mode::Default).unwrap()],
             next_cursor: Some("next-event".into()),
         });
         let lines: Vec<Value> = render(&report, Format::Jsonl)

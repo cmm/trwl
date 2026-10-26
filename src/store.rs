@@ -27,6 +27,7 @@ use crate::{
     providers,
     record::{ConversationMessage, Provider, Record, digest},
     report::{Diagnostic, ImportReport, ImportSource, LexicalStatus, Outcome, State},
+    texture::{self, Mode, SourceSpans},
     workspace,
 };
 use anyhow::{Context, Result, ensure};
@@ -127,7 +128,7 @@ struct Change {
 /// hexadecimal, so they cannot match it.
 const CHECKPOINT_ID: &str = "input-checkpoint";
 
-const RECORD_VERSION: u32 = 5;
+const RECORD_VERSION: u32 = 6;
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     #[serde(default)]
@@ -172,6 +173,9 @@ struct Fields {
     id: Field,
     session: Field,
     text: Field,
+    default_text: Field,
+    expanded_text: Field,
+    availability: Field,
     record: Field,
     summary: Field,
     message: Field,
@@ -192,6 +196,9 @@ fn schema() -> (Schema, Fields) {
         id: schema.add_text_field("id", STRING | FAST),
         session: schema.add_text_field("session", STRING | FAST),
         text: schema.add_text_field("text", TEXT | STORED),
+        default_text: schema.add_text_field("default_text", TEXT),
+        expanded_text: schema.add_text_field("expanded_text", TEXT),
+        availability: schema.add_u64_field("content_availability", tantivy::schema::INDEXED),
         record: schema.add_bytes_field("record", STORED),
         summary: schema.add_bytes_field("summary", STORED),
         message: schema.add_bool_field("conversation_message", FAST),
@@ -205,6 +212,16 @@ fn schema() -> (Schema, Fields) {
         sequence: schema.add_u64_field("sequence", FAST | tantivy::schema::INDEXED),
     };
     (schema.build(), fields)
+}
+
+impl Fields {
+    fn text(self, mode: Mode) -> Field {
+        match mode {
+            Mode::Default => self.default_text,
+            Mode::Expanded => self.expanded_text,
+            Mode::Source => self.text,
+        }
+    }
 }
 
 pub struct ReadIndex {
@@ -234,30 +251,38 @@ pub enum LexicalMode {
 
 pub struct LexicalResults {
     pub rows: Vec<(f32, Record)>,
-    addresses: HashMap<String, DocAddress>,
+    addresses: HashMap<String, (DocAddress, Option<SourceSpans>)>,
     generators: Vec<SnippetGenerator>,
+    texture: Mode,
 }
 
 impl LexicalResults {
     pub fn snippet(&self, index: &ReadIndex, id: &str) -> Result<String> {
-        let address = self.addresses.get(id).context("lexical result missing")?;
+        let (address, source) = self.addresses.get(id).context("lexical result missing")?;
         let doc: TantivyDocument = index.searcher.doc(*address)?;
         let text = doc
             .get_first(index.fields.text)
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        Ok(self
+        let view = texture::text_view(text, source.as_ref(), self.texture)?;
+        let fragment = self
             .generators
             .iter()
-            .map(|g| g.snippet(text))
+            .map(|g| g.snippet(&view.text))
             .filter(|s| !s.highlighted().is_empty())
             .max_by_key(|s| s.highlighted().len())
             .map(|s| s.fragment().to_owned())
             .unwrap_or_else(|| {
-                text.chars()
+                view.text
+                    .chars()
                     .take(crate::record::SEARCH_SNIPPET_CHARS)
                     .collect()
-            }))
+            });
+        let start = view
+            .text
+            .find(&fragment)
+            .context("excerpt missing from content")?;
+        view.render(start..start + fragment.len())
     }
 }
 
@@ -566,7 +591,7 @@ impl SegmentWinners {
 impl ReadIndex {
     /// Identify this reader's conversation inputs and result metadata.
     pub fn version(&self) -> String {
-        self.semantic_version.clone()
+        conversation_version(&self.semantic_version)
     }
 
     pub fn open(root: &Path) -> Result<Option<Self>> {
@@ -684,6 +709,7 @@ impl ReadIndex {
         filters: &Filters,
         exclude_current: bool,
         workspace: &workspace::Selection,
+        texture: Mode,
     ) -> Result<Box<dyn Query>> {
         let f = self.fields;
         let term = |field, value: &str| term_query(Term::from_field_text(field, value));
@@ -697,6 +723,7 @@ impl ReadIndex {
             (Occur::Must, Box::new(AllQuery) as Box<dyn Query>),
             (Occur::MustNot, term(f.id, CHECKPOINT_ID)),
         ];
+        clauses.push((Occur::Must, self.availability(texture)));
         if !filters.provider.is_empty() {
             let providers = filters
                 .provider
@@ -815,8 +842,9 @@ impl ReadIndex {
         limit: usize,
         cursor: Option<&str>,
         workspace: &workspace::Selection,
+        texture: Mode,
     ) -> Result<(Vec<Record>, Option<String>)> {
-        let mut selection = self.selection(filters, false, workspace)?;
+        let mut selection = self.selection(filters, false, workspace, texture)?;
         if !sessions && let Some(id) = cursor {
             let selected_cursor = BooleanQuery::new(vec![
                 (Occur::Must, selection.box_clone()),
@@ -967,13 +995,13 @@ impl ReadIndex {
     /// Build a query without field or boolean syntax, so code and URLs search as
     /// text. See [`query_groups`] for the accepted syntax. Returns `None` when
     /// the text has no tokens.
-    fn text_query(&self, text: &str) -> Result<Option<Box<dyn Query>>> {
-        let mut analyzer = self.index.tokenizer_for_field(self.fields.text)?;
+    fn text_query(&self, text: &str, field: Field) -> Result<Option<Box<dyn Query>>> {
+        let mut analyzer = self.index.tokenizer_for_field(field)?;
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for (required, group) in query_groups(text) {
             let mut terms = Vec::new();
             analyzer.token_stream(group).process(&mut |token| {
-                terms.push(Term::from_field_text(self.fields.text, &token.text));
+                terms.push(Term::from_field_text(field, &token.text));
             });
             // A group that tokenizes into several tokens (`std::fs`, `foo-bar`,
             // a quoted span) matches as a phrase.
@@ -996,22 +1024,24 @@ impl ReadIndex {
         terms: &[String],
         mode: LexicalMode,
         selection: &dyn Query,
+        texture: Mode,
     ) -> Result<LexicalResults> {
         if matches!(mode, LexicalMode::Events(0)) {
             return Ok(LexicalResults {
                 rows: Vec::new(),
                 addresses: HashMap::new(),
                 generators: Vec::new(),
+                texture,
             });
         }
         let mut scores = BTreeMap::<DocAddress, Candidate>::new();
         let mut generators = Vec::new();
         for term in terms {
-            let Some(query) = self.text_query(term)? else {
+            let field = self.fields.text(texture);
+            let Some(query) = self.text_query(term, field)? else {
                 continue;
             };
-            let mut generator =
-                SnippetGenerator::create(&self.searcher, &*query, self.fields.text)?;
+            let mut generator = SnippetGenerator::create(&self.searcher, &*query, field)?;
             generator.set_max_num_chars(crate::record::SEARCH_SNIPPET_CHARS);
             generators.push(generator);
             let filtered = BooleanQuery::new(vec![
@@ -1055,7 +1085,10 @@ impl ReadIndex {
                     .and_then(|v| v.as_bytes())
                     .context("record summary missing")?;
                 let record: Record = serde_json::from_slice(bytes)?;
-                addresses.insert(record.event_id.clone(), address);
+                addresses.insert(
+                    record.event_id.clone(),
+                    (address, record.source_spans.clone()),
+                );
                 Ok((row.score, record))
             })
             .collect::<Result<_>>()?;
@@ -1063,25 +1096,35 @@ impl ReadIndex {
             rows,
             addresses,
             generators,
+            texture,
         })
     }
 
-    pub fn by_session(&self, id: &str) -> Result<Vec<Record>> {
+    pub fn by_session(&self, id: &str, texture: Mode) -> Result<Vec<Record>> {
         Ok(self
-            .query(&TermQuery::new(
-                Term::from_field_text(self.fields.session, id),
-                IndexRecordOption::Basic,
-            ))?
+            .query(&BooleanQuery::new(vec![
+                (
+                    Occur::Must,
+                    term_query(Term::from_field_text(self.fields.session, id)),
+                ),
+                (Occur::Must, self.availability(texture)),
+            ]))?
             .into_iter()
             .map(|(_, record)| record)
             .collect())
     }
 
-    pub fn window(&self, record: &Record, radius: usize) -> Result<Vec<Record>> {
-        let mut addresses = self.addresses(&*term_query(Term::from_field_text(
-            self.fields.session,
-            &record.session_id,
-        )))?;
+    pub fn window(&self, record: &Record, radius: usize, texture: Mode) -> Result<Vec<Record>> {
+        let mut addresses = self.addresses(&BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                term_query(Term::from_field_text(
+                    self.fields.session,
+                    &record.session_id,
+                )),
+            ),
+            (Occur::Must, self.availability(texture)),
+        ]))?;
         addresses.sort_unstable_by_key(|a| (a.segment_ord, a.doc_id));
         let mut ordered = Vec::with_capacity(addresses.len());
         // Read ordering fields before loading the window's stored payloads.
@@ -1141,7 +1184,7 @@ impl ReadIndex {
             .collect())
     }
 
-    pub fn session_reference(&self, id: &str) -> Result<Vec<Record>> {
+    pub fn session_reference(&self, id: &str, texture: Mode) -> Result<Vec<Record>> {
         let mut clauses = vec![(
             Occur::Should,
             term_query(Term::from_field_text(self.fields.native_session, id)),
@@ -1154,7 +1197,10 @@ impl ReadIndex {
         }
         self.searcher
             .search(
-                &BooleanQuery::new(clauses),
+                &BooleanQuery::new(vec![
+                    (Occur::Must, Box::new(BooleanQuery::new(clauses))),
+                    (Occur::Must, self.availability(texture)),
+                ]),
                 &Winners {
                     mode: LexicalMode::Sessions,
                     chronological: true,
@@ -1163,6 +1209,16 @@ impl ReadIndex {
             .into_iter()
             .map(|row| self.summary(row.address))
             .collect()
+    }
+
+    fn availability(&self, texture: Mode) -> Box<dyn Query> {
+        Box::new(RangeQuery::new(
+            std::ops::Bound::Included(Term::from_field_u64(self.fields.availability, 0)),
+            std::ops::Bound::Included(Term::from_field_u64(
+                self.fields.availability,
+                texture.availability().indexed(),
+            )),
+        ))
     }
 }
 
@@ -1220,9 +1276,15 @@ pub fn semantic_version(root: &Path) -> Result<Option<String>> {
     if !path.join("meta.json").try_exists()? {
         return Ok(None);
     }
-    let meta = Index::open_in_dir(&path)?.load_metas()?;
-    Ok(Some(
-        decode_manifest(meta.payload.as_deref())?
+    let index = Index::open_in_dir(&path)?;
+    ensure!(
+        index.schema() == schema().0,
+        "incompatible history index at {}; move that directory aside, then re-import your sources",
+        path.display()
+    );
+    let meta = index.load_metas()?;
+    Ok(Some(conversation_version(
+        &decode_manifest(meta.payload.as_deref())?
             .semantic_version
             .unwrap_or_else(|| {
                 segment_version(
@@ -1231,7 +1293,11 @@ pub fn semantic_version(root: &Path) -> Result<Option<String>> {
                         .map(|s| (s.id().uuid_string(), s.num_deleted_docs())),
                 )
             }),
-    ))
+    )))
+}
+
+fn conversation_version(version: &str) -> String {
+    digest(&[&RECORD_VERSION.to_string(), version])
 }
 
 fn read_record(searcher: &Searcher, fields: Fields, address: DocAddress) -> Result<Record> {
@@ -1799,6 +1865,9 @@ fn update_with_parser(
                 }
                 let full = serde_json::to_vec(&StoredRecord::new(record.clone()))?;
                 let message = record.is_conversation_message();
+                let default_text = texture::view(&record, Mode::Default)?.text;
+                let expanded_text = texture::view(&record, Mode::Expanded)?.text;
+                let availability = record.availability()?.indexed();
                 let mut summary = record.clone();
                 summary.text.clear();
                 summary.structured_content = Value::Null;
@@ -1809,6 +1878,9 @@ fn update_with_parser(
                     fields.session => record.session_id.clone(),
                     fields.message => message,
                     fields.text => record.text,
+                    fields.default_text => default_text,
+                    fields.expanded_text => expanded_text,
+                    fields.availability => availability,
                     fields.record => full,
                     fields.summary => serde_json::to_vec(&summary)?,
                     fields.provider => record.provider.as_str(),
@@ -1923,10 +1995,20 @@ pub(crate) mod tests {
         input(&path, &text);
         let index = import(&config, Provider::Codex, &path);
         let selection = index
-            .selection(&Filters::default(), false, &workspace::Selection::All)
+            .selection(
+                &Filters::default(),
+                false,
+                &workspace::Selection::All,
+                Mode::Default,
+            )
             .unwrap();
         let hits = index
-            .lexical(&["needle".into()], LexicalMode::Events(1), &*selection)
+            .lexical(
+                &["needle".into()],
+                LexicalMode::Events(1),
+                &*selection,
+                Mode::Default,
+            )
             .unwrap();
         assert_eq!(hits.rows.len(), 1);
         let snippet = hits.snippet(&index, &hits.rows[0].1.event_id).unwrap();
@@ -1939,30 +2021,106 @@ pub(crate) mod tests {
             .remove(0);
         assert_eq!(full.text, text);
         assert_eq!(full.structured_content["content"][0]["text"], text);
+
+        let path = path.with_file_name("pi.jsonl");
+        let header = json!({"type":"session", "version":3, "id":"mixed"});
+        let row = json!({"type":"message", "id":"mixed", "message":{"role":"assistant", "content":[
+            {"type":"text", "text":"ordinary prefix"},
+            {"type":"thinking", "thinking":text},
+            {"type":"text", "text":"ordinary suffix"}
+        ]}});
+        fs::write(&path, format!("{header}\n{row}\n")).unwrap();
+        let index = import(&config, Provider::Pi, &path);
+        for mode in [Mode::Default, Mode::Expanded, Mode::Source] {
+            index.record_decodes.set(0);
+            let selection = index
+                .selection(
+                    &Filters {
+                        provider: vec![Provider::Pi],
+                        ..Default::default()
+                    },
+                    false,
+                    &workspace::Selection::All,
+                    mode,
+                )
+                .unwrap();
+            let hits = index
+                .lexical(
+                    &["needle".into()],
+                    LexicalMode::Events(1),
+                    &*selection,
+                    mode,
+                )
+                .unwrap();
+            if mode == Mode::Default {
+                assert!(hits.rows.is_empty());
+                continue;
+            }
+            let snippet = hits.snippet(&index, &hits.rows[0].1.event_id).unwrap();
+            assert_eq!(index.record_decodes.get(), 0);
+            assert!(snippet.chars().count() <= crate::record::SEARCH_SNIPPET_CHARS);
+            let full = index
+                .event_reference(&hits.rows[0].1.event_id)
+                .unwrap()
+                .remove(0)
+                .project(mode)
+                .unwrap();
+            assert!(full.text.contains(&snippet));
+        }
     }
 
     #[test]
     fn incompatible_indexes_remain_untouched_and_explain_reimport() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
-        let path = config.directories.data.join("index");
-        fs::create_dir_all(&path).unwrap();
-        let mut old = Schema::builder();
-        old.add_text_field("obsolete", TEXT);
-        Index::create_in_dir(&path, old.build()).unwrap();
-        let metadata = fs::read(path.join("meta.json")).unwrap();
-        for error in [
-            ReadIndex::open(&config.directories.data).err().unwrap(),
-            status(&config).err().unwrap(),
-            update(&config, &[], false).err().unwrap(),
-        ] {
-            assert!(
-                error
-                    .to_string()
-                    .contains("move that directory aside, then re-import")
-            );
+        for old_schema in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let config =
+                Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
+            let path = config.directories.data.join("index");
+            fs::create_dir_all(&path).unwrap();
+            let mut old = Schema::builder();
+            old.add_text_field("obsolete", TEXT);
+            let index =
+                Index::create_in_dir(&path, if old_schema { old.build() } else { schema().0 })
+                    .unwrap();
+            if !old_schema {
+                let mut writer = index
+                    .writer_with_num_threads::<TantivyDocument>(1, 15_000_000)
+                    .unwrap();
+                let mut commit = writer.prepare_commit().unwrap();
+                commit.set_payload(
+                    &serde_json::to_string(&Manifest {
+                        record_version: RECORD_VERSION - 1,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                );
+                commit.commit().unwrap();
+                writer.wait_merging_threads().unwrap();
+            }
+            let snapshot = || {
+                fs::read_dir(&path)
+                    .unwrap()
+                    .map(|entry| {
+                        let path = entry.unwrap().path();
+                        (
+                            path.file_name().unwrap().to_owned(),
+                            fs::read(&path).unwrap(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            };
+            let before = snapshot();
+            for error in [
+                ReadIndex::open(&config.directories.data).err().unwrap(),
+                semantic_version(&config.directories.data).err().unwrap(),
+                status(&config).err().unwrap(),
+                update(&config, &[], false).err().unwrap(),
+                update_full(&config, &[], false).err().unwrap(),
+            ] {
+                assert!(error.to_string().contains("then re-import your sources"));
+            }
+            assert_eq!(snapshot(), before);
         }
-        assert_eq!(fs::read(path.join("meta.json")).unwrap(), metadata);
     }
 
     fn assert_full_parse(config: &Config, path: &Path) -> Vec<Record> {
@@ -2241,11 +2399,21 @@ pub(crate) mod tests {
         );
         let index = import(&config, Provider::Codex, &path);
         let selection = index
-            .selection(&Filters::default(), false, &workspace::Selection::All)
+            .selection(
+                &Filters::default(),
+                false,
+                &workspace::Selection::All,
+                Mode::Default,
+            )
             .unwrap();
         let hits = |query: &str| {
             index
-                .lexical(&[query.into()], LexicalMode::All, &*selection)
+                .lexical(
+                    &[query.into()],
+                    LexicalMode::All,
+                    &*selection,
+                    Mode::Default,
+                )
                 .unwrap()
                 .rows
                 .len()
@@ -2301,11 +2469,11 @@ pub(crate) mod tests {
                 ..Default::default()
             };
             let selection = index
-                .selection(&filters, false, &workspace::Selection::All)
+                .selection(&filters, false, &workspace::Selection::All, Mode::Default)
                 .unwrap();
             index.summary_decodes.set(0);
             let limited = index
-                .lexical(terms, LexicalMode::Events(1), &*selection)
+                .lexical(terms, LexicalMode::Events(1), &*selection, Mode::Default)
                 .unwrap()
                 .rows;
             // The newest of the equally short matches wins. Long messages
@@ -2316,7 +2484,7 @@ pub(crate) mod tests {
             assert_eq!(index.record_decodes.get(), 0);
             index.summary_decodes.set(0);
             let grouped = index
-                .lexical(terms, LexicalMode::Sessions, &*selection)
+                .lexical(terms, LexicalMode::Sessions, &*selection, Mode::Default)
                 .unwrap()
                 .rows;
             assert_eq!(grouped.len(), 1);
@@ -2325,11 +2493,16 @@ pub(crate) mod tests {
             assert_eq!(index.record_decodes.get(), 0);
         }
         let selection = index
-            .selection(&Filters::default(), false, &workspace::Selection::All)
+            .selection(
+                &Filters::default(),
+                false,
+                &workspace::Selection::All,
+                Mode::Default,
+            )
             .unwrap();
         assert!(
             index
-                .lexical(&terms, LexicalMode::Events(0), &*selection)
+                .lexical(&terms, LexicalMode::Events(0), &*selection, Mode::Default)
                 .unwrap()
                 .rows
                 .is_empty()
@@ -2339,10 +2512,15 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let selection = index
-            .selection(&filters, false, &workspace::Selection::All)
+            .selection(&filters, false, &workspace::Selection::All, Mode::Default)
             .unwrap();
         let last = index
-            .lexical(&terms[..1], LexicalMode::Events(1), &*selection)
+            .lexical(
+                &terms[..1],
+                LexicalMode::Events(1),
+                &*selection,
+                Mode::Default,
+            )
             .unwrap()
             .rows;
         assert_eq!(
@@ -2395,6 +2573,7 @@ pub(crate) mod tests {
                 },
             },
             Some(&index),
+            Mode::Default,
         )
         .unwrap();
         assert!(result.retrieval.effective_mode == Backend::Lexical);
@@ -2638,8 +2817,14 @@ pub(crate) mod tests {
                     &["needle".into()],
                     LexicalMode::All,
                     &*index
-                        .selection(&Filters::default(), false, &workspace::Selection::All)
+                        .selection(
+                            &Filters::default(),
+                            false,
+                            &workspace::Selection::All,
+                            Mode::Default,
+                        )
                         .unwrap(),
+                    Mode::Default,
                 )
                 .unwrap();
             assert_eq!(hits.rows.len(), 2);
@@ -2654,7 +2839,12 @@ pub(crate) mod tests {
                     let selected = index
                         .selected_ids(
                             &*index
-                                .selection(&filters, false, &workspace::Selection::All)
+                                .selection(
+                                    &filters,
+                                    false,
+                                    &workspace::Selection::All,
+                                    Mode::Default,
+                                )
                                 .unwrap(),
                         )
                         .unwrap();

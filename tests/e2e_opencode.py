@@ -78,13 +78,51 @@ def opencode_v2(case):
     # Growing tool state changes the number of trwl events in the middle of a
     # session; later records must be resequenced, not left stale or duplicated.
     assistant = {
+        "tokens": {"input": 8, "output": 5, "reasoning": 3},
+        "error": {
+            "_tag": "UnknownError",
+            "message": "assistantfailurebeacon Original error.",
+        },
         "content": [
-            {"type": "reasoning", "text": "reasonbeacon Inspect the failing request."},
-            {"type": "text", "text": "answerbeacon I will inspect the file."},
+            {
+                "type": "reasoning",
+                "text": "reasonbeacon Inspect the failing request.",
+                "native": {
+                    "provider": {
+                        "nested": [
+                            {"signature": "v2-signature"},
+                            {"redactedData": "v2-data"},
+                            False,
+                            0,
+                            None,
+                            {},
+                            [],
+                            "same",
+                            "same",
+                        ]
+                    }
+                },
+            },
+            {
+                "type": "text",
+                "text": "answerbeacon I will inspect the file.",
+                "native": {
+                    "provider": {
+                        "signature": "ordinary-signature",
+                        "reasoning": "ordinary native value",
+                    }
+                },
+            },
             {
                 "type": "tool",
                 "id": "call_read",
                 "name": "read",
+                "native": {
+                    "provider": {
+                        "signature": "tool-signature",
+                        "reasoning": "tool native value",
+                    }
+                },
                 "state": {"status": "running", "input": {"filePath": "src/main.rs"}},
             },
             {
@@ -93,7 +131,12 @@ def opencode_v2(case):
                 "name": "bash",
                 "state": {"status": "streaming", "input": '{"command":"ls'},
             },
-        ]
+            {
+                "type": "reasoning",
+                "text": "",
+                "native": {"provider": {"signature": "empty-signature", "payload": []}},
+            },
+        ],
     }
     message("msg_assistant", "assistant", assistant, 2)
     for n in range(70):
@@ -111,7 +154,75 @@ def opencode_v2(case):
     calls = [e for e in before if e["event_type"] == "tool_call"]
     require(len(calls) == 2, "v2 assistant tools were not separated into calls")
     require(any("src/main.rs" in e["files"] for e in calls), "v2 tool file paths lost")
-    require(case.search("reasonbeacon", "--events")["results"], "reasoning was lost")
+    require(
+        not case.search("reasonbeacon", "--events")["results"],
+        "default matched a selected content part",
+    )
+    details = case.search("reasonbeacon", "--events", "--texture")["results"]
+    require(len(details) == 1, "expanded v2 content is not searchable")
+    detail_id = details[0]["trwl_event_id"]
+    expanded = case.json_command("show", "event", detail_id, "--texture")["event"]
+    ordinary = case.json_command("show", "event", detail_id)["event"]
+    case.env["TRWL_TEXTURE"] = "source"
+    source = case.json_command("show", "event", detail_id, "--texture")["event"]
+    case.env.pop("TRWL_TEXTURE", None)
+    require(
+        ordinary["text"]
+        == "answerbeacon I will inspect the file.\nUnknownError\nassistantfailurebeacon Original error.",
+        "default lost ordinary content or appended v2 error",
+    )
+    require(
+        expanded["structured_content"]["content"][0]
+        == {"type": "detail", "text": expanded["text"].split("\n")[0]},
+        "v2 structured selected text differs from body",
+    )
+    require(
+        source["text"].startswith("reasonbeacon Inspect the failing request.\n"),
+        "source v2 text changed",
+    )
+    for event in (ordinary, expanded, source):
+        require(
+            next(
+                part
+                for part in event["structured_content"]["content"]
+                if part["type"] == "text"
+            )["native"]
+            == assistant["content"][1]["native"],
+            "ordinary V2 native data changed",
+        )
+        require(
+            next(
+                part
+                for part in event["structured_content"]["content"]
+                if part["type"] == "tool"
+            )["native"]
+            == assistant["content"][2]["native"],
+            "tool V2 native data changed",
+        )
+        require(
+            event["structured_content"]["tokens"]
+            == {"input": 8, "output": 5, "detail_tokens": 3},
+            "v2 counter metadata was not neutral",
+        )
+        require(
+            "assistantfailurebeacon Original error." in event["text"],
+            "v2 error was lost in projection",
+        )
+    require(
+        source["structured_content"]["content"][0]
+        == {
+            "type": "detail",
+            "text": "reasonbeacon Inspect the failing request.",
+            "signature": "v2-signature",
+            "data": ["v2-data", False, 0, None, {}, [], "same", "same"],
+        },
+        "V2 source projection lost nested terminal values",
+    )
+    require(
+        source["structured_content"]["content"][-1]
+        == {"type": "detail", "text": "", "signature": "empty-signature", "data": []},
+        "empty V2 selected native data disappeared",
+    )
     assistant["content"][2]["state"] = {
         "status": "completed",
         "input": {"filePath": "src/main.rs"},
@@ -169,7 +280,11 @@ def opencode_v2(case):
     message(
         "msg_compact",
         "compaction",
-        {"status": "completed", "summary": "summarybeacon Summary."},
+        {
+            "status": "completed",
+            "summary": "summarybeacon Summary.",
+            "tokens": {"input": 8, "output": 5, "reasoning": 3},
+        },
         80,
     )
     message("msg_system", "system", {"text": "systembeacon Updated instructions."}, 81)
@@ -182,7 +297,12 @@ def opencode_v2(case):
         },
         82,
     )
-    imported()
+    compact = next(e for e in imported() if e["provider_event_id"] == "msg_compact")
+    require(
+        compact["structured_content"]["tokens"]
+        == {"input": 8, "output": 5, "detail_tokens": 3},
+        "v2 compaction exposed category-only token metadata",
+    )
     child = case.json_command("show", "session", "ses_child")["events"][0]
     require(
         child["parent_trwl_session_id"] == user["trwl_session_id"],

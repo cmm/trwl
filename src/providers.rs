@@ -16,8 +16,11 @@
 //! duplicate-identity counters and rejections (a count and the first few
 //! diagnostics).
 
-use crate::record::{EventType, Provider, Record, Role, digest, millis, session_id, timestamp};
+use crate::record::{
+    EventType, NativeEventKind, Provider, Record, Role, digest, millis, session_id, timestamp,
+};
 use crate::report::Diagnostic;
+use crate::texture::{BlockArray, BlockCollection, Body, Opaque, OpaqueKind, Selection, Target};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -196,27 +199,274 @@ pub fn parse(
 /// Invalidate cached parses when a reader learns a previously ignored format.
 pub fn parser_revision(provider: Provider) -> u32 {
     match provider {
-        Provider::Opencode => 1,
+        Provider::Opencode | Provider::Pi | Provider::Claude => 2,
+        Provider::CopilotCli => 1,
         _ => 0,
     }
 }
 
 fn text(value: &Value) -> String {
-    if let Some(s) = value.as_str() {
-        return s.into();
+    text_parts(value).join("\n")
+}
+
+fn selected_part(provider: Provider, value: &Value) -> bool {
+    selected_form(provider, value).is_some()
+}
+
+#[derive(Clone, Copy)]
+enum SelectedForm {
+    Opencode,
+    Codex,
+    Pi,
+    Thinking,
+    Redacted,
+}
+
+fn selected_form(provider: Provider, value: &Value) -> Option<SelectedForm> {
+    match (provider, value["type"].as_str()?) {
+        (Provider::Opencode, "reasoning") => Some(SelectedForm::Opencode),
+        (Provider::Codex, "reasoning") => Some(SelectedForm::Codex),
+        (Provider::Pi, "thinking") => Some(SelectedForm::Pi),
+        (Provider::Claude, "thinking") => Some(SelectedForm::Thinking),
+        (Provider::Claude, "redacted_thinking") => Some(SelectedForm::Redacted),
+        _ => None,
     }
-    if let Some(parts) = value.as_array() {
-        return parts
-            .iter()
-            .filter_map(|v| {
-                v.get("text")
-                    .or_else(|| v.get("thinking"))
+}
+
+fn block_form(value: &Value) -> Option<SelectedForm> {
+    match value["type"].as_str()? {
+        "thinking" => Some(SelectedForm::Thinking),
+        "redacted_thinking" => Some(SelectedForm::Redacted),
+        "reasoning" => Some(SelectedForm::Codex),
+        _ => None,
+    }
+}
+
+fn select_part(body: &mut Body, pointer: String, value: &Value, form: SelectedForm) -> usize {
+    let fields: &[(&str, OpaqueKind)] = match form {
+        SelectedForm::Opencode => &[
+            ("data", OpaqueKind::Data),
+            ("encrypted_content", OpaqueKind::Data),
+            ("signature", OpaqueKind::Signature),
+            ("thinkingSignature", OpaqueKind::Signature),
+        ],
+        SelectedForm::Codex => &[("encrypted_content", OpaqueKind::Data)],
+        SelectedForm::Pi => &[("thinkingSignature", OpaqueKind::Signature)],
+        SelectedForm::Thinking => &[("signature", OpaqueKind::Signature)],
+        SelectedForm::Redacted => &[("data", OpaqueKind::Data)],
+    };
+    let mut opaque: Vec<_> = fields
+        .iter()
+        .filter(|(key, _)| value.get(*key).is_some())
+        .map(|(key, kind)| Opaque::Value {
+            pointer: format!("{pointer}/{key}"),
+            kind: *kind,
+        })
+        .collect();
+    if matches!(form, SelectedForm::Opencode) {
+        for key in ["metadata", "native"] {
+            if value.get(key).is_some() {
+                opaque.push(Opaque::NativeMap(format!("{pointer}/{key}")));
+            }
+        }
+    }
+    body.select(Selection {
+        target: Target::Node(pointer),
+        opaque,
+    })
+}
+
+fn push_selected(body: &mut Body, node: usize, value: &Value, form: SelectedForm) {
+    match form {
+        SelectedForm::Codex => {
+            for key in ["summary", "content"] {
+                let parts = text_parts(&value[key]);
+                if !parts.join("\n").is_empty() {
+                    for text in parts {
+                        body.push(text, Some(node));
+                    }
+                }
+            }
+        }
+        SelectedForm::Opencode => body.push(&text(&value["text"]), Some(node)),
+        SelectedForm::Pi | SelectedForm::Thinking => {
+            if let Some(text) = value["thinking"].as_str() {
+                body.push(text, Some(node));
+            }
+        }
+        SelectedForm::Redacted => {}
+    }
+}
+
+fn compose_copilot(record: &mut Record, kind: NativeEventKind) -> Result<()> {
+    let value = &record.structured_content;
+    let mut body = Body::default();
+    if kind == NativeEventKind::CopilotAssistantDetail {
+        let node = body.select(Selection {
+            target: Target::Node(String::new()),
+            opaque: Vec::new(),
+        });
+        body.push(
+            value["content"]
+                .as_str()
+                .context("message content missing")?,
+            Some(node),
+        );
+    } else {
+        let members: Vec<_> = ["reasoningText", "reasoningOpaque", "encryptedContent"]
+            .into_iter()
+            .filter(|key| value.get(*key).is_some())
+            .map(str::to_owned)
+            .collect();
+        if members.is_empty() && value.get("reasoningBlocks").is_none() {
+            return Ok(());
+        }
+        if let Some(content) = value.get("content") {
+            body.ordinary();
+            for text in text_parts(content) {
+                body.push(text, None);
+            }
+        }
+        if !members.is_empty() {
+            let opaque = [
+                ("reasoningOpaque", OpaqueKind::Signature),
+                ("encryptedContent", OpaqueKind::Data),
+            ]
+            .into_iter()
+            .filter(|(key, _)| value.get(*key).is_some())
+            .map(|(key, kind)| Opaque::Value {
+                pointer: format!("/{key}"),
+                kind,
+            })
+            .collect();
+            let node = body.select(Selection {
+                target: Target::Fields {
+                    object: String::new(),
+                    members,
+                },
+                opaque,
+            });
+            if let Some(text) = value["reasoningText"].as_str() {
+                body.push(text, Some(node));
+            }
+        }
+        if let Some(envelope) = value.get("reasoningBlocks") {
+            let envelope = envelope.as_object().context("invalid content container")?;
+            let mut arrays = Vec::new();
+            for array in [BlockArray::Blocks, BlockArray::OrderedBlocks] {
+                if let Some(parts) = envelope.get(array.name()) {
+                    let parts = parts.as_array().context("invalid content array")?;
+                    arrays.push(array);
+                    for (position, part) in parts.iter().enumerate() {
+                        if let Some(form) = block_form(part) {
+                            let node = select_part(
+                                &mut body,
+                                format!("/reasoningBlocks/{}/{position}", array.name()),
+                                part,
+                                form,
+                            );
+                            push_selected(&mut body, node, part, form);
+                        } else {
+                            body.ordinary();
+                        }
+                    }
+                }
+            }
+            if envelope
+                .keys()
+                .any(|key| !matches!(key.as_str(), "provider" | "blocks" | "orderedBlocks"))
+            {
+                body.ordinary();
+            }
+            body.collection(BlockCollection {
+                pointer: "/reasoningBlocks".into(),
+                arrays,
+            });
+        }
+    }
+    body.finish(record)
+}
+
+fn text_parts(value: &Value) -> Vec<&str> {
+    if let Some(text) = value.as_str() {
+        vec![text]
+    } else {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|part| {
+                part.get("text")
+                    .or_else(|| part.get("thinking"))
                     .and_then(Value::as_str)
             })
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect()
     }
-    String::new()
+}
+
+/// Retain provenance while composing native message parts. Tool records and
+/// arbitrary objects inside them never enter this classifier.
+fn compose_message(record: &mut Record) -> Result<()> {
+    if record.event_type != EventType::Message {
+        return Ok(());
+    }
+    if let Some(kind) = record.native_kind {
+        return compose_copilot(record, kind);
+    }
+    let value = &record.structured_content;
+    let mut body = Body::default();
+    if matches!(record.provider, Provider::Opencode | Provider::Codex)
+        && selected_part(record.provider, value)
+    {
+        let form = selected_form(record.provider, value).context("invalid content owner")?;
+        let node = select_part(&mut body, String::new(), value, form);
+        push_selected(&mut body, node, value, form);
+    } else if let Some(parts) = value["content"].as_array() {
+        if !matches!(record.provider, Provider::Pi | Provider::Claude)
+            && !(record.provider == Provider::Opencode && value["type"] == "assistant")
+        {
+            return Ok(());
+        }
+        if !parts
+            .iter()
+            .any(|part| selected_part(record.provider, part))
+        {
+            return Ok(());
+        }
+        // OpenCode v2 appends errors after its content, excluding an empty
+        // composed content body. Other readers preserve empty text parts.
+        let empty_content =
+            record.provider == Provider::Opencode && text(&value["content"]).is_empty();
+        for (position, part) in parts.iter().enumerate() {
+            if let Some(form) = selected_form(record.provider, part) {
+                let node = select_part(&mut body, format!("/content/{position}"), part, form);
+                if !empty_content {
+                    push_selected(&mut body, node, part, form);
+                }
+            } else {
+                body.ordinary();
+                if !empty_content
+                    && let Some(text) = part
+                        .get("text")
+                        .or_else(|| part.get("thinking"))
+                        .and_then(Value::as_str)
+                {
+                    body.push(text, None);
+                }
+            }
+        }
+        if record.provider == Provider::Opencode {
+            let mut errors = Vec::new();
+            strings(&value["error"], &mut errors);
+            for error in errors.into_iter().filter(|text| !text.is_empty()) {
+                body.ordinary();
+                body.push(error, None);
+            }
+        }
+    } else {
+        return Ok(());
+    }
+    body.finish(record)
 }
 
 /// Collect the string values of a native part, except identifiers and inline
@@ -592,6 +842,7 @@ fn opencode_part(
         .collect();
     let output = (kind == EventType::ToolCall && !output.is_empty()).then(|| output.join("\n"));
     record.structured_content = value;
+    compose_message(&mut record)?;
     emit(&record)?;
     session.records += 1;
     if let Some(output) = output {
@@ -665,6 +916,7 @@ fn opencode_v2_message(
         record.event_type = event_type;
         record.text = body;
         record.structured_content = structured;
+        compose_message(&mut record)?;
         record.files = files;
         record.sequence = session.records as u64;
         sink(&record)?;
@@ -888,6 +1140,7 @@ fn jsonl(
                     kind,
                     "user.message"
                         | "assistant.message"
+                        | "assistant.reasoning"
                         | "tool.execution_start"
                         | "tool.execution_complete"
                 ) =>
@@ -952,6 +1205,14 @@ fn jsonl(
             record.occurred_at = time.clone();
             record.text = body;
             record.structured_content = structured;
+            if provider == Provider::CopilotCli && event_type == EventType::Message {
+                record.native_kind = match kind {
+                    "assistant.message" => Some(NativeEventKind::CopilotAssistantMessage),
+                    "assistant.reasoning" => Some(NativeEventKind::CopilotAssistantDetail),
+                    _ => None,
+                };
+            }
+            compose_message(&mut record)?;
             record.files = files;
             record.sequence = parsed.records as u64;
             sink(&record)?;
@@ -959,7 +1220,15 @@ fn jsonl(
             Ok(())
         };
         let message_kind = message["type"].as_str().unwrap_or("");
-        if provider == Provider::Codex && message_kind == "reasoning" {
+        if provider == Provider::CopilotCli && kind == "assistant.reasoning" {
+            emit(
+                "message",
+                EventType::Message,
+                text(&message["content"]),
+                message.clone(),
+                Vec::new(),
+            )?;
+        } else if provider == Provider::Codex && message_kind == "reasoning" {
             let body = [text(&message["summary"]), text(&message["content"])]
                 .into_iter()
                 .filter(|s| !s.is_empty())
@@ -1036,9 +1305,22 @@ fn jsonl(
             // role for tool results), so it must not interrupt pairing.
             let visible = content.is_string()
                 || content.as_array().is_some_and(|parts| {
-                    parts.is_empty() || parts.iter().any(crate::record::is_text_part)
+                    parts.is_empty()
+                        || parts.iter().any(|part| {
+                            !matches!(
+                                part["type"].as_str(),
+                                Some("toolCall" | "tool_use" | "tool_result")
+                            )
+                        })
                 });
-            if !body.is_empty() || visible {
+            let marked = content
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| selected_part(provider, part)));
+            if !body.is_empty()
+                || visible
+                || marked
+                || (provider == Provider::CopilotCli && kind == "assistant.message")
+            {
                 emit(
                     "message",
                     EventType::Message,

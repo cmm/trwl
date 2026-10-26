@@ -1,7 +1,7 @@
 use crate::{
     cli::Backend,
     config::Source,
-    record::{EventType, IndexMode, Provider, Record, SourceLocation},
+    record::{EventType, IndexMode, Provider, Record, Role, SourceLocation},
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -154,19 +154,103 @@ pub struct Location {
     pub workspace: String,
     pub workspace_root: Option<crate::workspace::Root>,
 }
+#[derive(Clone, Serialize)]
+pub struct OutputRecord {
+    #[serde(rename = "trwl_event_id")]
+    pub event_id: String,
+    #[serde(rename = "trwl_session_id")]
+    pub session_id: String,
+    pub provider: Provider,
+    pub provider_session_id: String,
+    pub provider_event_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_message_id: Option<String>,
+    #[serde(rename = "parent_trwl_session_id")]
+    pub parent_session_id: Option<String>,
+    pub event_type: EventType,
+    pub role: Option<Role>,
+    pub occurred_at: String,
+    pub text: String,
+    pub structured_content: serde_json::Value,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub details: Vec<serde_json::Value>,
+    pub workspace: String,
+    pub workspace_root: Option<crate::workspace::Root>,
+    pub source: SourceLocation,
+    pub files: Vec<String>,
+    pub sequence: u64,
+    pub is_subagent: bool,
+}
+
+impl Record {
+    pub fn availability(&self) -> anyhow::Result<crate::texture::Availability> {
+        self.source_spans
+            .as_ref()
+            .map_or(Ok(crate::texture::Availability::Ordinary), |spans| {
+                spans.availability(&self.text)
+            })
+    }
+
+    pub fn project(self, mode: crate::texture::Mode) -> anyhow::Result<OutputRecord> {
+        anyhow::ensure!(
+            self.availability()? <= mode.availability(),
+            "record reference not found"
+        );
+        let view = crate::texture::view(&self, mode)?;
+        let text = view.render(0..view.text.len())?;
+        let projection = match &self.source_spans {
+            Some(spans) => spans.project_native(&self, mode)?,
+            None => crate::texture::NativeProjection {
+                value: self.structured_content,
+                details: Vec::new(),
+            },
+        };
+        let mut structured_content = projection.value;
+        // Tool payload keys and values are owned by the tool, not the envelope.
+        if !matches!(self.event_type, EventType::ToolCall | EventType::ToolOutput) {
+            crate::texture::neutral_metadata(
+                self.provider,
+                self.native_kind,
+                &mut structured_content,
+            );
+        }
+        Ok(OutputRecord {
+            event_id: self.event_id,
+            session_id: self.session_id,
+            provider: self.provider,
+            provider_session_id: self.provider_session_id,
+            provider_event_id: self.provider_event_id,
+            provider_message_id: self.provider_message_id,
+            parent_session_id: self.parent_session_id,
+            event_type: self.event_type,
+            role: self.role,
+            occurred_at: self.occurred_at,
+            text,
+            structured_content,
+            details: projection.details,
+            workspace: self.workspace,
+            workspace_root: self.workspace_root,
+            source: self.source,
+            files: self.files,
+            sequence: self.sequence,
+            is_subagent: self.is_subagent,
+        })
+    }
+}
+
 #[derive(Serialize)]
 pub struct SelectedEvents {
-    pub event: Record,
-    pub events: Vec<Record>,
+    pub event: OutputRecord,
+    pub events: Vec<OutputRecord>,
 }
 #[derive(Serialize)]
 pub struct SessionEvents {
     pub session: Location,
-    pub events: Vec<Record>,
+    pub events: Vec<OutputRecord>,
 }
 #[derive(Serialize)]
 pub struct EventsPage {
-    pub events: Vec<Record>,
+    pub events: Vec<OutputRecord>,
     pub next_cursor: Option<String>,
 }
 #[derive(Serialize)]

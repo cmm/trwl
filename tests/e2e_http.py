@@ -7,6 +7,7 @@ import threading
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from e2e_providers import copilot_records, write_jsonl
 from e2e_semantic import (
     QUERY,
     SESSION,
@@ -407,6 +408,51 @@ def semantic_cache(case):
             len(api.requests) == before, "tool-only update embedded conversation text"
         )
         require(plans() == original, "tool-only update changed composed input")
+        fixture.part(
+            "cache",
+            "first",
+            "detail",
+            {
+                "type": "reasoning",
+                "text": "selectedonlybeacon First selected part.",
+            },
+        )
+        refresh()
+        require(
+            plans() == original and len(api.requests) == before,
+            "selected-only update changed semantic input",
+        )
+        with sqlite3.connect(fixture.path) as db:
+            db.execute(
+                "UPDATE part SET data=?, time_updated=? WHERE id='detail'",
+                (
+                    json.dumps(
+                        {
+                            "type": "reasoning",
+                            "text": "selectedonlybeacon Edited selected part.",
+                        }
+                    ),
+                    fixture.stamp(),
+                ),
+            )
+        refresh()
+        require(
+            plans() == original and len(api.requests) == before,
+            "selected-only edit re-embedded history",
+        )
+        for source in (False, True):
+            if source:
+                case.env["TRWL_TEXTURE"] = "source"
+            hits = case.search(
+                "cachebeacon", "--events", "--texture", backend="semantic"
+            )["results"]
+            require(
+                len(hits) == 2
+                and all("selectedonlybeacon" not in hit["snippet"] for hit in hits),
+                "semantic snippets exposed additional parts",
+            )
+        case.env.pop("TRWL_TEXTURE", None)
+        before = len(api.requests)
         with sqlite3.connect(database) as db:
             require(
                 db.execute("SELECT count(*) FROM test_plan_writes").fetchone()[0] == 0,
@@ -502,6 +548,99 @@ def semantic_cache(case):
         case.check(
             "prepared plans reuse unchanged inputs while replies, metadata, deletions and eviction stay fresh"
         )
+        # Copilot SDK AssistantMessageData has scalar ordinary content beside
+        # selected sidecars; only the scalar content belongs in conversation input.
+        path = case.providers / "scalar-copilot/events.jsonl"
+        scalar, expected = copilot_records(case.work, "scalar-copilot")
+        for index, row in enumerate(scalar):
+            row["parentId"] = scalar[index - 1]["id"] if index else None
+            if row["type"] == "assistant.message":
+                row["data"].update(
+                    messageId="scalar-message",
+                    reasoningText="scalarselectedbeacon Original sidecar.",
+                    reasoningOpaque="scalar-signature",
+                    reasoningBlocks={
+                        "provider": "anthropic",
+                        "blocks": [
+                            {
+                                "type": "thinking",
+                                "thinking": "blockselectedbeacon Original block.",
+                                "signature": "block-signature",
+                            }
+                        ],
+                    },
+                )
+        scalar.append(
+            {
+                "id": "scalar-standalone",
+                "parentId": scalar[-1]["id"],
+                "timestamp": "2026-09-21T12:00:03.000Z",
+                "type": "assistant.reasoning",
+                "data": {
+                    "reasoningId": "scalar-detail",
+                    "content": "standaloneselectedbeacon Original standalone.",
+                },
+            }
+        )
+        before = len(api.requests)
+        write_jsonl(path, scalar)
+        case.command("import", "--provider", "copilot-cli", "--path", path)
+        case.command("setup", "--wait")
+        document_texts = [
+            text
+            for request in api.requests[before:]
+            for text in request["texts"]
+            if text.startswith("user:")
+        ]
+        require(
+            "user:\n" + expected[0][1] + "\n\nassistant:\n" + expected[1][1]
+            in document_texts,
+            "scalar Copilot content did not form its ordinary conversation document",
+        )
+        require(
+            all("selectedbeacon" not in text for text in document_texts),
+            "Copilot sidecar entered embedding input",
+        )
+        initial = plans()
+        before = len(api.requests)
+        scalar[2]["data"]["reasoningText"] = "scalarselectedbeacon Edited sidecar."
+        scalar[2]["data"]["reasoningOpaque"] = "edited-signature"
+        scalar[2]["data"]["reasoningBlocks"]["blocks"][0]["thinking"] = (
+            "blockselectedbeacon Edited block."
+        )
+        scalar[3]["data"]["content"] = "standaloneselectedbeacon Edited standalone."
+        write_jsonl(path, scalar)
+        case.command("import", "--provider", "copilot-cli", "--path", path)
+        case.command("setup", "--wait")
+        require(
+            plans() == initial and len(api.requests) == before,
+            "Copilot selected/opaque edit invalidated ordinary semantic input",
+        )
+        for source in (False, True):
+            if source:
+                case.env["TRWL_TEXTURE"] = "source"
+            hits = case.search(
+                "copilotpromptbeacon",
+                "--session",
+                "scalar-copilot",
+                "--events",
+                "--texture",
+                backend="semantic",
+            )["results"]
+            require(
+                len(hits) == 1 and hits[0]["snippet"] == expected[0][1],
+                "Copilot semantic anchor snippet included sidecars",
+            )
+            hybrid = case.search(
+                "scalarselectedbeacon",
+                "--session",
+                "scalar-copilot",
+                "--events",
+                "--texture",
+                backend="hybrid",
+            )["results"]
+            require(len(hybrid) == 2, "Copilot hybrid did not expand its lexical side")
+        case.env.pop("TRWL_TEXTURE", None)
     case.check(
         "cache eviction reports partial/unavailable coverage and preserves history; waited fill recovers"
     )

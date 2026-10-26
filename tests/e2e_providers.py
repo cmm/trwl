@@ -1,6 +1,7 @@
 """Native coding-harness histories, checked through the public CLI."""
 
 import json
+from copy import deepcopy
 
 from e2e_support import OpenCodeFixture, require
 
@@ -300,6 +301,486 @@ def copilot_cli_jsonl(case):
     case.check(
         "Copilot CLI append, correction and deletion preserve surviving references"
     )
+    copilot_details(case)
+
+
+def copilot_details(case):
+    # Copilot SDK AssistantMessageData, AssistantReasoningEvent and
+    # AssistantMessageReasoningBlocks, including their persisted event envelope.
+    session = "copilot-details"
+    path = case.providers / "copilot-details/events.jsonl"
+    identity = lambda n: f"00000000-0000-4000-8000-{n:012d}"
+
+    def native(n, kind, data):
+        return {
+            "id": identity(n),
+            "parentId": identity(n - 1) if n else None,
+            "timestamp": "2026-10-01T00:00:00.000Z",
+            "type": kind,
+            "data": data,
+        }
+
+    duplicate = "duplicatecopilotbeacon Identical ordinary and selected text."
+    ordinary = duplicate + '\nthinking reasoning trace {"type":"thinking"}'
+    sidecar = "plain words " * 100 + "sidecarlatebeacon Selected sidecar text."
+    replay_text = {"type": "text", "text": "Original replay text with reasoning words."}
+    tool = {
+        "type": "tool_use",
+        "id": "tool",
+        "name": "read",
+        "input": {
+            "type": "thinking",
+            "reasoningText": "tooljsonbeacon Original arguments.",
+        },
+    }
+    blocks = [
+        {"type": "thinking", "thinking": duplicate, "signature": "block-signature"},
+        {"type": "redacted_thinking", "data": "redacted-opaque"},
+        {
+            "type": "reasoning",
+            "summary": [
+                {
+                    "type": "summary_text",
+                    "text": "summarycopilotbeacon Original summary.",
+                }
+            ],
+            "content": [
+                {
+                    "type": "reasoning_text",
+                    "text": "contentcopilotbeacon Original native content.",
+                }
+            ],
+            "encrypted_content": "native-ciphertext",
+        },
+        replay_text,
+        *[
+            {
+                "type": "thinking",
+                "thinking": f"arraycopilotbeacon{n} Selected array entry.",
+            }
+            for n in range(12)
+        ],
+    ]
+    ordered = [
+        replay_text,
+        {"type": "thinking", "thinking": duplicate, "signature": "ordered-signature"},
+        tool,
+        {
+            "type": "thinking",
+            "thinking": "`protectedcopilotbeacon`",
+            "signature": "protected-signature",
+        },
+        {
+            "type": "unknown_native_form",
+            "payload": {"type": "thinking", "thinking": "unknown payload"},
+        },
+    ]
+    mixed = {
+        "messageId": identity(102),
+        "content": ordinary,
+        "reasoningText": sidecar,
+        "reasoningOpaque": "sidecar-signature",
+        "encryptedContent": "sidecar-ciphertext",
+        "reasoningWireField": "reasoning_content",
+        "phase": "thinking",
+        "reasoningBlocks": {
+            "provider": "anthropic",
+            "blocks": blocks,
+            "orderedBlocks": ordered,
+            "revision": 7,
+        },
+        "details": {"reasoningText": "Original extension field."},
+        "toolRequests": [
+            {"toolCallId": "tool", "name": "read", "arguments": tool["input"]}
+        ],
+        "serverTools": {"provider": "anthropic", "rawContentBlocks": [tool]},
+    }
+    records = [
+        native(
+            0,
+            "session.start",
+            {
+                "sessionId": session,
+                "startTime": "2026-10-01T00:00:00Z",
+                "context": {"cwd": str(case.work)},
+            },
+        ),
+        native(
+            1,
+            "user.message",
+            {
+                "messageId": identity(101),
+                "content": "copilotordinarybeacon Ordinary prompt.",
+            },
+        ),
+        native(2, "assistant.message", mixed),
+        native(
+            3,
+            "assistant.reasoning",
+            {
+                "reasoningId": identity(203),
+                "content": "standalonecopilotbeacon Selected event.",
+            },
+        ),
+        native(4, "assistant.reasoning", {"reasoningId": identity(204), "content": ""}),
+        native(
+            5,
+            "assistant.message",
+            {
+                "messageId": identity(105),
+                "content": "",
+                "reasoningOpaque": "opaqueonly-signature",
+                "encryptedContent": "opaqueonly-ciphertext",
+                "phase": "response",
+            },
+        ),
+        native(
+            6,
+            "assistant.message",
+            {
+                "messageId": identity(106),
+                "content": "phasestillordinarybeacon Original scalar content.",
+                "phase": "thinking",
+            },
+        ),
+        native(
+            7,
+            "assistant.reasoning_delta",
+            {"reasoningId": identity(207), "deltaContent": "transientcopilotbeacon"},
+        ),
+    ]
+    write_jsonl(path, records[:4])
+    case.command("import", "--provider", "copilot-cli", "--path", path)
+    write_jsonl(path, records)
+    case.command("import", "--provider", "copilot-cli", "--path", path)
+
+    def mode(name):
+        case.env.pop("TRWL_TEXTURE", None)
+        if name == "source":
+            case.env["TRWL_TEXTURE"] = "source"
+        return () if name == "default" else ("--texture",)
+
+    def transcript(name):
+        return case.json_command("show", "session", session, *mode(name))["events"]
+
+    views = {name: transcript(name) for name in ("default", "expanded", "source")}
+
+    def event(name, n):
+        return next(
+            row for row in views[name] if row["provider_event_id"] == identity(n)
+        )
+
+    expected_native = {
+        key: value
+        for key, value in mixed.items()
+        if key
+        not in (
+            "reasoningText",
+            "reasoningOpaque",
+            "encryptedContent",
+            "reasoningWireField",
+            "reasoningBlocks",
+        )
+    }
+    expected_native["phase"] = "detail"
+    for name, rows in views.items():
+        shown = event(name, 2)
+        require(
+            shown["structured_content"] == expected_native,
+            "Copilot projection changed ordinary fields or retained selected sidecars",
+        )
+        archive = shown["details"][-1]
+        require(
+            archive["type"] == "archive"
+            and archive["provider"] == "anthropic"
+            and archive["revision"] == 7,
+            "native block envelope was not relocated neutrally",
+        )
+        if name == "default":
+            require(
+                shown["text"] == ordinary
+                and shown["details"]
+                == [
+                    {
+                        "type": "archive",
+                        "provider": "anthropic",
+                        "revision": 7,
+                        "blocks": [replay_text],
+                        "orderedBlocks": [ordered[i] for i in (0, 2, 4)],
+                    }
+                ],
+                "default replay projection changed ordinary entries",
+            )
+        else:
+            require(
+                shown["details"][0]["type"] == "detail"
+                and shown["details"][0]["text"] != "",
+                "sidecar detail was not relocated",
+            )
+            require(
+                archive["blocks"][3 if name == "source" else 2] == replay_text
+                and archive["orderedBlocks"][0] == replay_text
+                and archive["orderedBlocks"][2] == tool,
+                "mixed replay text/tool entry changed",
+            )
+        require(
+            not any(row["provider_event_id"] == identity(7) for row in rows),
+            "transient delta was imported",
+        )
+        require(
+            any(row["provider_event_id"] == identity(4) for row in rows)
+            == (name == "source"),
+            "empty standalone event has incorrect availability",
+        )
+        require(
+            event(name, 5)["text"] == ""
+            and event(name, 5)["structured_content"]["phase"] == "response",
+            "empty ordinary boundary or other phase changed",
+        )
+        require(
+            event(name, 6)["text"] == records[6]["data"]["content"]
+            and event(name, 6)["structured_content"]["phase"] == "detail",
+            "phase metadata classified ordinary content",
+        )
+        mode(name)
+        page_rows, cursor = [], None
+        while True:
+            page = case.json_command(
+                "list",
+                "events",
+                "--session",
+                session,
+                "--limit",
+                "2",
+                *(("--cursor", cursor) if cursor else ()),
+                *mode(name),
+            )
+            page_rows.extend(page["events"])
+            cursor = page["next_cursor"]
+            if not cursor:
+                break
+        require(page_rows == rows, "Copilot eligibility skipped or repeated tied pages")
+        for position, row in enumerate(rows):
+            window = case.json_command(
+                "show", "event", row["trwl_event_id"], "--window", "1", *mode(name)
+            )
+            require(
+                window["events"] == rows[max(0, position - 1) : position + 2],
+                "Copilot window counted excluded events",
+            )
+        for marker in (
+            "sidecarlatebeacon",
+            "summarycopilotbeacon",
+            "contentcopilotbeacon",
+            "arraycopilotbeacon11",
+            "standalonecopilotbeacon",
+        ):
+            hits = case.search(
+                marker, "--session", session, "--events", "--limit", "1", *mode(name)
+            )["results"]
+            require(
+                bool(hits) == (name != "default"),
+                "Copilot selected readable occurrence used the wrong query view",
+            )
+            if hits:
+                full = case.json_command(
+                    "show", "event", hits[0]["trwl_event_id"], *mode(name)
+                )["event"]
+                require(
+                    hits[0]["snippet"] in full["text"]
+                    and len(hits[0]["snippet"]) <= 400,
+                    "Copilot late snippet lost whole-part provenance",
+                )
+        require(
+            not case.search("sidecar-ciphertext", "--session", session, *mode(name))[
+                "results"
+            ],
+            "opaque sidecar entered searchable text",
+        )
+
+    source = event("source", 2)
+    archive = source["details"][1]
+    require(
+        source["details"][0]
+        == {
+            "type": "detail",
+            "text": sidecar,
+            "signature": "sidecar-signature",
+            "data": "sidecar-ciphertext",
+        },
+        "source lost scalar sidecars",
+    )
+    require(
+        archive["blocks"][:3]
+        == [
+            {"type": "detail", "text": duplicate, "signature": "block-signature"},
+            {"type": "detail", "text": "", "data": "redacted-opaque"},
+            {
+                "type": "detail",
+                "text": "summarycopilotbeacon Original summary.\ncontentcopilotbeacon Original native content.",
+                "data": "native-ciphertext",
+            },
+        ],
+        "source lost native block text or opaque values",
+    )
+    require(
+        archive["orderedBlocks"][1]
+        == {"type": "detail", "text": duplicate, "signature": "ordered-signature"}
+        and archive["orderedBlocks"][3]
+        == {
+            "type": "detail",
+            "text": "`protectedcopilotbeacon`",
+            "signature": "protected-signature",
+        },
+        "source lost ordered block occurrences",
+    )
+    require(
+        event("source", 5)["details"]
+        == [
+            {
+                "type": "detail",
+                "text": "",
+                "signature": "opaqueonly-signature",
+                "data": "opaqueonly-ciphertext",
+            }
+        ],
+        "opaque-only group disappeared",
+    )
+    for name in ("default", "expanded"):
+        require(
+            "details" not in event(name, 5),
+            "opaque-only group generated an empty detail",
+        )
+    expanded = event("expanded", 2)
+    require(
+        expanded["details"][1]["blocks"][0]["text"] != duplicate
+        and expanded["text"].startswith(ordinary + "\n"),
+        "identical ordinary and selected occurrences were globally replaced",
+    )
+    require(
+        all(
+            set(node) == {"type", "text"}
+            for node in expanded["details"][1]["blocks"]
+            if node["type"] == "detail"
+        ),
+        "expanded block retained opaque data",
+    )
+
+    for index, env in enumerate((None, "", "source", "SOURCE", " source")):
+        for enabled in (False, True):
+            case.env.pop("TRWL_TEXTURE", None)
+            if env is not None:
+                case.env["TRWL_TEXTURE"] = env
+            flags = ("--texture",) if enabled else ()
+            expected = event(
+                "source"
+                if enabled and env == "source"
+                else "expanded"
+                if enabled
+                else "default",
+                2,
+            )
+            for format in ("text", "markdown", "json", "jsonl"):
+                args = (
+                    *flags,
+                    "show",
+                    "event",
+                    expected["trwl_event_id"],
+                    "--format",
+                    format,
+                )
+                rendered = case.command(*args).stdout
+                output = case.root / f"copilot-{index}-{enabled}.{format}"
+                case.command(*args, "--out", output)
+                require(
+                    output.read_text() == rendered, "Copilot export bypassed projection"
+                )
+                if format == "json":
+                    value = json.loads(rendered)
+                    require(
+                        value["event"] == expected and value["events"] == [expected],
+                        "JSON event/events disagree",
+                    )
+                elif format == "jsonl":
+                    lines = [json.loads(line) for line in rendered.splitlines()]
+                    require(
+                        lines[0]["event"] == expected
+                        and lines[-1]["terminal"]
+                        and not lines[-1]["truncated"],
+                        "JSONL projection/completion changed",
+                    )
+                else:
+                    require(
+                        expected["text"] in rendered,
+                        "human output changed the chosen body",
+                    )
+
+    mode("default")
+    case.command(
+        "show", "event", event("source", 3)["trwl_event_id"], expect_failure=True
+    )
+    case.command(
+        "list",
+        "events",
+        "--session",
+        session,
+        "--cursor",
+        event("source", 4)["trwl_event_id"],
+        "--texture",
+        expect_failure=True,
+    )
+    case.command("import", "--provider", "copilot-cli", "--path", path)
+    require(
+        all(transcript(name) == rows for name, rows in views.items()),
+        "repeat import changed Copilot projections",
+    )
+    changed = deepcopy(records)
+    changed[2]["data"]["reasoningText"] = "editedsidecarbeacon New selected text."
+    changed = [row for row in changed if row["id"] != identity(3)]
+    write_jsonl(path, changed)
+    case.command("import", "--provider", "copilot-cli", "--path", path)
+    require(
+        next(
+            row
+            for row in transcript("default")
+            if row["provider_event_id"] == identity(2)
+        )
+        == event("default", 2),
+        "selected edit changed the ordinary message",
+    )
+    require(
+        not case.search("sidecarlatebeacon", "--session", session, *mode("expanded"))[
+            "results"
+        ]
+        and case.search("editedsidecarbeacon", "--session", session, *mode("expanded"))[
+            "results"
+        ],
+        "selected rewrite kept stale search text",
+    )
+    require(
+        not any(
+            row["provider_event_id"] == identity(3) for row in transcript("source")
+        ),
+        "deleted standalone event survived",
+    )
+    latest = {name: transcript(name) for name in views}
+    old_data = case.env["XDG_DATA_HOME"]
+    case.env["XDG_DATA_HOME"] = str(case.root / "fresh-copilot-data")
+    case.command("import", "--provider", "copilot-cli", "--path", path)
+    require(
+        all(transcript(name) == rows for name, rows in latest.items()),
+        "fresh Copilot import differs from incremental updates",
+    )
+    case.env["XDG_DATA_HOME"] = old_data
+    path.rename(path.with_suffix(".indexed-away"))
+    require(
+        transcript("source") == latest["source"],
+        "Copilot source retrieval depended on the source file",
+    )
+    mode("default")
+    case.check(
+        "Copilot sidecars, standalone events and mixed native replay blocks share projection, query and paging policy"
+    )
 
 
 def provider_details(case):
@@ -311,10 +792,58 @@ def provider_details(case):
 
     opencode_control = "opencodecontrolbeacon Ordinary OpenCode message."
     opencode.message(opencode_session, "message-control", opencode_control, role="user")
+    # OpenCode V1 ReasoningPart.metadata supports provider-owned nested values.
+    opencode_detail = "opencodedetailbeacon Native selected part."
+    opencode.message(opencode_session, "message-detail", "", role="assistant")
+    opencode.part(
+        opencode_session,
+        "message-detail",
+        "part-detail",
+        {
+            "type": "reasoning",
+            "text": opencode_detail,
+            "signature": "direct-signature",
+            "metadata": {
+                "anthropic": {
+                    "signature": "nested-signature",
+                    "redactedData": "nested-data",
+                },
+                "other": [None, False, 0, {}, [], "same", "same"],
+            },
+        },
+    )
 
+    ordinary_owned = {
+        "type": "text",
+        "text": "ordinarynativebeacon Original native data.",
+        "metadata": {
+            "anthropic": {
+                "signature": "ordinary-signature",
+                "redactedData": [False, 0, None],
+            },
+        },
+    }
+    opencode.part(
+        opencode_session, "message-control", "part-ordinary-owned", ordinary_owned
+    )
+    opencode.part(
+        opencode_session,
+        "message-detail",
+        "part-empty-owned",
+        {
+            "type": "reasoning",
+            "text": "",
+            "metadata": {
+                "anthropic": {"signature": "empty-signature", "redactedData": []}
+            },
+        },
+    )
     opencode_error = "opencodeerrorbeacon Native failure details."
     error_part = {
         "type": "tool",
+        "metadata": {
+            "anthropic": {"signature": "tool-signature", "redactedData": "tool value"}
+        },
         "tool": "bash",
         "callID": "call_error",
         "state": {
@@ -469,7 +998,13 @@ def provider_details(case):
     pi_control = "picontrolbeacon Native ordinary message."
     pi_body = {
         "role": "assistant",
-        "content": [{"type": "thinking", "thinking": pi_thinking}],
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": pi_thinking,
+                "thinkingSignature": "pi-signature",
+            }
+        ],
     }
     pi_control_body = {
         "role": "assistant",
@@ -504,13 +1039,26 @@ def provider_details(case):
     claude_path = case.providers / "provider-details/claude/session.jsonl"
     claude_thinking = "claudethinkingbeacon Native reasoning content."
     claude_control = "claudecontrolbeacon Native ordinary message."
+    # Anthropic SDK ThinkingBlock/RedactedThinkingBlock shapes; this is not a
+    # capture establishing how the Claude CLI persists these blocks.
     claude_body = {
         "role": "assistant",
-        "content": [{"type": "thinking", "thinking": claude_thinking}],
+        "content": [
+            {
+                "type": "thinking",
+                "thinking": claude_thinking,
+                "signature": "claude-signature",
+            },
+            {"type": "redacted_thinking", "data": "claude-redacted-opaque"},
+        ],
     }
     claude_control_body = {
         "role": "assistant",
-        "content": [{"type": "text", "text": claude_control}],
+        "content": [
+            {"type": "text", "text": claude_control},
+            {"type": "reasoning", "text": "unknownclaudebeacon Unverified form."},
+            {"type": "redacted_reasoning", "data": "unknown opaque value"},
+        ],
     }
     write_jsonl(
         claude_path,
@@ -542,7 +1090,13 @@ def provider_details(case):
         "type": "reasoning",
         "id": "codex-reasoning",
         "summary": [{"type": "summary_text", "text": codex_reasoning}],
-        "content": [],
+        "content": [
+            {
+                "type": "reasoning_text",
+                "text": "codexcontentbeacon More selected content.",
+            }
+        ],
+        "encrypted_content": "codex-opaque",
     }
     codex_control_payload = {
         "type": "message",
@@ -577,6 +1131,22 @@ def provider_details(case):
 
     checks = [
         {
+            "marker": "ordinarynativebeacon",
+            "provider": "opencode",
+            "session": opencode_session,
+            "scope": "all",
+            "text": ordinary_owned["text"],
+            "native": ordinary_owned,
+        },
+        {
+            "marker": "opencodedetailbeacon",
+            "selected": True,
+            "provider": "opencode",
+            "session": opencode_session,
+            "scope": "all",
+            "text": opencode_detail,
+        },
+        {
             "marker": "opencodeerrorbeacon",
             "provider": "opencode",
             "session": opencode_session,
@@ -610,6 +1180,7 @@ def provider_details(case):
         ),
         {
             "marker": "pithinkingbeacon",
+            "selected": True,
             "provider": "pi",
             "session": pi_session,
             "scope": "all",
@@ -618,6 +1189,7 @@ def provider_details(case):
         },
         {
             "marker": "claudethinkingbeacon",
+            "selected": True,
             "provider": "claude",
             "session": claude_session,
             "scope": "all",
@@ -626,10 +1198,11 @@ def provider_details(case):
         },
         {
             "marker": "codexreasoningbeacon",
+            "selected": True,
             "provider": "codex",
             "session": codex_session,
             "scope": "all",
-            "text": codex_reasoning,
+            "text": codex_reasoning + "\ncodexcontentbeacon More selected content.",
             "native": codex_reasoning_payload,
         },
         {
@@ -678,6 +1251,83 @@ def provider_details(case):
         ]
         if "file" in item:
             args.extend(("--file", item["file"]))
+        if item.get("selected"):
+            case.env.pop("TRWL_TEXTURE", None)
+            require(
+                not case.search(item["marker"], *args)["results"],
+                "default indexed a selected native part",
+            )
+            hits = case.search(item["marker"], *args, "--texture")["results"]
+            require(len(hits) == 1, "expanded query did not use original spelling")
+            identity = hits[0]["trwl_event_id"]
+            transformed = case.json_command("show", "event", identity, "--texture")[
+                "event"
+            ]
+            case.command("show", "event", identity, expect_failure=True)
+            case.env["TRWL_TEXTURE"] = "source"
+            original = case.json_command("show", "event", identity, "--texture")[
+                "event"
+            ]
+            require(
+                original["text"] == item["text"]
+                and transformed["text"] != original["text"],
+                "native text mode changed",
+            )
+            require(
+                len(transformed["text"]) == len(original["text"]),
+                "selected projection changed scalar length",
+            )
+
+            def nodes(event):
+                native = event["structured_content"]
+                return (
+                    [native]
+                    if item["provider"] in ("codex", "opencode")
+                    else native["content"]
+                )
+
+            require(
+                nodes(transformed) == [{"type": "detail", "text": transformed["text"]}],
+                "expanded native projection has a second copy or opaque metadata",
+            )
+            expected = [{"type": "detail", "text": item["text"]}]
+            if item["provider"] == "codex":
+                expected[0]["data"] = "codex-opaque"
+            elif item["provider"] == "pi":
+                expected[0]["signature"] = "pi-signature"
+            elif item["provider"] == "opencode":
+                expected[0]["signature"] = ["direct-signature", "nested-signature"]
+                expected[0]["data"] = [
+                    "nested-data",
+                    None,
+                    False,
+                    0,
+                    {},
+                    [],
+                    "same",
+                    "same",
+                ]
+            elif item["provider"] == "claude":
+                expected[0]["signature"] = "claude-signature"
+                expected.append(
+                    {"type": "detail", "text": "", "data": "claude-redacted-opaque"}
+                )
+            require(
+                nodes(original) == expected,
+                "source native projection lost text or opaque values",
+            )
+            require(
+                case.search(item["marker"], *args, "--texture")["results"][0][
+                    "trwl_event_id"
+                ]
+                == identity,
+                "source query changed identity",
+            )
+            case.env.pop("TRWL_TEXTURE", None)
+            return {
+                "event_id": identity,
+                "event": {"expanded": transformed, "source": original},
+            }
         hits = case.search(item["marker"], *args, refresh="off")["results"]
         require(
             len(hits) == 1,
@@ -724,6 +1374,45 @@ def provider_details(case):
         return {"event_id": hit["trwl_event_id"], "event": event}
 
     baseline = {item["marker"]: capture_hit(item) for item in checks}
+    claude_ordinary = baseline["claudecontrolbeacon"]["event"]
+    for source_mode in (False, True):
+        if source_mode:
+            case.env["TRWL_TEXTURE"] = "source"
+        require(
+            case.json_command(
+                "show", "event", claude_ordinary["trwl_event_id"], "--texture"
+            )["event"]
+            == claude_ordinary,
+            "unknown Claude forms were reclassified",
+        )
+    case.env.pop("TRWL_TEXTURE", None)
+    ordinary_event = baseline["ordinarynativebeacon"]["event"]
+    for source_mode in (False, True):
+        if source_mode:
+            case.env["TRWL_TEXTURE"] = "source"
+        require(
+            case.json_command(
+                "show", "event", ordinary_event["trwl_event_id"], "--texture"
+            )["event"]
+            == ordinary_event,
+            "ordinary V1 metadata was projected",
+        )
+    empty_owned = next(
+        row
+        for row in case.json_command("show", "session", opencode_session, "--texture")[
+            "events"
+        ]
+        if row["provider_event_id"] == "part-empty-owned"
+    )
+    require(
+        empty_owned["structured_content"]
+        == {"type": "detail", "text": "", "signature": "empty-signature", "data": []},
+        "empty V1 nested values disappeared",
+    )
+    case.env.pop("TRWL_TEXTURE", None)
+    case.command(
+        "show", "event", empty_owned["trwl_event_id"], "--texture", expect_failure=True
+    )
     for unsearchable in (
         "base64onlybeacon",
         "nativeidentitybeacon",
@@ -780,6 +1469,15 @@ def provider_details(case):
             == event,
             "native metadata changed after input removal",
         )
+    case.env["TRWL_TEXTURE"] = "source"
+    require(
+        case.json_command("show", "event", empty_owned["trwl_event_id"], "--texture")[
+            "event"
+        ]
+        == empty_owned,
+        "empty V1 native restoration depended on the source file",
+    )
+    case.env.pop("TRWL_TEXTURE", None)
 
     case.check(
         "provider details remain searchable with exact scopes and complete native show/list content after source inputs are renamed"

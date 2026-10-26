@@ -19,6 +19,7 @@ use crate::{
     },
     semantic,
     store::{self, ReadIndex},
+    texture::Mode,
     workspace,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -59,15 +60,16 @@ pub(crate) fn bound(value: &str, until: bool) -> Result<String> {
     }
 }
 
-pub fn search(config: &Config, args: &Search) -> Result<SearchReport> {
+pub fn search(config: &Config, args: &Search, texture: Mode) -> Result<SearchReport> {
     let index = ReadIndex::open(&config.directories.data)?;
-    search_index(config, args, index.as_ref())
+    search_index(config, args, index.as_ref(), texture)
 }
 
 pub(crate) fn search_index(
     config: &Config,
     args: &Search,
     index: Option<&ReadIndex>,
+    texture: Mode,
 ) -> Result<SearchReport> {
     let Some(index) = index else {
         if args.backend == Backend::Semantic {
@@ -88,7 +90,7 @@ pub(crate) fn search_index(
         .collect();
     let workspace =
         workspace::Selection::resolve(&args.filters.workspace, || index.workspace_roots())?;
-    let selection = index.selection(&args.filters, true, &workspace)?;
+    let selection = index.selection(&args.filters, true, &workspace, texture)?;
     let mut mode = Backend::Lexical;
     let mut status = State::Disabled;
     let mut reason = None;
@@ -142,6 +144,7 @@ pub(crate) fn search_index(
                 store::LexicalMode::Sessions
             },
             &*selection,
+            texture,
         )?;
         let rows = std::mem::take(&mut found.rows)
             .into_iter()
@@ -293,14 +296,22 @@ fn chronological(records: &mut [Record]) {
 
 pub fn resolve(root: &Path, kind: Entity, prefix: &str) -> Result<Record> {
     let index = ReadIndex::open(root)?.context("no history index")?;
-    resolve_in(&index, kind, prefix)
+    resolve_in(&index, kind, prefix, Mode::Source)
 }
 
-fn resolve_in(index: &ReadIndex, kind: Entity, prefix: &str) -> Result<Record> {
+fn resolve_in(index: &ReadIndex, kind: Entity, prefix: &str, texture: Mode) -> Result<Record> {
     ensure!(!prefix.is_empty(), "empty record reference");
     let mut matching = match kind {
-        Entity::Event => index.event_reference(prefix)?,
-        Entity::Session => index.session_reference(prefix)?,
+        Entity::Event => index
+            .event_reference(prefix)?
+            .into_iter()
+            .filter_map(|record| match record.availability() {
+                Ok(availability) if availability <= texture.availability() => Some(Ok(record)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Entity::Session => index.session_reference(prefix, texture)?,
     };
     chronological(&mut matching);
     let first = matching.first().context("record reference not found")?;
@@ -314,27 +325,33 @@ fn resolve_in(index: &ReadIndex, kind: Entity, prefix: &str) -> Result<Record> {
     Ok(first.clone())
 }
 
-pub fn show(root: &Path, kind: Entity, id: &str, window: usize) -> Result<Report> {
+pub fn show(root: &Path, kind: Entity, id: &str, window: usize, texture: Mode) -> Result<Report> {
     let index = ReadIndex::open(root)?.context("no history index")?;
-    let record = resolve_in(&index, kind, id)?;
+    let record = resolve_in(&index, kind, id, texture)?;
     if matches!(kind, Entity::Event) && window == 0 {
         return Ok(Report::ShowEvent(SelectedEvents {
-            events: vec![record.clone()],
-            event: record,
+            events: vec![record.clone().project(texture)?],
+            event: record.project(texture)?,
         }));
     }
     if matches!(kind, Entity::Event) {
-        let events = index.window(&record, window)?;
+        let events = index.window(&record, window, texture)?;
         Ok(Report::ShowEvent(SelectedEvents {
-            event: record,
-            events,
+            event: record.project(texture)?,
+            events: events
+                .into_iter()
+                .map(|record| record.project(texture))
+                .collect::<Result<_>>()?,
         }))
     } else {
-        let mut events = index.by_session(&record.session_id)?;
+        let mut events = index.by_session(&record.session_id, texture)?;
         chronological(&mut events);
         Ok(Report::ShowSession(SessionEvents {
             session: locate(&record),
-            events,
+            events: events
+                .into_iter()
+                .map(|record| record.project(texture))
+                .collect::<Result<_>>()?,
         }))
     }
 }
@@ -359,6 +376,7 @@ pub fn list(
     filters: &Filters,
     limit: usize,
     cursor: Option<&str>,
+    texture: Mode,
 ) -> Result<Report> {
     ensure!(limit > 0, "list limit must be positive");
     let (records, next) = match ReadIndex::open(root)? {
@@ -371,6 +389,7 @@ pub fn list(
                 limit,
                 cursor,
                 &workspace,
+                texture,
             )?
         }
         None => {
@@ -380,7 +399,10 @@ pub fn list(
     };
     match kind {
         ListKind::Events => Ok(Report::Events(EventsPage {
-            events: records,
+            events: records
+                .into_iter()
+                .map(|record| record.project(texture))
+                .collect::<Result<_>>()?,
             next_cursor: next,
         })),
         ListKind::Sessions => Ok(Report::Sessions(SessionsPage {
@@ -509,7 +531,7 @@ mod tests {
         let selected = index
             .selected_ids(
                 &*index
-                    .selection(&day, false, &workspace::Selection::All)
+                    .selection(&day, false, &workspace::Selection::All, Mode::Default)
                     .unwrap(),
             )
             .unwrap();
@@ -519,7 +541,7 @@ mod tests {
         let selected = index
             .selected_ids(
                 &*index
-                    .selection(&exact, false, &workspace::Selection::All)
+                    .selection(&exact, false, &workspace::Selection::All, Mode::Default)
                     .unwrap(),
             )
             .unwrap();
@@ -548,7 +570,7 @@ mod tests {
             !index
                 .selected_ids(
                     &*index
-                        .selection(&filters, false, &workspace::Selection::All)
+                        .selection(&filters, false, &workspace::Selection::All, Mode::Default)
                         .unwrap(),
                 )
                 .unwrap()
@@ -621,7 +643,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let grouped = search(&config, &args).unwrap();
+        let grouped = search(&config, &args, Mode::Default).unwrap();
         assert_eq!(
             grouped
                 .results
@@ -631,7 +653,7 @@ mod tests {
             ["root", "other", "child"]
         );
         args.events = true;
-        let events = search(&config, &args).unwrap();
+        let events = search(&config, &args, Mode::Default).unwrap();
         assert_eq!(
             events
                 .results
@@ -657,6 +679,7 @@ mod tests {
                     2,
                     cursor.as_deref(),
                     &workspace::Selection::All,
+                    Mode::Default,
                 )
                 .unwrap();
             assert_eq!(index.record_decodes.get(), page.len());
@@ -683,7 +706,14 @@ mod tests {
             5
         );
         let (sessions, next) = index
-            .page(&filters, true, 1, None, &workspace::Selection::All)
+            .page(
+                &filters,
+                true,
+                1,
+                None,
+                &workspace::Selection::All,
+                Mode::Default,
+            )
             .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].event_id, records[0].event_id);
@@ -699,7 +729,8 @@ mod tests {
                     false,
                     2,
                     Some(&records[0].event_id),
-                    &workspace::Selection::All
+                    &workspace::Selection::All,
+                    Mode::Default,
                 )
                 .is_err()
         );
@@ -710,7 +741,8 @@ mod tests {
                     false,
                     2,
                     Some("missing"),
-                    &workspace::Selection::All
+                    &workspace::Selection::All,
+                    Mode::Default,
                 )
                 .is_err()
         );
@@ -726,13 +758,13 @@ mod tests {
         }
         let prefix = prefixes.iter().find(|(_, count)| **count > 1).unwrap().0;
         assert!(
-            resolve_in(&index, Entity::Event, prefix)
+            resolve_in(&index, Entity::Event, prefix, Mode::Default)
                 .unwrap_err()
                 .to_string()
                 .contains("ambiguous")
         );
         assert_eq!(
-            resolve_in(&index, Entity::Event, &records[0].event_id)
+            resolve_in(&index, Entity::Event, &records[0].event_id, Mode::Default)
                 .unwrap()
                 .event_id,
             records[0].event_id
@@ -751,15 +783,20 @@ mod tests {
         let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let next = import(&config, Provider::Pi, &path);
         assert!(
-            resolve_in(&next, Entity::Session, "native")
+            resolve_in(&next, Entity::Session, "native", Mode::Default)
                 .unwrap_err()
                 .to_string()
                 .contains("ambiguous")
         );
         assert_eq!(
-            resolve_in(&next, Entity::Session, &records[0].session_id)
-                .unwrap()
-                .provider,
+            resolve_in(
+                &next,
+                Entity::Session,
+                &records[0].session_id,
+                Mode::Default
+            )
+            .unwrap()
+            .provider,
             crate::record::Provider::Codex
         );
     }

@@ -1,7 +1,7 @@
 # trwl
 
 trwl searches coding-agent history from OpenCode, Codex, Pi, Claude Code and
-GitHub Copilot CLI. It provides lexical and semantic search, complete transcript
+GitHub Copilot CLI. It provides lexical and semantic search, transcript
 retrieval and source locations.  It can update the index in the background.
 
 trwl is inspired by [ctx](https://github.com/ctxrs/ctx), around
@@ -40,7 +40,7 @@ and `~/.copilot/session-state`; unset Codex and Claude paths default to
 
 By default a search outputs one match per session, with event and
 session IDs and a snippet. Copy a session ID into `show session` to
-read the whole conversation, or `show event` with `--window 5` for
+read the conversation, or `show event` with `--window 5` for
 surrounding context. Searches cover the current workspace by default;
 `--workspace '**'` searches all history (see [Workspace
 selection](#workspace-selection)).
@@ -131,11 +131,14 @@ trwl locate event EVENT_ID
 trwl show session SESSION_ID --format markdown --out conversation.md
 ```
 
-`show` and `locate` accept unambiguous ID prefixes. `show` reads complete
-stored records without reopening the original input. `locate` reports the trwl
+`show` and `locate` accept unambiguous ID prefixes. `show` retrieves stored
+events without reopening the original input. `locate` reports the trwl
 and provider identities, the source path, the original workspace directory
 and the canonical root. `--out PATH` writes any format to a file (see
 [Output formats](#output-formats)).
+
+`--texture` expands archived detail in search, show and list results. The selected
+view applies to every output format, including exports.
 
 ## Indexing
 
@@ -211,9 +214,8 @@ trwl search "Why are database requests waiting for free connections?" --backend 
 Each user message is paired with the last assistant reply before the
 next user message, and a match always points at the user message, even
 when the matching text is in the reply. User messages with no reply
-are embedded too. Tool calls, their outputs, metadata and reasoning
-are not embedded; use lexical search for those. Everything appears in
-full transcripts.
+are embedded too. Use lexical search for other event content, with `--texture`
+to expand archived detail.
 
 ### Executors
 
@@ -265,10 +267,11 @@ still emit one, and single-object commands such as `status` and
 `locate` emit the same single line for JSON and JSONL.
 
 For `list events` and `list sessions`, pass the completion record's `next_cursor`
-to the next `--cursor` request until `terminal` is true. Keep filters unchanged
-between pages. Changing filters does not restart pagination: if the cursor still
-identifies a row in the new selection, the command continues after it using the
-new filters; otherwise it fails with `cursor no longer matches this selection`.
+to the next `--cursor` request until `terminal` is true. Keep filters and the
+selected view unchanged between pages. Changing either does not restart
+pagination: if the cursor still identifies a row in the new selection, the
+command continues after it using that selection; otherwise it fails with
+`cursor no longer matches this selection`.
 Concurrent updates can change later pages.
 
 ## Data and configuration

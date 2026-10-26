@@ -15,6 +15,7 @@ import time
 import traceback
 from collections import Counter, defaultdict
 from contextlib import closing
+from copy import deepcopy
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -56,22 +57,72 @@ def native_parts(path):
     return parts, manifest
 
 
+def source_part(data):
+    """Expected public source representation of an OpenCode V1 part."""
+    if data.get("type") != "reasoning":
+        result = deepcopy(data)
+        if data.get("type") in ("assistant", "step-finish", "compaction"):
+            tokens = result.get("tokens")
+            if isinstance(tokens, dict) and "reasoning" in tokens:
+                tokens["detail_tokens"] = tokens.pop("reasoning")
+        return result
+    result = {"type": "detail", "text": data.get("text", "")}
+    values = {"data": [], "signature": []}
+
+    def collect(value, kind="data"):
+        if isinstance(value, dict) and value:
+            for key in sorted(value):
+                collect(
+                    value[key],
+                    "signature"
+                    if key in ("signature", "thinkingSignature")
+                    else "data",
+                )
+        elif isinstance(value, list) and value:
+            for item in value:
+                collect(item, kind)
+        else:
+            values[kind].append(value)
+
+    for key in ("data", "encrypted_content", "signature", "thinkingSignature"):
+        if key in data:
+            values[
+                "signature" if key in ("signature", "thinkingSignature") else "data"
+            ].append(data[key])
+    for key in ("metadata", "native"):
+        if key in data:
+            collect(data[key])
+    for key, items in values.items():
+        if items:
+            result[key] = items[0] if len(items) == 1 else items
+    return result
+
+
 def enumerate_history(case, parts, timeout):
     """Verify source parts, full text/output, and pagination."""
     rows, cursors, cursor_args = [], set(), ()
     while True:
-        result = case.command(
-            "list",
-            "events",
-            "--workspace",
-            "**",
-            "--format",
-            "jsonl",
-            "--limit",
-            "1000",
-            *cursor_args,
-            timeout=timeout,
-        )
+        previous = case.env.get("TRWL_TEXTURE")
+        case.env["TRWL_TEXTURE"] = "source"
+        try:
+            result = case.command(
+                "--texture",
+                "list",
+                "events",
+                "--workspace",
+                "**",
+                "--format",
+                "jsonl",
+                "--limit",
+                "1000",
+                *cursor_args,
+                timeout=timeout,
+            )
+        finally:
+            if previous is None:
+                case.env.pop("TRWL_TEXTURE", None)
+            else:
+                case.env["TRWL_TEXTURE"] = previous
         page = [json.loads(line) for line in result.stdout.splitlines()]
         require(
             page and page[-1]["record_type"] == "event_range_completion",
@@ -112,7 +163,7 @@ def enumerate_history(case, parts, timeout):
             outputs[part] = row["text"]
         else:
             require(
-                part not in primary and row["structured_content"] == data,
+                part not in primary and row["structured_content"] == source_part(data),
                 "lost or duplicated native part content",
             )
             primary[part] = row
@@ -137,6 +188,7 @@ def enumerate_history(case, parts, timeout):
 
 def trial(root, args, parts):
     case = PerformanceCase(root, args.binary, args.model_dir)
+    case.env["TRWL_TEXTURE"] = "source"
     # Default-workspace reads must run from the requested checkout, not the
     # runner's otherwise empty disposable workspace. Data and HOME stay private.
     case.work = args.workspace
@@ -148,7 +200,9 @@ def trial(root, args, parts):
         )
 
         def measure(name, *argv):
-            result, record = case.measured(name, *argv, timeout=args.timeout)
+            result, record = case.measured(
+                name, "--texture", *argv, timeout=args.timeout
+            )
             report["measurements"][name] = record
             return result
 

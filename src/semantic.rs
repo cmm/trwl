@@ -1730,6 +1730,9 @@ pub(crate) mod tests {
         let source = source(Provider::Claude, &path);
         let write = |user: &Value, assistant: Option<&Value>| {
             let mut lines = format!("{user}\n");
+            let selected_only = json!({"type":"assistant", "uuid":"selected-only", "sessionId":"native",
+                "message":{"role":"assistant", "content":[{"type":"redacted_thinking", "data":"opaque"}]}});
+            lines.push_str(&format!("{selected_only}\n"));
             if let Some(assistant) = assistant {
                 lines.push_str(&format!("{assistant}\n"));
             }
@@ -1755,7 +1758,10 @@ pub(crate) mod tests {
         let mut user = json!({
             "type":"user", "uuid":"11111111-1111-4111-8111-111111111111",
             "sessionId":"native", "timestamp":"2026-01-01T00:00:00.000Z",
-            "cwd":"/workspace/first", "message":{"role":"user", "content":"question"}
+            "cwd":"/workspace/first", "message":{"role":"user", "content":[
+                {"type":"thinking", "thinking":"long selected prefix ".repeat(30)},
+                {"type":"text", "text":"question"}
+            ]}
         });
         let mut assistant = json!({
             "type":"assistant", "uuid":"22222222-2222-4222-8222-222222222222",
@@ -1781,6 +1787,9 @@ pub(crate) mod tests {
         let (first, inputs) = plan(&index);
         assert!(inputs.is_some());
         assert_eq!(first.len(), 1);
+        assert_eq!(first[0].record.text, "question");
+        assert!(first[0].record.source_spans.is_none());
+        assert!(first[0].record.structured_content.is_null());
         assert_eq!(
             first[0].keys,
             vec![digest(&["user:\nquestion\n\nassistant:\nanswer"])]
@@ -1788,6 +1797,7 @@ pub(crate) mod tests {
         assert_eq!(index.record_decodes.get(), 2);
 
         assistant["message"]["content"][0]["thinking"] = json!("revised private reasoning");
+        user["message"]["content"][0]["thinking"] = json!("revised selected user prefix");
         assistant["message"]["content"][2]["input"]["path"] = json!("second");
         assistant["message"]["usage"]["input_tokens"] = json!(20);
         let irrelevant = write(&user, Some(&assistant));

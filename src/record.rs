@@ -161,6 +161,12 @@ pub fn chronological_order(a: (&str, u64, &str), b: (&str, u64, &str)) -> std::c
     a.cmp(&b)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeEventKind {
+    CopilotAssistantMessage,
+    CopilotAssistantDetail,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
     #[serde(rename = "trwl_event_id")]
@@ -179,6 +185,10 @@ pub struct Record {
     pub occurred_at: String,
     pub text: String,
     pub structured_content: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_spans: Option<crate::texture::SourceSpans>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_kind: Option<NativeEventKind>,
     pub workspace: String,
     pub workspace_root: Option<crate::workspace::Root>,
     pub source: SourceLocation,
@@ -213,8 +223,9 @@ impl ConversationMessage {
         let text = record.message_text()?.into_owned();
         let request = matches!(record.role, Some(Role::User)).then(|| {
             let mut request = record.clone();
-            request.text = request.text.chars().take(SEARCH_SNIPPET_CHARS).collect();
+            request.text = text.chars().take(SEARCH_SNIPPET_CHARS).collect();
             request.structured_content = Value::Null;
+            request.source_spans = None;
             request
         });
         Some(Self {
@@ -234,10 +245,10 @@ impl Record {
     pub fn is_conversation_message(&self) -> bool {
         self.event_type == EventType::Message
             && matches!(self.role, Some(Role::User | Role::Assistant))
-            && !matches!(
-                self.structured_content["type"].as_str(),
-                Some("reasoning" | "thinking")
-            )
+            && self
+                .source_spans
+                .as_ref()
+                .is_none_or(|spans| spans.ordinary)
     }
 
     pub fn message_text(&self) -> Option<Cow<'_, str>> {
@@ -246,7 +257,11 @@ impl Record {
         }
         // A message's display text can include reasoning. Extract visible text
         // from its parts before pairing user messages with assistant replies.
-        if let Some(parts) = self.structured_content["content"].as_array() {
+        if let Some(text) = self.structured_content["content"].as_str() {
+            Some(Cow::Borrowed(text))
+        } else if self.native_kind == Some(NativeEventKind::CopilotAssistantMessage) {
+            Some(Cow::Borrowed(""))
+        } else if let Some(parts) = self.structured_content["content"].as_array() {
             Some(Cow::Owned(
                 parts
                     .iter()
@@ -281,6 +296,8 @@ impl Record {
             occurred_at: String::new(),
             text: String::new(),
             structured_content: Value::Null,
+            source_spans: None,
+            native_kind: None,
             workspace: String::new(),
             workspace_root: None,
             source: SourceLocation {

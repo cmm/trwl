@@ -5,6 +5,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "trwl", version, about = "Search coding agent history")]
 pub struct Cli {
+    #[arg(long, global = true, help = "Expand archived detail")]
+    pub texture: bool,
     #[arg(long, value_enum, default_value = "text", global = true)]
     pub format: Format,
     #[arg(long, global = true)]
