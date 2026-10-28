@@ -186,7 +186,7 @@ pub struct Record {
     pub text: String,
     pub structured_content: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_spans: Option<crate::texture::SourceSpans>,
+    pub source_spans: Option<crate::redaction::SourceSpans>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_kind: Option<NativeEventKind>,
     pub workspace: String,
@@ -242,13 +242,16 @@ impl ConversationMessage {
 }
 
 impl Record {
+    pub fn has_ordinary_content(&self) -> bool {
+        self.source_spans
+            .as_ref()
+            .is_none_or(|spans| spans.ordinary)
+    }
+
     pub fn is_conversation_message(&self) -> bool {
         self.event_type == EventType::Message
             && matches!(self.role, Some(Role::User | Role::Assistant))
-            && self
-                .source_spans
-                .as_ref()
-                .is_none_or(|spans| spans.ordinary)
+            && self.has_ordinary_content()
     }
 
     pub fn message_text(&self) -> Option<Cow<'_, str>> {

@@ -440,18 +440,12 @@ def semantic_cache(case):
             plans() == original and len(api.requests) == before,
             "selected-only edit re-embedded history",
         )
-        for source in (False, True):
-            if source:
-                case.env["TRWL_TEXTURE"] = "source"
-            hits = case.search(
-                "cachebeacon", "--events", "--texture", backend="semantic"
-            )["results"]
-            require(
-                len(hits) == 2
-                and all("selectedonlybeacon" not in hit["snippet"] for hit in hits),
-                "semantic snippets exposed additional parts",
-            )
-        case.env.pop("TRWL_TEXTURE", None)
+        hits = case.search("cachebeacon", "--events", backend="semantic")["results"]
+        require(
+            len(hits) == 2
+            and all("selectedonlybeacon" not in hit["snippet"] for hit in hits),
+            "semantic snippets exposed additional parts",
+        )
         before = len(api.requests)
         with sqlite3.connect(database) as db:
             require(
@@ -616,31 +610,28 @@ def semantic_cache(case):
             plans() == initial and len(api.requests) == before,
             "Copilot selected/opaque edit invalidated ordinary semantic input",
         )
-        for source in (False, True):
-            if source:
-                case.env["TRWL_TEXTURE"] = "source"
-            hits = case.search(
-                "copilotpromptbeacon",
-                "--session",
-                "scalar-copilot",
-                "--events",
-                "--texture",
-                backend="semantic",
-            )["results"]
-            require(
-                len(hits) == 1 and hits[0]["snippet"] == expected[0][1],
-                "Copilot semantic anchor snippet included sidecars",
-            )
-            hybrid = case.search(
-                "scalarselectedbeacon",
-                "--session",
-                "scalar-copilot",
-                "--events",
-                "--texture",
-                backend="hybrid",
-            )["results"]
-            require(len(hybrid) == 2, "Copilot hybrid did not expand its lexical side")
-        case.env.pop("TRWL_TEXTURE", None)
+        hits = case.search(
+            "copilotpromptbeacon",
+            "--session",
+            "scalar-copilot",
+            "--events",
+            backend="semantic",
+        )["results"]
+        require(
+            len(hits) == 1 and hits[0]["snippet"] == expected[0][1],
+            "Copilot semantic anchor snippet included sidecars",
+        )
+        hybrid = case.search(
+            "scalarselectedbeacon",
+            "--session",
+            "scalar-copilot",
+            "--events",
+            backend="hybrid",
+        )["results"]
+        require(
+            all("selectedbeacon" not in hit["snippet"] for hit in hybrid),
+            "hybrid snippets exposed thinking",
+        )
     case.check(
         "cache eviction reports partial/unavailable coverage and preserves history; waited fill recovers"
     )

@@ -13,12 +13,12 @@ mod output;
 mod providers;
 mod query;
 mod record;
+mod redaction;
 mod report;
 mod semantic;
 mod store;
 #[cfg(test)]
 mod test_support;
-mod texture;
 mod workspace;
 
 use anyhow::{Context, Result, ensure};
@@ -248,7 +248,6 @@ impl EmbeddingUpdater {
 
 fn dispatch(cli: &Cli, directories: &Directories) -> Result<Report> {
     let root = &directories.data;
-    let texture = texture::Mode::from_flag(cli.texture);
     let config = Config::load(directories)?;
     match &cli.command {
         Command::EmbeddingWorker | Command::EmbeddingServer => {
@@ -290,9 +289,9 @@ fn dispatch(cli: &Cli, directories: &Directories) -> Result<Report> {
             } else if args.refresh == Refresh::Background {
                 start_daemon(&config)?;
             }
-            Ok(Report::Search(query::search(&config, args, texture)?))
+            Ok(Report::Search(query::search(&config, args)?))
         }
-        Command::Show { kind, id, window } => query::show(root, *kind, id, *window, texture),
+        Command::Show { kind, id, window } => query::show(root, *kind, id, *window),
         Command::Locate { kind, id } => Ok(Report::Location(query::locate(&query::resolve(
             root, *kind, id,
         )?))),
@@ -302,7 +301,7 @@ fn dispatch(cli: &Cli, directories: &Directories) -> Result<Report> {
             limit,
             cursor,
             ..
-        } => query::list(root, *kind, filters, *limit, cursor.as_deref(), texture),
+        } => query::list(root, *kind, filters, *limit, cursor.as_deref()),
         Command::Sources { command } => match command {
             Sources::List => Ok(Report::Sources {
                 sources: config.sources()?,

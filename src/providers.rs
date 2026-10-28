@@ -19,8 +19,8 @@
 use crate::record::{
     EventType, NativeEventKind, Provider, Record, Role, digest, millis, session_id, timestamp,
 };
+use crate::redaction::{BlockArray, BlockCollection, Body, Opaque, OpaqueKind, Selection, Target};
 use crate::report::Diagnostic;
-use crate::texture::{BlockArray, BlockCollection, Body, Opaque, OpaqueKind, Selection, Target};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -196,12 +196,12 @@ pub fn parse(
     Ok(parsed)
 }
 
-/// Invalidate cached parses when a reader learns a previously ignored format.
+/// Invalidate cached parses when normalized content or supported formats change.
 pub fn parser_revision(provider: Provider) -> u32 {
     match provider {
-        Provider::Opencode | Provider::Pi | Provider::Claude => 2,
-        Provider::CopilotCli => 1,
-        _ => 0,
+        Provider::Opencode | Provider::Pi | Provider::Claude => 3,
+        Provider::CopilotCli => 2,
+        Provider::Codex => 1,
     }
 }
 
@@ -422,8 +422,8 @@ fn compose_message(record: &mut Record) -> Result<()> {
         let node = select_part(&mut body, String::new(), value, form);
         push_selected(&mut body, node, value, form);
     } else if let Some(parts) = value["content"].as_array() {
-        if !matches!(record.provider, Provider::Pi | Provider::Claude)
-            && !(record.provider == Provider::Opencode && value["type"] == "assistant")
+        if !(matches!(record.provider, Provider::Pi | Provider::Claude)
+            || record.provider == Provider::Opencode && value["type"] == "assistant")
         {
             return Ok(());
         }

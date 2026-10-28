@@ -58,71 +58,36 @@ def native_parts(path):
 
 
 def source_part(data):
-    """Expected public source representation of an OpenCode V1 part."""
-    if data.get("type") != "reasoning":
-        result = deepcopy(data)
-        if data.get("type") in ("assistant", "step-finish", "compaction"):
-            tokens = result.get("tokens")
-            if isinstance(tokens, dict) and "reasoning" in tokens:
-                tokens["detail_tokens"] = tokens.pop("reasoning")
-        return result
-    result = {"type": "detail", "text": data.get("text", "")}
-    values = {"data": [], "signature": []}
-
-    def collect(value, kind="data"):
-        if isinstance(value, dict) and value:
-            for key in sorted(value):
-                collect(
-                    value[key],
-                    "signature"
-                    if key in ("signature", "thinkingSignature")
-                    else "data",
-                )
-        elif isinstance(value, list) and value:
-            for item in value:
-                collect(item, kind)
-        else:
-            values[kind].append(value)
-
-    for key in ("data", "encrypted_content", "signature", "thinkingSignature"):
-        if key in data:
-            values[
-                "signature" if key in ("signature", "thinkingSignature") else "data"
-            ].append(data[key])
-    for key in ("metadata", "native"):
-        if key in data:
-            collect(data[key])
-    for key, items in values.items():
-        if items:
-            result[key] = items[0] if len(items) == 1 else items
+    """Expected public representation of an ordinary OpenCode V1 part."""
+    result = deepcopy(data)
+    if data.get("type") in ("assistant", "step-finish", "compaction"):
+        tokens = result.get("tokens")
+        if isinstance(tokens, dict) and "reasoning" in tokens:
+            tokens["detail_tokens"] = tokens.pop("reasoning")
     return result
 
 
 def enumerate_history(case, parts, timeout):
-    """Verify source parts, full text/output, and pagination."""
+    """Verify ordinary source parts, full text/output, and pagination."""
+    parts = {
+        part: value
+        for part, value in parts.items()
+        if value[1].get("type") != "reasoning"
+    }
     rows, cursors, cursor_args = [], set(), ()
     while True:
-        previous = case.env.get("TRWL_TEXTURE")
-        case.env["TRWL_TEXTURE"] = "source"
-        try:
-            result = case.command(
-                "--texture",
-                "list",
-                "events",
-                "--workspace",
-                "**",
-                "--format",
-                "jsonl",
-                "--limit",
-                "1000",
-                *cursor_args,
-                timeout=timeout,
-            )
-        finally:
-            if previous is None:
-                case.env.pop("TRWL_TEXTURE", None)
-            else:
-                case.env["TRWL_TEXTURE"] = previous
+        result = case.command(
+            "list",
+            "events",
+            "--workspace",
+            "**",
+            "--format",
+            "jsonl",
+            "--limit",
+            "1000",
+            *cursor_args,
+            timeout=timeout,
+        )
         page = [json.loads(line) for line in result.stdout.splitlines()]
         require(
             page and page[-1]["record_type"] == "event_range_completion",
@@ -167,7 +132,7 @@ def enumerate_history(case, parts, timeout):
                 "lost or duplicated native part content",
             )
             primary[part] = row
-            if data.get("type") in ("text", "reasoning", "tool_result"):
+            if data.get("type") in ("text", "tool_result"):
                 require(row["text"] == data.get("text", ""), "changed full native text")
     require(set(primary) == set(parts), "missing native parts")
     expected_outputs = {
@@ -188,7 +153,6 @@ def enumerate_history(case, parts, timeout):
 
 def trial(root, args, parts):
     case = PerformanceCase(root, args.binary, args.model_dir)
-    case.env["TRWL_TEXTURE"] = "source"
     # Default-workspace reads must run from the requested checkout, not the
     # runner's otherwise empty disposable workspace. Data and HOME stay private.
     case.work = args.workspace
@@ -200,9 +164,7 @@ def trial(root, args, parts):
         )
 
         def measure(name, *argv):
-            result, record = case.measured(
-                name, "--texture", *argv, timeout=args.timeout
-            )
+            result, record = case.measured(name, *argv, timeout=args.timeout)
             report["measurements"][name] = record
             return result
 

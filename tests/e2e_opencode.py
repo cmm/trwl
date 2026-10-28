@@ -156,73 +156,33 @@ def opencode_v2(case):
     require(any("src/main.rs" in e["files"] for e in calls), "v2 tool file paths lost")
     require(
         not case.search("reasonbeacon", "--events")["results"],
-        "default matched a selected content part",
+        "matched selected thinking",
     )
-    details = case.search("reasonbeacon", "--events", "--texture")["results"]
-    require(len(details) == 1, "expanded v2 content is not searchable")
-    detail_id = details[0]["trwl_event_id"]
-    expanded = case.json_command("show", "event", detail_id, "--texture")["event"]
+    detail_id = next(
+        e["trwl_event_id"]
+        for e in before
+        if e["provider_event_id"] == "msg_assistant" and e["event_type"] == "message"
+    )
     ordinary = case.json_command("show", "event", detail_id)["event"]
-    case.env["TRWL_TEXTURE"] = "source"
-    source = case.json_command("show", "event", detail_id, "--texture")["event"]
-    case.env.pop("TRWL_TEXTURE", None)
     require(
         ordinary["text"]
         == "answerbeacon I will inspect the file.\nUnknownError\nassistantfailurebeacon Original error.",
-        "default lost ordinary content or appended v2 error",
+        "redaction lost ordinary content or appended v2 error",
     )
     require(
-        expanded["structured_content"]["content"][0]
-        == {"type": "detail", "text": expanded["text"].split("\n")[0]},
-        "v2 structured selected text differs from body",
+        ordinary["structured_content"]["content"] == assistant["content"][1:-1],
+        "redaction changed ordinary V2 native siblings",
     )
     require(
-        source["text"].startswith("reasonbeacon Inspect the failing request.\n"),
-        "source v2 text changed",
+        ordinary["structured_content"]["tokens"]
+        == {"input": 8, "output": 5, "detail_tokens": 3},
+        "v2 counter metadata changed",
     )
-    for event in (ordinary, expanded, source):
+    for secret in ("reasonbeacon", "v2-signature", "v2-data", "empty-signature"):
         require(
-            next(
-                part
-                for part in event["structured_content"]["content"]
-                if part["type"] == "text"
-            )["native"]
-            == assistant["content"][1]["native"],
-            "ordinary V2 native data changed",
+            secret not in json.dumps(ordinary),
+            f"V2 retrieval exposed thinking payload: {secret}",
         )
-        require(
-            next(
-                part
-                for part in event["structured_content"]["content"]
-                if part["type"] == "tool"
-            )["native"]
-            == assistant["content"][2]["native"],
-            "tool V2 native data changed",
-        )
-        require(
-            event["structured_content"]["tokens"]
-            == {"input": 8, "output": 5, "detail_tokens": 3},
-            "v2 counter metadata was not neutral",
-        )
-        require(
-            "assistantfailurebeacon Original error." in event["text"],
-            "v2 error was lost in projection",
-        )
-    require(
-        source["structured_content"]["content"][0]
-        == {
-            "type": "detail",
-            "text": "reasonbeacon Inspect the failing request.",
-            "signature": "v2-signature",
-            "data": ["v2-data", False, 0, None, {}, [], "same", "same"],
-        },
-        "V2 source projection lost nested terminal values",
-    )
-    require(
-        source["structured_content"]["content"][-1]
-        == {"type": "detail", "text": "", "signature": "empty-signature", "data": []},
-        "empty V2 selected native data disappeared",
-    )
     assistant["content"][2]["state"] = {
         "status": "completed",
         "input": {"filePath": "src/main.rs"},

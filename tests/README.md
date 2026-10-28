@@ -439,7 +439,7 @@ taskset -c 0,2 python3 tests/perf_history_updates.py \
 The default is five alternating pairs and one excluded warm-up pair. Omit
 `--candidate` to measure one executable. `--repetitions` and `--timeout` control
 sample count and per-command deadlines. The runner reports resources but makes
-no regression decision. It enumerates complete source content after every sample,
+no regression decision. It enumerates retrievable event content after every sample,
 compares normalized event output across executables and samples, and compares
 warm-up results with full import. Artifacts remain under
 `.cache/assistant/tmp/edit-pairs-*`; `report.json` records hashes, commands,

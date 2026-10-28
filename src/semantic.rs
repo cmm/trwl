@@ -1804,8 +1804,10 @@ pub(crate) mod tests {
         assert_eq!(irrelevant.version(), index.version());
         let latest = irrelevant.event_reference(&assistant_id).unwrap();
         assert_eq!(latest.len(), 1);
-        assert_eq!(latest[0].text, "revised private reasoning\nanswer");
-        assert_eq!(latest[0].structured_content, assistant["message"]);
+        assert_eq!(latest[0].text, "answer");
+        let mut expected = assistant["message"].clone();
+        expected["content"].as_array_mut().unwrap().remove(0);
+        assert_eq!(latest[0].structured_content, expected);
         let legacy = config
             .directories
             .cache

@@ -26,8 +26,8 @@ use crate::{
     config::{Config, Source, is_locked, lock},
     providers,
     record::{ConversationMessage, Provider, Record, digest},
+    redaction::SourceSpans,
     report::{Diagnostic, ImportReport, ImportSource, LexicalStatus, Outcome, State},
-    texture::{self, Mode, SourceSpans},
     workspace,
 };
 use anyhow::{Context, Result, ensure};
@@ -174,7 +174,7 @@ struct Fields {
     session: Field,
     text: Field,
     default_text: Field,
-    expanded_text: Field,
+    _expanded_text: Field,
     availability: Field,
     record: Field,
     summary: Field,
@@ -197,7 +197,8 @@ fn schema() -> (Schema, Fields) {
         session: schema.add_text_field("session", STRING | FAST),
         text: schema.add_text_field("text", TEXT | STORED),
         default_text: schema.add_text_field("default_text", TEXT),
-        expanded_text: schema.add_text_field("expanded_text", TEXT),
+        // Preserve the v6 schema so existing indexes remain readable.
+        _expanded_text: schema.add_text_field("expanded_text", TEXT),
         availability: schema.add_u64_field("content_availability", tantivy::schema::INDEXED),
         record: schema.add_bytes_field("record", STORED),
         summary: schema.add_bytes_field("summary", STORED),
@@ -212,16 +213,6 @@ fn schema() -> (Schema, Fields) {
         sequence: schema.add_u64_field("sequence", FAST | tantivy::schema::INDEXED),
     };
     (schema.build(), fields)
-}
-
-impl Fields {
-    fn text(self, mode: Mode) -> Field {
-        match mode {
-            Mode::Default => self.default_text,
-            Mode::Expanded => self.expanded_text,
-            Mode::Source => self.text,
-        }
-    }
 }
 
 pub struct ReadIndex {
@@ -253,7 +244,6 @@ pub struct LexicalResults {
     pub rows: Vec<(f32, Record)>,
     addresses: HashMap<String, (DocAddress, Option<SourceSpans>)>,
     generators: Vec<SnippetGenerator>,
-    texture: Mode,
 }
 
 impl LexicalResults {
@@ -264,25 +254,24 @@ impl LexicalResults {
             .get_first(index.fields.text)
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let view = texture::text_view(text, source.as_ref(), self.texture)?;
+        // Older v6 documents store selected text in `text`; their summary's
+        // spans must still be applied even when the original source is gone.
+        let text = source
+            .as_ref()
+            .map_or_else(|| Ok(text.to_owned()), |spans| spans.project_text(text))?;
         let fragment = self
             .generators
             .iter()
-            .map(|g| g.snippet(&view.text))
+            .map(|g| g.snippet(&text))
             .filter(|s| !s.highlighted().is_empty())
             .max_by_key(|s| s.highlighted().len())
             .map(|s| s.fragment().to_owned())
             .unwrap_or_else(|| {
-                view.text
-                    .chars()
+                text.chars()
                     .take(crate::record::SEARCH_SNIPPET_CHARS)
                     .collect()
             });
-        let start = view
-            .text
-            .find(&fragment)
-            .context("excerpt missing from content")?;
-        view.render(start..start + fragment.len())
+        Ok(fragment)
     }
 }
 
@@ -709,7 +698,6 @@ impl ReadIndex {
         filters: &Filters,
         exclude_current: bool,
         workspace: &workspace::Selection,
-        texture: Mode,
     ) -> Result<Box<dyn Query>> {
         let f = self.fields;
         let term = |field, value: &str| term_query(Term::from_field_text(field, value));
@@ -723,7 +711,7 @@ impl ReadIndex {
             (Occur::Must, Box::new(AllQuery) as Box<dyn Query>),
             (Occur::MustNot, term(f.id, CHECKPOINT_ID)),
         ];
-        clauses.push((Occur::Must, self.availability(texture)));
+        clauses.push((Occur::Must, self.ordinary_content()));
         if !filters.provider.is_empty() {
             let providers = filters
                 .provider
@@ -842,9 +830,8 @@ impl ReadIndex {
         limit: usize,
         cursor: Option<&str>,
         workspace: &workspace::Selection,
-        texture: Mode,
     ) -> Result<(Vec<Record>, Option<String>)> {
-        let mut selection = self.selection(filters, false, workspace, texture)?;
+        let mut selection = self.selection(filters, false, workspace)?;
         if !sessions && let Some(id) = cursor {
             let selected_cursor = BooleanQuery::new(vec![
                 (Occur::Must, selection.box_clone()),
@@ -1024,20 +1011,18 @@ impl ReadIndex {
         terms: &[String],
         mode: LexicalMode,
         selection: &dyn Query,
-        texture: Mode,
     ) -> Result<LexicalResults> {
         if matches!(mode, LexicalMode::Events(0)) {
             return Ok(LexicalResults {
                 rows: Vec::new(),
                 addresses: HashMap::new(),
                 generators: Vec::new(),
-                texture,
             });
         }
         let mut scores = BTreeMap::<DocAddress, Candidate>::new();
         let mut generators = Vec::new();
         for term in terms {
-            let field = self.fields.text(texture);
+            let field = self.fields.default_text;
             let Some(query) = self.text_query(term, field)? else {
                 continue;
             };
@@ -1096,25 +1081,24 @@ impl ReadIndex {
             rows,
             addresses,
             generators,
-            texture,
         })
     }
 
-    pub fn by_session(&self, id: &str, texture: Mode) -> Result<Vec<Record>> {
+    pub fn by_session(&self, id: &str) -> Result<Vec<Record>> {
         Ok(self
             .query(&BooleanQuery::new(vec![
                 (
                     Occur::Must,
                     term_query(Term::from_field_text(self.fields.session, id)),
                 ),
-                (Occur::Must, self.availability(texture)),
+                (Occur::Must, self.ordinary_content()),
             ]))?
             .into_iter()
             .map(|(_, record)| record)
             .collect())
     }
 
-    pub fn window(&self, record: &Record, radius: usize, texture: Mode) -> Result<Vec<Record>> {
+    pub fn window(&self, record: &Record, radius: usize) -> Result<Vec<Record>> {
         let mut addresses = self.addresses(&BooleanQuery::new(vec![
             (
                 Occur::Must,
@@ -1123,7 +1107,7 @@ impl ReadIndex {
                     &record.session_id,
                 )),
             ),
-            (Occur::Must, self.availability(texture)),
+            (Occur::Must, self.ordinary_content()),
         ]))?;
         addresses.sort_unstable_by_key(|a| (a.segment_ord, a.doc_id));
         let mut ordered = Vec::with_capacity(addresses.len());
@@ -1184,7 +1168,7 @@ impl ReadIndex {
             .collect())
     }
 
-    pub fn session_reference(&self, id: &str, texture: Mode) -> Result<Vec<Record>> {
+    pub fn session_reference(&self, id: &str) -> Result<Vec<Record>> {
         let mut clauses = vec![(
             Occur::Should,
             term_query(Term::from_field_text(self.fields.native_session, id)),
@@ -1197,10 +1181,7 @@ impl ReadIndex {
         }
         self.searcher
             .search(
-                &BooleanQuery::new(vec![
-                    (Occur::Must, Box::new(BooleanQuery::new(clauses))),
-                    (Occur::Must, self.availability(texture)),
-                ]),
+                &BooleanQuery::new(clauses),
                 &Winners {
                     mode: LexicalMode::Sessions,
                     chronological: true,
@@ -1211,14 +1192,8 @@ impl ReadIndex {
             .collect()
     }
 
-    fn availability(&self, texture: Mode) -> Box<dyn Query> {
-        Box::new(RangeQuery::new(
-            std::ops::Bound::Included(Term::from_field_u64(self.fields.availability, 0)),
-            std::ops::Bound::Included(Term::from_field_u64(
-                self.fields.availability,
-                texture.availability().indexed(),
-            )),
-        ))
+    fn ordinary_content(&self) -> Box<dyn Query> {
+        term_query(Term::from_field_u64(self.fields.availability, 0))
     }
 }
 
@@ -1865,9 +1840,7 @@ fn update_with_parser(
                 }
                 let full = serde_json::to_vec(&StoredRecord::new(record.clone()))?;
                 let message = record.is_conversation_message();
-                let default_text = texture::view(&record, Mode::Default)?.text;
-                let expanded_text = texture::view(&record, Mode::Expanded)?.text;
-                let availability = record.availability()?.indexed();
+                let availability = u64::from(!record.has_ordinary_content());
                 let mut summary = record.clone();
                 summary.text.clear();
                 summary.structured_content = Value::Null;
@@ -1877,9 +1850,8 @@ fn update_with_parser(
                     fields.id => record.event_id.clone(),
                     fields.session => record.session_id.clone(),
                     fields.message => message,
-                    fields.text => record.text,
-                    fields.default_text => default_text,
-                    fields.expanded_text => expanded_text,
+                    fields.text => record.text.clone(),
+                    fields.default_text => record.text,
                     fields.availability => availability,
                     fields.record => full,
                     fields.summary => serde_json::to_vec(&summary)?,
@@ -1995,20 +1967,10 @@ pub(crate) mod tests {
         input(&path, &text);
         let index = import(&config, Provider::Codex, &path);
         let selection = index
-            .selection(
-                &Filters::default(),
-                false,
-                &workspace::Selection::All,
-                Mode::Default,
-            )
+            .selection(&Filters::default(), false, &workspace::Selection::All)
             .unwrap();
         let hits = index
-            .lexical(
-                &["needle".into()],
-                LexicalMode::Events(1),
-                &*selection,
-                Mode::Default,
-            )
+            .lexical(&["needle".into()], LexicalMode::Events(1), &*selection)
             .unwrap();
         assert_eq!(hits.rows.len(), 1);
         let snippet = hits.snippet(&index, &hits.rows[0].1.event_id).unwrap();
@@ -2026,47 +1988,183 @@ pub(crate) mod tests {
         let header = json!({"type":"session", "version":3, "id":"mixed"});
         let row = json!({"type":"message", "id":"mixed", "message":{"role":"assistant", "content":[
             {"type":"text", "text":"ordinary prefix"},
-            {"type":"thinking", "thinking":text},
+            {"type":"thinking", "thinking":text.replace("needle", "selectedneedle"), "thinkingSignature":"selectedneedleopaque"},
             {"type":"text", "text":"ordinary suffix"}
         ]}});
         fs::write(&path, format!("{header}\n{row}\n")).unwrap();
         let index = import(&config, Provider::Pi, &path);
-        for mode in [Mode::Default, Mode::Expanded, Mode::Source] {
-            index.record_decodes.set(0);
-            let selection = index
-                .selection(
-                    &Filters {
-                        provider: vec![Provider::Pi],
-                        ..Default::default()
-                    },
-                    false,
-                    &workspace::Selection::All,
-                    mode,
-                )
-                .unwrap();
-            let hits = index
-                .lexical(
-                    &["needle".into()],
-                    LexicalMode::Events(1),
-                    &*selection,
-                    mode,
-                )
-                .unwrap();
-            if mode == Mode::Default {
-                assert!(hits.rows.is_empty());
-                continue;
+        index.record_decodes.set(0);
+        let selection = index
+            .selection(
+                &Filters {
+                    provider: vec![Provider::Pi],
+                    ..Default::default()
+                },
+                false,
+                &workspace::Selection::All,
+            )
+            .unwrap();
+        let hits = index
+            .lexical(
+                &["selectedneedle".into()],
+                LexicalMode::Events(1),
+                &*selection,
+            )
+            .unwrap();
+        assert!(hits.rows.is_empty());
+        let hits = index
+            .lexical(&["ordinary".into()], LexicalMode::Events(1), &*selection)
+            .unwrap();
+        assert_eq!(hits.rows.len(), 1);
+        let snippet = hits.snippet(&index, &hits.rows[0].1.event_id).unwrap();
+        assert_eq!(snippet, "ordinary prefix\nordinary suffix");
+        assert_eq!(index.record_decodes.get(), 0);
+        let full = index
+            .event_reference(&hits.rows[0].1.event_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(full.text, snippet);
+        assert_eq!(
+            full.structured_content["content"].as_array().unwrap().len(),
+            2
+        );
+        // Search omission alone would miss raw text and native payloads in
+        // stored fields, or a second index field still receiving selected text.
+        for segment in index.searcher.segment_readers() {
+            for field in [
+                index.fields.text,
+                index.fields.default_text,
+                index.fields._expanded_text,
+            ] {
+                let inverted = segment.inverted_index(field).unwrap();
+                let term = Term::from_field_text(field, "selectedneedle");
+                assert!(inverted.get_term_info(&term).unwrap().is_none());
             }
-            let snippet = hits.snippet(&index, &hits.rows[0].1.event_id).unwrap();
-            assert_eq!(index.record_decodes.get(), 0);
-            assert!(snippet.chars().count() <= crate::record::SEARCH_SNIPPET_CHARS);
-            let full = index
-                .event_reference(&hits.rows[0].1.event_id)
-                .unwrap()
-                .remove(0)
-                .project(mode)
-                .unwrap();
-            assert!(full.text.contains(&snippet));
         }
+        assert!(
+            !serde_json::to_string(&full)
+                .unwrap()
+                .contains("selectedneedle")
+        );
+    }
+
+    #[test]
+    fn pre_redaction_records_use_ordinary_search_and_projection_without_the_source() {
+        let (_dir, config, path) = crate::test_support::history_file("missing.jsonl");
+        assert!(!path.exists());
+        let mut record = Record::new(
+            Provider::Pi,
+            "old-session",
+            "mixed",
+            EventType::Message,
+            &path,
+        );
+        let before = "ordinarybeacon before";
+        let selected = "privatebeacon apples";
+        let after = "ordinaryafter";
+        record.text = format!("{before}\n{selected}\n{after}");
+        record.structured_content = json!({"content":[
+            {"type":"text", "text":before},
+            {"type":"thinking", "thinking":selected, "thinkingSignature":"private-signature"},
+            {"type":"text", "text":after}
+        ]});
+        // This is the serialized descriptor from before ingestion redaction.
+        // Fresh imports cannot exercise a stored raw body or its old offsets.
+        record.source_spans = Some(serde_json::from_value(json!({
+            "ordinary":true,
+            "spans":[
+                {"range":{"start":0,"end":before.len()},"node":null},
+                {"range":{"start":before.len()+1,"end":before.len()+1+selected.len()},"node":0},
+                {"range":{"start":before.len()+selected.len()+2,"end":record.text.len()},"node":null}
+            ],
+            "selections":[{"target":{"Node":"/content/1"},"opaque":[{
+                "Value":{"pointer":"/content/1/thinkingSignature","kind":"Signature"}
+            }]}],
+            "collections":[]
+        })).unwrap());
+        let path = config.directories.data.join("index");
+        fs::create_dir_all(&path).unwrap();
+        let (schema, fields) = schema();
+        let index = Index::create_in_dir(path, schema).unwrap();
+        let mut writer = index
+            .writer_with_num_threads::<TantivyDocument>(1, 15_000_000)
+            .unwrap();
+        let mut summary = record.clone();
+        summary.text.clear();
+        summary.structured_content = Value::Null;
+        writer
+            .add_document(doc!(
+                fields.id => record.event_id.clone(),
+                fields.session => record.session_id.clone(),
+                fields.native_session => record.provider_session_id.clone(),
+                fields.text => record.text.clone(),
+                fields.default_text => format!("{before}\n{after}"),
+                fields._expanded_text => record.text.clone(),
+                fields.availability => 0u64,
+                fields.record => serde_json::to_vec(&StoredRecord::new(record.clone())).unwrap(),
+                fields.summary => serde_json::to_vec(&summary).unwrap(),
+                fields.timestamp => "2026-01-01T00:00:00.000Z",
+                fields.sequence => 0u64
+            ))
+            .unwrap();
+        let mut commit = writer.prepare_commit().unwrap();
+        commit.set_payload(&serde_json::to_string(&Manifest::default()).unwrap());
+        commit.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let index = ReadIndex::open(&config.directories.data).unwrap().unwrap();
+        index.record_decodes.set(0);
+        let selection = index
+            .selection(&Filters::default(), false, &workspace::Selection::All)
+            .unwrap();
+        let hits = index
+            .lexical(
+                &["privatebeacon".into()],
+                LexicalMode::Events(10),
+                &*selection,
+            )
+            .unwrap();
+        assert!(hits.rows.is_empty());
+        let hits = index
+            .lexical(
+                &["ordinarybeacon".into()],
+                LexicalMode::Events(10),
+                &*selection,
+            )
+            .unwrap();
+        assert_eq!(hits.rows.len(), 1);
+        assert_eq!(index.record_decodes.get(), 0);
+        assert_eq!(
+            hits.snippet(&index, &record.event_id).unwrap(),
+            format!("{before}\n{after}")
+        );
+        let shown = index
+            .event_reference(&record.event_id)
+            .unwrap()
+            .remove(0)
+            .project()
+            .unwrap();
+        assert_eq!(shown.text, format!("{before}\n{after}"));
+        assert_eq!(
+            shown.structured_content["content"],
+            json!([
+                {"type":"text", "text":before}, {"type":"text", "text":after}
+            ])
+        );
+        let (page, next) = index
+            .page(
+                &Filters::default(),
+                false,
+                10,
+                None,
+                &workspace::Selection::All,
+            )
+            .unwrap();
+        assert!(next.is_none());
+        assert_eq!(page.len(), 1);
+        assert_eq!(
+            serde_json::to_value(page.into_iter().next().unwrap().project().unwrap()).unwrap(),
+            serde_json::to_value(shown).unwrap()
+        );
     }
 
     #[test]
@@ -2399,21 +2497,11 @@ pub(crate) mod tests {
         );
         let index = import(&config, Provider::Codex, &path);
         let selection = index
-            .selection(
-                &Filters::default(),
-                false,
-                &workspace::Selection::All,
-                Mode::Default,
-            )
+            .selection(&Filters::default(), false, &workspace::Selection::All)
             .unwrap();
         let hits = |query: &str| {
             index
-                .lexical(
-                    &[query.into()],
-                    LexicalMode::All,
-                    &*selection,
-                    Mode::Default,
-                )
+                .lexical(&[query.into()], LexicalMode::All, &*selection)
                 .unwrap()
                 .rows
                 .len()
@@ -2469,11 +2557,11 @@ pub(crate) mod tests {
                 ..Default::default()
             };
             let selection = index
-                .selection(&filters, false, &workspace::Selection::All, Mode::Default)
+                .selection(&filters, false, &workspace::Selection::All)
                 .unwrap();
             index.summary_decodes.set(0);
             let limited = index
-                .lexical(terms, LexicalMode::Events(1), &*selection, Mode::Default)
+                .lexical(terms, LexicalMode::Events(1), &*selection)
                 .unwrap()
                 .rows;
             // The newest of the equally short matches wins. Long messages
@@ -2484,7 +2572,7 @@ pub(crate) mod tests {
             assert_eq!(index.record_decodes.get(), 0);
             index.summary_decodes.set(0);
             let grouped = index
-                .lexical(terms, LexicalMode::Sessions, &*selection, Mode::Default)
+                .lexical(terms, LexicalMode::Sessions, &*selection)
                 .unwrap()
                 .rows;
             assert_eq!(grouped.len(), 1);
@@ -2493,16 +2581,11 @@ pub(crate) mod tests {
             assert_eq!(index.record_decodes.get(), 0);
         }
         let selection = index
-            .selection(
-                &Filters::default(),
-                false,
-                &workspace::Selection::All,
-                Mode::Default,
-            )
+            .selection(&Filters::default(), false, &workspace::Selection::All)
             .unwrap();
         assert!(
             index
-                .lexical(&terms, LexicalMode::Events(0), &*selection, Mode::Default)
+                .lexical(&terms, LexicalMode::Events(0), &*selection)
                 .unwrap()
                 .rows
                 .is_empty()
@@ -2512,15 +2595,10 @@ pub(crate) mod tests {
             ..Default::default()
         };
         let selection = index
-            .selection(&filters, false, &workspace::Selection::All, Mode::Default)
+            .selection(&filters, false, &workspace::Selection::All)
             .unwrap();
         let last = index
-            .lexical(
-                &terms[..1],
-                LexicalMode::Events(1),
-                &*selection,
-                Mode::Default,
-            )
+            .lexical(&terms[..1], LexicalMode::Events(1), &*selection)
             .unwrap()
             .rows;
         assert_eq!(
@@ -2573,7 +2651,6 @@ pub(crate) mod tests {
                 },
             },
             Some(&index),
-            Mode::Default,
         )
         .unwrap();
         assert!(result.retrieval.effective_mode == Backend::Lexical);
@@ -2817,14 +2894,8 @@ pub(crate) mod tests {
                     &["needle".into()],
                     LexicalMode::All,
                     &*index
-                        .selection(
-                            &Filters::default(),
-                            false,
-                            &workspace::Selection::All,
-                            Mode::Default,
-                        )
+                        .selection(&Filters::default(), false, &workspace::Selection::All)
                         .unwrap(),
-                    Mode::Default,
                 )
                 .unwrap();
             assert_eq!(hits.rows.len(), 2);
@@ -2839,12 +2910,7 @@ pub(crate) mod tests {
                     let selected = index
                         .selected_ids(
                             &*index
-                                .selection(
-                                    &filters,
-                                    false,
-                                    &workspace::Selection::All,
-                                    Mode::Default,
-                                )
+                                .selection(&filters, false, &workspace::Selection::All)
                                 .unwrap(),
                         )
                         .unwrap();

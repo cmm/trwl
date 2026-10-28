@@ -183,24 +183,15 @@ pub struct OutputRecord {
 }
 
 impl Record {
-    pub fn availability(&self) -> anyhow::Result<crate::texture::Availability> {
-        self.source_spans
-            .as_ref()
-            .map_or(Ok(crate::texture::Availability::Ordinary), |spans| {
-                spans.availability(&self.text)
-            })
-    }
-
-    pub fn project(self, mode: crate::texture::Mode) -> anyhow::Result<OutputRecord> {
-        anyhow::ensure!(
-            self.availability()? <= mode.availability(),
-            "record reference not found"
-        );
-        let view = crate::texture::view(&self, mode)?;
-        let text = view.render(0..view.text.len())?;
+    pub fn project(self) -> anyhow::Result<OutputRecord> {
+        anyhow::ensure!(self.has_ordinary_content(), "record reference not found");
+        let text = self.source_spans.as_ref().map_or_else(
+            || Ok(self.text.clone()),
+            |spans| spans.project_text(&self.text),
+        )?;
         let projection = match &self.source_spans {
-            Some(spans) => spans.project_native(&self, mode)?,
-            None => crate::texture::NativeProjection {
+            Some(spans) => spans.project_native(&self)?,
+            None => crate::redaction::NativeProjection {
                 value: self.structured_content,
                 details: Vec::new(),
             },
@@ -208,7 +199,7 @@ impl Record {
         let mut structured_content = projection.value;
         // Tool payload keys and values are owned by the tool, not the envelope.
         if !matches!(self.event_type, EventType::ToolCall | EventType::ToolOutput) {
-            crate::texture::neutral_metadata(
+            crate::redaction::neutral_metadata(
                 self.provider,
                 self.native_kind,
                 &mut structured_content,

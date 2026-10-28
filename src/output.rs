@@ -377,8 +377,8 @@ mod tests {
         let expected = serde_json::to_value(&r).unwrap();
         let id = r.event_id.clone();
         let report = Report::ShowEvent(SelectedEvents {
-            event: r.clone().project(crate::texture::Mode::Default).unwrap(),
-            events: vec![r.project(crate::texture::Mode::Default).unwrap()],
+            event: r.clone().project().unwrap(),
+            events: vec![r.project().unwrap()],
         });
         let lines: Vec<Value> = render(&report, Format::Jsonl)
             .unwrap()
@@ -405,7 +405,7 @@ mod tests {
     fn pages_and_empty_collections_have_completion_records() {
         let r = record();
         let report = Report::Events(EventsPage {
-            events: vec![r.project(crate::texture::Mode::Default).unwrap()],
+            events: vec![r.project().unwrap()],
             next_cursor: Some("next-event".into()),
         });
         let lines: Vec<Value> = render(&report, Format::Jsonl)

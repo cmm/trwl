@@ -454,21 +454,13 @@ def copilot_details(case):
     write_jsonl(path, records)
     case.command("import", "--provider", "copilot-cli", "--path", path)
 
-    def mode(name):
-        case.env.pop("TRWL_TEXTURE", None)
-        if name == "source":
-            case.env["TRWL_TEXTURE"] = "source"
-        return () if name == "default" else ("--texture",)
+    def transcript():
+        return case.json_command("show", "session", session)["events"]
 
-    def transcript(name):
-        return case.json_command("show", "session", session, *mode(name))["events"]
+    initial = transcript()
 
-    views = {name: transcript(name) for name in ("default", "expanded", "source")}
-
-    def event(name, n):
-        return next(
-            row for row in views[name] if row["provider_event_id"] == identity(n)
-        )
+    def event(n):
+        return next(row for row in initial if row["provider_event_id"] == identity(n))
 
     expected_native = {
         key: value
@@ -483,8 +475,9 @@ def copilot_details(case):
         )
     }
     expected_native["phase"] = "detail"
-    for name, rows in views.items():
-        shown = event(name, 2)
+
+    def check_transcript(rows):
+        shown = event(2)
         require(
             shown["structured_content"] == expected_native,
             "Copilot projection changed ordinary fields or retained selected sidecars",
@@ -496,53 +489,40 @@ def copilot_details(case):
             and archive["revision"] == 7,
             "native block envelope was not relocated neutrally",
         )
-        if name == "default":
-            require(
-                shown["text"] == ordinary
-                and shown["details"]
-                == [
-                    {
-                        "type": "archive",
-                        "provider": "anthropic",
-                        "revision": 7,
-                        "blocks": [replay_text],
-                        "orderedBlocks": [ordered[i] for i in (0, 2, 4)],
-                    }
-                ],
-                "default replay projection changed ordinary entries",
-            )
-        else:
-            require(
-                shown["details"][0]["type"] == "detail"
-                and shown["details"][0]["text"] != "",
-                "sidecar detail was not relocated",
-            )
-            require(
-                archive["blocks"][3 if name == "source" else 2] == replay_text
-                and archive["orderedBlocks"][0] == replay_text
-                and archive["orderedBlocks"][2] == tool,
-                "mixed replay text/tool entry changed",
-            )
+        require(
+            shown["text"] == ordinary
+            and shown["details"]
+            == [
+                {
+                    "type": "archive",
+                    "provider": "anthropic",
+                    "revision": 7,
+                    "blocks": [replay_text],
+                    "orderedBlocks": [ordered[i] for i in (0, 2, 4)],
+                }
+            ],
+            "redaction changed ordinary replay entries",
+        )
         require(
             not any(row["provider_event_id"] == identity(7) for row in rows),
             "transient delta was imported",
         )
         require(
-            any(row["provider_event_id"] == identity(4) for row in rows)
-            == (name == "source"),
+            not any(
+                row["provider_event_id"] in (identity(3), identity(4)) for row in rows
+            ),
             "empty standalone event has incorrect availability",
         )
         require(
-            event(name, 5)["text"] == ""
-            and event(name, 5)["structured_content"]["phase"] == "response",
+            event(5)["text"] == ""
+            and event(5)["structured_content"]["phase"] == "response",
             "empty ordinary boundary or other phase changed",
         )
         require(
-            event(name, 6)["text"] == records[6]["data"]["content"]
-            and event(name, 6)["structured_content"]["phase"] == "detail",
+            event(6)["text"] == records[6]["data"]["content"]
+            and event(6)["structured_content"]["phase"] == "detail",
             "phase metadata classified ordinary content",
         )
-        mode(name)
         page_rows, cursor = [], None
         while True:
             page = case.json_command(
@@ -553,7 +533,6 @@ def copilot_details(case):
                 "--limit",
                 "2",
                 *(("--cursor", cursor) if cursor else ()),
-                *mode(name),
             )
             page_rows.extend(page["events"])
             cursor = page["next_cursor"]
@@ -562,7 +541,7 @@ def copilot_details(case):
         require(page_rows == rows, "Copilot eligibility skipped or repeated tied pages")
         for position, row in enumerate(rows):
             window = case.json_command(
-                "show", "event", row["trwl_event_id"], "--window", "1", *mode(name)
+                "show", "event", row["trwl_event_id"], "--window", "1"
             )
             require(
                 window["events"] == rows[max(0, position - 1) : position + 2],
@@ -576,163 +555,52 @@ def copilot_details(case):
             "standalonecopilotbeacon",
         ):
             hits = case.search(
-                marker, "--session", session, "--events", "--limit", "1", *mode(name)
+                marker, "--session", session, "--events", "--limit", "1"
             )["results"]
             require(
-                bool(hits) == (name != "default"),
-                "Copilot selected readable occurrence used the wrong query view",
+                not hits,
+                "Copilot thinking was searchable",
             )
-            if hits:
-                full = case.json_command(
-                    "show", "event", hits[0]["trwl_event_id"], *mode(name)
-                )["event"]
-                require(
-                    hits[0]["snippet"] in full["text"]
-                    and len(hits[0]["snippet"]) <= 400,
-                    "Copilot late snippet lost whole-part provenance",
-                )
         require(
-            not case.search("sidecar-ciphertext", "--session", session, *mode(name))[
-                "results"
-            ],
+            not case.search("sidecar-ciphertext", "--session", session)["results"],
             "opaque sidecar entered searchable text",
         )
 
-    source = event("source", 2)
-    archive = source["details"][1]
-    require(
-        source["details"][0]
-        == {
-            "type": "detail",
-            "text": sidecar,
-            "signature": "sidecar-signature",
-            "data": "sidecar-ciphertext",
-        },
-        "source lost scalar sidecars",
-    )
-    require(
-        archive["blocks"][:3]
-        == [
-            {"type": "detail", "text": duplicate, "signature": "block-signature"},
-            {"type": "detail", "text": "", "data": "redacted-opaque"},
-            {
-                "type": "detail",
-                "text": "summarycopilotbeacon Original summary.\ncontentcopilotbeacon Original native content.",
-                "data": "native-ciphertext",
-            },
-        ],
-        "source lost native block text or opaque values",
-    )
-    require(
-        archive["orderedBlocks"][1]
-        == {"type": "detail", "text": duplicate, "signature": "ordered-signature"}
-        and archive["orderedBlocks"][3]
-        == {
-            "type": "detail",
-            "text": "`protectedcopilotbeacon`",
-            "signature": "protected-signature",
-        },
-        "source lost ordered block occurrences",
-    )
-    require(
-        event("source", 5)["details"]
-        == [
-            {
-                "type": "detail",
-                "text": "",
-                "signature": "opaqueonly-signature",
-                "data": "opaqueonly-ciphertext",
-            }
-        ],
-        "opaque-only group disappeared",
-    )
-    for name in ("default", "expanded"):
+    check_transcript(initial)
+    require("details" not in event(5), "opaque-only group generated a detail")
+    expected = event(2)
+    for format in ("text", "markdown", "json", "jsonl"):
+        args = ("show", "event", expected["trwl_event_id"], "--format", format)
+        rendered = case.command(*args).stdout
+        output = case.root / f"copilot.{format}"
+        case.command(*args, "--out", output)
+        require(output.read_text() == rendered, "Copilot export bypassed redaction")
         require(
-            "details" not in event(name, 5),
-            "opaque-only group generated an empty detail",
+            "sidecarlatebeacon" not in rendered and "sidecar-signature" not in rendered,
+            "Copilot output exposed thinking",
         )
-    expanded = event("expanded", 2)
-    require(
-        expanded["details"][1]["blocks"][0]["text"] != duplicate
-        and expanded["text"].startswith(ordinary + "\n"),
-        "identical ordinary and selected occurrences were globally replaced",
-    )
-    require(
-        all(
-            set(node) == {"type", "text"}
-            for node in expanded["details"][1]["blocks"]
-            if node["type"] == "detail"
-        ),
-        "expanded block retained opaque data",
-    )
-
-    for index, env in enumerate((None, "", "source", "SOURCE", " source")):
-        for enabled in (False, True):
-            case.env.pop("TRWL_TEXTURE", None)
-            if env is not None:
-                case.env["TRWL_TEXTURE"] = env
-            flags = ("--texture",) if enabled else ()
-            expected = event(
-                "source"
-                if enabled and env == "source"
-                else "expanded"
-                if enabled
-                else "default",
-                2,
+        if format == "json":
+            value = json.loads(rendered)
+            require(
+                value["event"] == expected and value["events"] == [expected],
+                "JSON event/events disagree",
             )
-            for format in ("text", "markdown", "json", "jsonl"):
-                args = (
-                    *flags,
-                    "show",
-                    "event",
-                    expected["trwl_event_id"],
-                    "--format",
-                    format,
-                )
-                rendered = case.command(*args).stdout
-                output = case.root / f"copilot-{index}-{enabled}.{format}"
-                case.command(*args, "--out", output)
-                require(
-                    output.read_text() == rendered, "Copilot export bypassed projection"
-                )
-                if format == "json":
-                    value = json.loads(rendered)
-                    require(
-                        value["event"] == expected and value["events"] == [expected],
-                        "JSON event/events disagree",
-                    )
-                elif format == "jsonl":
-                    lines = [json.loads(line) for line in rendered.splitlines()]
-                    require(
-                        lines[0]["event"] == expected
-                        and lines[-1]["terminal"]
-                        and not lines[-1]["truncated"],
-                        "JSONL projection/completion changed",
-                    )
-                else:
-                    require(
-                        expected["text"] in rendered,
-                        "human output changed the chosen body",
-                    )
-
-    mode("default")
-    case.command(
-        "show", "event", event("source", 3)["trwl_event_id"], expect_failure=True
-    )
-    case.command(
-        "list",
-        "events",
-        "--session",
-        session,
-        "--cursor",
-        event("source", 4)["trwl_event_id"],
-        "--texture",
-        expect_failure=True,
-    )
+        elif format == "jsonl":
+            lines = [json.loads(line) for line in rendered.splitlines()]
+            require(
+                lines[0]["event"] == expected
+                and lines[-1]["terminal"]
+                and not lines[-1]["truncated"],
+                "JSONL redaction/completion changed",
+            )
+        else:
+            require(
+                expected["text"] in rendered, "human output changed the ordinary body"
+            )
     case.command("import", "--provider", "copilot-cli", "--path", path)
     require(
-        all(transcript(name) == rows for name, rows in views.items()),
-        "repeat import changed Copilot projections",
+        transcript() == initial,
+        "repeat import changed Copilot retrieval",
     )
     changed = deepcopy(records)
     changed[2]["data"]["reasoningText"] = "editedsidecarbeacon New selected text."
@@ -740,44 +608,33 @@ def copilot_details(case):
     write_jsonl(path, changed)
     case.command("import", "--provider", "copilot-cli", "--path", path)
     require(
-        next(
-            row
-            for row in transcript("default")
-            if row["provider_event_id"] == identity(2)
-        )
-        == event("default", 2),
+        next(row for row in transcript() if row["provider_event_id"] == identity(2))
+        == event(2),
         "selected edit changed the ordinary message",
     )
     require(
-        not case.search("sidecarlatebeacon", "--session", session, *mode("expanded"))[
-            "results"
-        ]
-        and case.search("editedsidecarbeacon", "--session", session, *mode("expanded"))[
-            "results"
-        ],
-        "selected rewrite kept stale search text",
+        not case.search("sidecarlatebeacon", "--session", session)["results"]
+        and not case.search("editedsidecarbeacon", "--session", session)["results"],
+        "selected rewrite indexed thinking",
     )
     require(
-        not any(
-            row["provider_event_id"] == identity(3) for row in transcript("source")
-        ),
+        not any(row["provider_event_id"] == identity(3) for row in transcript()),
         "deleted standalone event survived",
     )
-    latest = {name: transcript(name) for name in views}
+    latest = transcript()
     old_data = case.env["XDG_DATA_HOME"]
     case.env["XDG_DATA_HOME"] = str(case.root / "fresh-copilot-data")
     case.command("import", "--provider", "copilot-cli", "--path", path)
     require(
-        all(transcript(name) == rows for name, rows in latest.items()),
+        transcript() == latest,
         "fresh Copilot import differs from incremental updates",
     )
     case.env["XDG_DATA_HOME"] = old_data
     path.rename(path.with_suffix(".indexed-away"))
     require(
-        transcript("source") == latest["source"],
-        "Copilot source retrieval depended on the source file",
+        transcript() == latest,
+        "Copilot redaction depended on the source file",
     )
-    mode("default")
     case.check(
         "Copilot sidecars, standalone events and mixed native replay blocks share projection, query and paging policy"
     )
@@ -1252,82 +1109,27 @@ def provider_details(case):
         if "file" in item:
             args.extend(("--file", item["file"]))
         if item.get("selected"):
-            case.env.pop("TRWL_TEXTURE", None)
             require(
                 not case.search(item["marker"], *args)["results"],
-                "default indexed a selected native part",
+                "indexed selected thinking",
             )
-            hits = case.search(item["marker"], *args, "--texture")["results"]
-            require(len(hits) == 1, "expanded query did not use original spelling")
-            identity = hits[0]["trwl_event_id"]
-            transformed = case.json_command("show", "event", identity, "--texture")[
-                "event"
-            ]
-            case.command("show", "event", identity, expect_failure=True)
-            case.env["TRWL_TEXTURE"] = "source"
-            original = case.json_command("show", "event", identity, "--texture")[
-                "event"
-            ]
-            require(
-                original["text"] == item["text"]
-                and transformed["text"] != original["text"],
-                "native text mode changed",
-            )
-            require(
-                len(transformed["text"]) == len(original["text"]),
-                "selected projection changed scalar length",
-            )
-
-            def nodes(event):
-                native = event["structured_content"]
-                return (
-                    [native]
-                    if item["provider"] in ("codex", "opencode")
-                    else native["content"]
+            transcript = case.json_command("show", "session", item["session"])
+            serialized = json.dumps(transcript, ensure_ascii=False)
+            for secret in (
+                item["marker"],
+                "codex-opaque",
+                "pi-signature",
+                "direct-signature",
+                "nested-signature",
+                "nested-data",
+                "claude-signature",
+                "claude-redacted-opaque",
+            ):
+                require(
+                    secret not in serialized,
+                    f"retrieval exposed selected text or native payload: {secret}",
                 )
-
-            require(
-                nodes(transformed) == [{"type": "detail", "text": transformed["text"]}],
-                "expanded native projection has a second copy or opaque metadata",
-            )
-            expected = [{"type": "detail", "text": item["text"]}]
-            if item["provider"] == "codex":
-                expected[0]["data"] = "codex-opaque"
-            elif item["provider"] == "pi":
-                expected[0]["signature"] = "pi-signature"
-            elif item["provider"] == "opencode":
-                expected[0]["signature"] = ["direct-signature", "nested-signature"]
-                expected[0]["data"] = [
-                    "nested-data",
-                    None,
-                    False,
-                    0,
-                    {},
-                    [],
-                    "same",
-                    "same",
-                ]
-            elif item["provider"] == "claude":
-                expected[0]["signature"] = "claude-signature"
-                expected.append(
-                    {"type": "detail", "text": "", "data": "claude-redacted-opaque"}
-                )
-            require(
-                nodes(original) == expected,
-                "source native projection lost text or opaque values",
-            )
-            require(
-                case.search(item["marker"], *args, "--texture")["results"][0][
-                    "trwl_event_id"
-                ]
-                == identity,
-                "source query changed identity",
-            )
-            case.env.pop("TRWL_TEXTURE", None)
-            return {
-                "event_id": identity,
-                "event": {"expanded": transformed, "source": original},
-            }
+            return {"event_id": None, "event": transcript}
         hits = case.search(item["marker"], *args, refresh="off")["results"]
         require(
             len(hits) == 1,
@@ -1375,43 +1177,23 @@ def provider_details(case):
 
     baseline = {item["marker"]: capture_hit(item) for item in checks}
     claude_ordinary = baseline["claudecontrolbeacon"]["event"]
-    for source_mode in (False, True):
-        if source_mode:
-            case.env["TRWL_TEXTURE"] = "source"
-        require(
-            case.json_command(
-                "show", "event", claude_ordinary["trwl_event_id"], "--texture"
-            )["event"]
-            == claude_ordinary,
-            "unknown Claude forms were reclassified",
-        )
-    case.env.pop("TRWL_TEXTURE", None)
+    require(
+        case.json_command("show", "event", claude_ordinary["trwl_event_id"])["event"]
+        == claude_ordinary,
+        "unknown Claude forms were reclassified",
+    )
     ordinary_event = baseline["ordinarynativebeacon"]["event"]
-    for source_mode in (False, True):
-        if source_mode:
-            case.env["TRWL_TEXTURE"] = "source"
-        require(
-            case.json_command(
-                "show", "event", ordinary_event["trwl_event_id"], "--texture"
-            )["event"]
-            == ordinary_event,
-            "ordinary V1 metadata was projected",
-        )
-    empty_owned = next(
-        row
-        for row in case.json_command("show", "session", opencode_session, "--texture")[
-            "events"
-        ]
-        if row["provider_event_id"] == "part-empty-owned"
+    require(
+        case.json_command("show", "event", ordinary_event["trwl_event_id"])["event"]
+        == ordinary_event,
+        "ordinary V1 metadata was projected",
     )
     require(
-        empty_owned["structured_content"]
-        == {"type": "detail", "text": "", "signature": "empty-signature", "data": []},
-        "empty V1 nested values disappeared",
-    )
-    case.env.pop("TRWL_TEXTURE", None)
-    case.command(
-        "show", "event", empty_owned["trwl_event_id"], "--texture", expect_failure=True
+        not any(
+            row["provider_event_id"] == "part-empty-owned"
+            for row in case.json_command("show", "session", opencode_session)["events"]
+        ),
+        "empty thinking part was displayed",
     )
     for unsearchable in (
         "base64onlybeacon",
@@ -1469,18 +1251,8 @@ def provider_details(case):
             == event,
             "native metadata changed after input removal",
         )
-    case.env["TRWL_TEXTURE"] = "source"
-    require(
-        case.json_command("show", "event", empty_owned["trwl_event_id"], "--texture")[
-            "event"
-        ]
-        == empty_owned,
-        "empty V1 native restoration depended on the source file",
-    )
-    case.env.pop("TRWL_TEXTURE", None)
-
     case.check(
-        "provider details remain searchable with exact scopes and complete native show/list content after source inputs are renamed"
+        "ordinary provider data remains searchable after source removal; selected thinking and native payloads stay omitted"
     )
 
 

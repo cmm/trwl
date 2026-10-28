@@ -2,7 +2,7 @@
 
 trwl searches coding-agent history from OpenCode, Codex, Pi, Claude Code and
 GitHub Copilot CLI. It provides lexical and semantic search, transcript
-retrieval and source locations.  It can update the index in the background.
+retrieval and source locations. It can update the index in the background.
 
 trwl is inspired by [ctx](https://github.com/ctxrs/ctx), around
 version 2.0.3. It borrows most of the CLI contract and several key
@@ -13,7 +13,7 @@ See [INSTALL.md](INSTALL.md) for build & install instructions.
 ## Contents
 
 - [Quick start](#quick-start)
-- [How it works](#how-it-works)
+- [History and search](#history-and-search)
 - [Searching](#searching)
   - [Workspace selection](#workspace-selection)
 - [Reading transcripts](#reading-transcripts)
@@ -45,13 +45,11 @@ surrounding context. Searches cover the current workspace by default;
 `--workspace '**'` searches all history (see [Workspace
 selection](#workspace-selection)).
 
-## How it works
+## History and search
 
 `setup` imports each provider's native history — OpenCode v1/v2 SQLite, and
-Codex, Pi, Claude Code and Copilot CLI JSONL — into a local index
-under the data directory. Every search, transcript and location lookup
-reads that index, so retrieval keeps working even if the original
-history moves away.
+Codex, Pi, Claude Code and Copilot CLI JSONL. Imported history remains
+available even if the original history moves away.
 
 There are three search backends: `lexical` (default) matches words and
 phrases, `semantic` (if enabled in configuration) matches meaning, and
@@ -88,13 +86,12 @@ trwl search "why do requests wait for connections?" --backend hybrid
   — fresh, but the search waits out the import; `background` (the
   default) searches indexed history immediately and restarts the
   updater in automatic mode, so freshness is restored without
-  blocking the search. In automatic mode the updater is supposed to
-  be running; the search only revives it if it died.
+  blocking the search.
 - **Current session:** excluded when `OPENCODE_SESSION_ID`,
   `CODEX_THREAD_ID` or `CLAUDE_SESSION_ID` identifies it;
   `--include-current-session` restores it. `--exclude-session` omits
-  any other session.  Limitation: exclusions do not extend to child
-  sessions automatically.
+  any other session. Exclusions do not extend to child sessions
+  automatically.
 
 Text results contain event and session IDs, the workspace root,
 retrieval mode and snippets around matches. Hybrid search combines
@@ -137,9 +134,6 @@ and provider identities, the source path, the original workspace directory
 and the canonical root. `--out PATH` writes any format to a file (see
 [Output formats](#output-formats)).
 
-`--texture` expands archived detail in search, show and list results. The selected
-view applies to every output format, including exports.
-
 ## Indexing
 
 ```sh
@@ -152,7 +146,7 @@ trwl status
 ```
 
 Provider selectors are `opencode`, `codex`, `pi`, `claude` and
-`copilot-cli`.  `sources add` registers a history for repeated
+`copilot-cli`. `sources add` registers a history for repeated
 imports, and `sources remove` drops the registration; one-time `import
 --path` accepts a file or directory, and automatic discovery can
 re-include a removed input. Imports pick up new, changed, and deleted
@@ -167,7 +161,7 @@ only the registration, and one-time imports are not monitored: their
 history stays indexed after the input file disappears.
 
 In automatic mode a polling updater imports changes in the background;
-in manual mode imports happen only when you run them.  `daemon run`
+in manual mode imports happen only when you run them. `daemon run`
 runs the updater in the foreground; `daemon stop` stops it and the
 local inference process without changing the mode. A later background
 search or `setup` will restart the updater.
@@ -178,9 +172,8 @@ See [Status](#status) for readiness checks and states.
 
 - `status` — the resolved directories, indexing mode, updater activity, both
   indexes, and overall `ready`.
-- `index status` — lexical readiness: configured and discovered inputs
-  compared with the index's source stamps, including SQLite WAL
-  changes; reports counts, pending changes and removals.
+- `index status` — compares configured and discovered inputs with indexed
+  history; reports counts, pending changes and removals.
 - `semantic status` — embedding coverage: documents and chunks
   embedded for the selected executor/model. Other selections and old
   content do not count.
@@ -197,10 +190,8 @@ See [Status](#status) for readiness checks and states.
 | `disabled` | retrieval off (semantic only) |
 
 Overall `ready` in `status` requires lexical readiness plus semantic
-readiness (if semantic is enabled). Every readiness is a snapshot of
-the stored index: it says nothing about source changes still awaiting
-import, an HTTP executor's availability, or rejected records — import
-reports count those.
+readiness (if semantic is enabled). It does not check an HTTP executor's
+availability or rejected records — import reports count those.
 
 ## Semantic search
 
@@ -214,16 +205,14 @@ trwl search "Why are database requests waiting for free connections?" --backend 
 Each user message is paired with the last assistant reply before the
 next user message, and a match always points at the user message, even
 when the matching text is in the reply. User messages with no reply
-are embedded too. Use lexical search for other event content, with `--texture`
-to expand archived detail.
+are embedded too. Use lexical search for other event content.
 
 ### Executors
 
 - `builtin` uses the configured multilingual-E5-small model; queries
   and small incremental fills use CPU. Initial history fills, full
   rebuilds and large incremental fills attempt to use GPU first.
-  [GPU selection](docs/GPU.md) accounts for missing chunks and their
-  token lengths.
+  See [GPU selection](docs/GPU.md).
 - `http` uses an OpenAI-compatible endpoint:
 
   ```sh
@@ -267,11 +256,10 @@ still emit one, and single-object commands such as `status` and
 `locate` emit the same single line for JSON and JSONL.
 
 For `list events` and `list sessions`, pass the completion record's `next_cursor`
-to the next `--cursor` request until `terminal` is true. Keep filters and the
-selected view unchanged between pages. Changing either does not restart
-pagination: if the cursor still identifies a row in the new selection, the
-command continues after it using that selection; otherwise it fails with
-`cursor no longer matches this selection`.
+to the next `--cursor` request until `terminal` is true. Keep filters unchanged
+between pages. Changing filters does not restart pagination: if the cursor still
+identifies a row in the new selection, the command continues after it using that
+selection; otherwise it fails with `cursor no longer matches this selection`.
 Concurrent updates can change later pages.
 
 ## Data and configuration
@@ -309,19 +297,18 @@ executor = "builtin"
 Automatic source discovery and indexing default to enabled; semantic
 retrieval defaults to disabled.
 
- `TRWL_SEMANTIC_MODEL_DIR` overrides the model directory configured at
+`TRWL_SEMANTIC_MODEL_DIR` overrides the model directory configured at
 `trwl` build time.
 
- `ORT_DYLIB_PATH` overrides the ONNX Runtime shared library configured
+`ORT_DYLIB_PATH` overrides the ONNX Runtime shared library configured
 at `trwl` build time.
 
 Indexes and exports contain private session history data, so access to
 files created by trwl is restricted to the current user.
 
 If trwl reports an incompatible history index, remove (or move aside) the data
-directory's `index/` and re-setup or re-build as appropriate.  There
-is no automatic rebuild at the moment.  We'll also endeavor to avoid
-frivolously changing the index format.
+directory's `index/` and re-setup or re-build as appropriate. There
+is no automatic rebuild at the moment.
 
 # Motivation
 
