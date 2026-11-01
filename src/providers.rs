@@ -199,7 +199,8 @@ pub fn parse(
 /// Invalidate cached parses when normalized content or supported formats change.
 pub fn parser_revision(provider: Provider) -> u32 {
     match provider {
-        Provider::Opencode | Provider::Pi | Provider::Claude => 3,
+        Provider::Opencode => 4,
+        Provider::Pi | Provider::Claude => 3,
         Provider::CopilotCli => 2,
         Provider::Codex => 1,
     }
@@ -543,12 +544,22 @@ fn opencode_fingerprints(
            (SELECT {AGGREGATE} FROM message WHERE session_id = s.id)
          FROM session s"
         ),
-        OpencodeSchema::V2 => format!(
-            "SELECT s.id, s.directory, s.parent_id,
-               (SELECT {AGGREGATE} || ':' || total(seq) FROM session_message WHERE session_id = s.id),
-               'v2'
-             FROM session_v2 s"
-        ),
+        OpencodeSchema::V2 { has_parts } => {
+            let parts = if has_parts {
+                format!(
+                    "'v2:' || (SELECT {AGGREGATE} || ':' || total(ordinal)
+                     FROM session_part WHERE session_id = s.id)"
+                )
+            } else {
+                "'v2'".into()
+            };
+            format!(
+                "SELECT s.id, s.directory, s.parent_id,
+                   (SELECT {AGGREGATE} || ':' || total(seq) FROM session_message WHERE session_id = s.id),
+                   {parts}
+                 FROM session_v2 s"
+            )
+        }
     };
     let mut statement = db.prepare(&sql)?;
     let mut rows = statement.query([])?;
@@ -566,7 +577,7 @@ fn opencode_fingerprints(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpencodeSchema {
     V1,
-    V2,
+    V2 { has_parts: bool },
 }
 
 impl OpencodeSchema {
@@ -576,21 +587,35 @@ impl OpencodeSchema {
                 "SELECT p.rowid FROM part p JOIN message m ON p.message_id = m.id
                  WHERE p.session_id = ?1 ORDER BY p.time_created, p.id"
             }
-            Self::V2 => "SELECT rowid FROM session_message WHERE session_id = ?1 ORDER BY seq",
+            Self::V2 { .. } => {
+                "SELECT rowid FROM session_message WHERE session_id = ?1 ORDER BY seq"
+            }
         }
     }
 
-    fn payload_sql(self) -> &'static str {
+    fn payload_sql(self) -> String {
         match self {
             Self::V1 => {
                 "SELECT p.id, p.data, p.time_created, m.data, s.directory, s.parent_id, m.id
                  FROM part p JOIN message m ON p.message_id = m.id
                  JOIN session s ON p.session_id = s.id WHERE p.rowid = ?1"
+                    .into()
             }
-            Self::V2 => {
-                "SELECT m.id, m.data, m.time_created, m.type, s.directory, s.parent_id, m.id, m.seq
-                 FROM session_message m JOIN session_v2 s ON m.session_id = s.id
-                 WHERE m.rowid = ?1"
+            Self::V2 { has_parts } => {
+                // Keep native JSON as strings so invalid parts produce parser
+                // diagnostics rather than failing the SQL query.
+                let parts = if has_parts {
+                    "(SELECT json_group_array(data) FROM
+                      (SELECT data FROM session_part WHERE message_id = m.id ORDER BY ordinal))"
+                } else {
+                    "'[]'"
+                };
+                format!(
+                    "SELECT m.id, m.data, m.time_created, m.type, s.directory, s.parent_id, m.id, m.seq,
+                        {parts}
+                     FROM session_message m JOIN session_v2 s ON m.session_id = s.id
+                     WHERE m.rowid = ?1"
+                )
             }
         }
     }
@@ -619,7 +644,9 @@ fn opencode(
         schemas.push(OpencodeSchema::V1);
     }
     if has_table("session_v2")? && has_table("session_message")? {
-        schemas.push(OpencodeSchema::V2);
+        schemas.push(OpencodeSchema::V2 {
+            has_parts: has_table("session_part")?,
+        });
     }
     ensure!(!schemas.is_empty(), "no supported OpenCode session tables");
     let mut fingerprints = BTreeMap::new();
@@ -636,7 +663,7 @@ fn opencode(
     let mut changed = Vec::new();
     for schema in schemas {
         let mut ordered = tx.prepare(schema.ordered_sql())?;
-        let mut statement = tx.prepare(schema.payload_sql())?;
+        let mut statement = tx.prepare(&schema.payload_sql())?;
         for (id, (_, fingerprint)) in fingerprints.iter().filter(|(_, (s, _))| *s == schema) {
             let old = previous.and_then(|sessions| sessions.get(id));
             let session = match old {
@@ -709,7 +736,7 @@ fn opencode(
                         count += 1;
                         match schema {
                             OpencodeSchema::V1 => opencode_part(path, id, row, &mut session, emit)?,
-                            OpencodeSchema::V2 => {
+                            OpencodeSchema::V2 { .. } => {
                                 opencode_v2_message(path, id, row, &mut session, emit)?
                             }
                         }
@@ -868,9 +895,24 @@ fn opencode_v2_message(
     let id: String = row.get(0)?;
     let data: String = row.get(1)?;
     let kind: String = row.get(3)?;
+    let parts: String = row.get(8)?;
     // The discriminator lives in its own column, outside the JSON payload.
-    let mut value = match serde_json::from_str::<serde_json::Map<String, Value>>(&data) {
-        Ok(value) => Value::Object(value),
+    let value =
+        serde_json::from_str::<serde_json::Map<String, Value>>(&data).and_then(|mut value| {
+            if kind == "assistant" && value.contains_key("content") {
+                let parts: Vec<String> = serde_json::from_str(&parts)?;
+                if !parts.is_empty() {
+                    let content = parts
+                        .iter()
+                        .map(|part| serde_json::from_str(part))
+                        .collect::<serde_json::Result<Vec<Value>>>()?;
+                    value.insert("content".into(), Value::Array(content));
+                }
+            }
+            Ok(Value::Object(value))
+        });
+    let mut value = match value {
+        Ok(value) => value,
         Err(error) => {
             session
                 .diagnostics

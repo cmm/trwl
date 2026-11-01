@@ -3,6 +3,7 @@
 The v2 fixture uses the columns consumed from upstream's session/sql.ts and
 the JSON shapes in schema/src/session-message.ts at commit
 a22754f761f868a80231859c4b8be8887f81187c of anomalyco/opencode.
+Separate parts follow OpenCode 2.2.5's session/sql.ts and history.ts withParts.
 It is hand-built, not a recording from a running OpenCode v2 instance.
 """
 
@@ -344,4 +345,198 @@ def opencode_v2(case):
     require(imported() == after, "incremental v2 output differs from a fresh import")
     case.check(
         "v2-only and mixed databases agree; incremental results match a fresh import"
+    )
+
+    # OpenCode 2.2.5 session/history.ts withParts restores data.content from
+    # session_part in ordinal order, falling back to inline content without parts.
+    with sqlite3.connect(fixture.path) as db:
+        db.executescript("""
+            CREATE TABLE session_part (
+                message_id TEXT NOT NULL REFERENCES session_message(id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL REFERENCES session_v2(id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL, type TEXT NOT NULL, call_id TEXT,
+                time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL, PRIMARY KEY (message_id, ordinal));
+        """)
+        for ordinal, part in reversed(list(enumerate(assistant["content"]))):
+            stamp = fixture.stamp()
+            db.execute(
+                "INSERT INTO session_part VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "msg_assistant",
+                    "ses_v2",
+                    ordinal * 10,
+                    part["type"],
+                    part.get("id"),
+                    stamp,
+                    stamp,
+                    json.dumps(part),
+                ),
+            )
+        db.execute(
+            "UPDATE session_message SET data = ?, time_updated = ? WHERE id = 'msg_assistant'",
+            (json.dumps({**assistant, "content": []}), fixture.stamp()),
+        )
+    separate = imported()
+    require(separate == after, "separate v2 parts lost content, order, or event IDs")
+    require(
+        not case.search("reasonbeacon", "--events")["results"],
+        "separate v2 parts made thinking searchable",
+    )
+    for secret in ("reasonbeacon", "v2-signature", "v2-data", "empty-signature"):
+        require(secret not in json.dumps(separate),
+                f"separate V2 parts exposed thinking payload: {secret}")
+
+    message(
+        "msg_inline",
+        "assistant",
+        {"content": [{"type": "text", "text": "inlinebeacon Inline fallback."}]},
+        90,
+    )
+    imported()
+    require(
+        case.search("inlinebeacon", "--events")["results"],
+        "part table suppressed an assistant without separate parts",
+    )
+
+    with sqlite3.connect(fixture.path) as db:
+        db.execute(
+            "UPDATE session_message SET data = ?, time_updated = ? WHERE id = 'msg_assistant'",
+            (
+                json.dumps(
+                    {
+                        **assistant,
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "stalebeacon Stale inline content.",
+                            }
+                        ],
+                    }
+                ),
+                fixture.stamp(),
+            ),
+        )
+    imported()
+    require(
+        not case.search("stalebeacon", "--events")["results"],
+        "inline content overrode separate parts",
+    )
+    case.json_command(
+        "sources", "add", "parts", "--provider", "opencode", "--root", fixture.path
+    )
+
+    # Only child rows change: parent message stamps and payload stay untouched.
+    replacement = {"type": "text", "text": "revisedbeacon Revised answer."}
+    tool = {
+        **assistant["content"][3],
+        "state": {
+            "status": "completed",
+            "input": {"filePath": "src/main.rs"},
+            "content": [{"type": "text", "text": "revisedoutputbeacon Revised file."}],
+        },
+    }
+    with sqlite3.connect(fixture.path) as db:
+        for ordinal, part in [(20, replacement), (30, tool)]:
+            db.execute(
+                "UPDATE session_part SET data = ?, time_updated = ? "
+                "WHERE message_id = 'msg_assistant' AND ordinal = ?",
+                (json.dumps(part), fixture.stamp(), ordinal),
+            )
+    require(
+        case.search("revisedbeacon", "--events", refresh="wait")["results"],
+        "refresh missed part-only edits",
+    )
+    revised = case.json_command("show", "session", "ses_v2")["events"]
+    require(
+        not case.search("answerbeacon", "--events")["results"],
+        "part-only edit kept old assistant text",
+    )
+    require(
+        not case.search("outputbeacon", "--events", "--content-scope", "outputs")[
+            "results"
+        ],
+        "part-only edit kept old tool output",
+    )
+    require(
+        case.search("revisedoutputbeacon", "--events", "--content-scope", "outputs")[
+            "results"
+        ],
+        "part-only edit missed new tool output",
+    )
+    require(
+        {
+            e["trwl_event_id"]
+            for e in revised
+            if e["event_type"] == "tool_call"
+            and e["provider_event_id"] == "msg_assistant"
+        }
+        == {e["trwl_event_id"] for e in calls},
+        "part-only edit changed tool-call identities",
+    )
+
+    with sqlite3.connect(fixture.path) as db:
+        stamp = fixture.stamp()
+        db.execute(
+            "INSERT INTO session_part VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "msg_assistant",
+                "ses_v2",
+                5,
+                "text",
+                None,
+                stamp,
+                stamp,
+                json.dumps({"type": "text", "text": "insertbeacon Inserted text."}),
+            ),
+        )
+        db.execute(
+            "DELETE FROM session_part WHERE message_id = 'msg_assistant' AND ordinal = 30"
+        )
+    require(
+        case.search("insertbeacon", "--events", refresh="wait")["results"],
+        "part-only insertion was missed",
+    )
+    changed = case.json_command("show", "session", "ses_v2")["events"]
+    require(
+        not case.search(
+            "revisedoutputbeacon", "--events", "--content-scope", "outputs"
+        )["results"],
+        "deleted part left tool output searchable",
+    )
+    require(
+        len(
+            [
+                e
+                for e in changed
+                if e["event_type"] == "tool_call"
+                and e["provider_event_id"] == "msg_assistant"
+            ]
+        )
+        == 1,
+        "deleted part left a tool call",
+    )
+    require(
+        [e["sequence"] for e in changed] == list(range(len(changed))),
+        "part insertion/deletion broke suffix sequences",
+    )
+    require(imported() == changed, "unchanged separate parts changed the transcript")
+    case.env["XDG_DATA_HOME"] = str(case.root / "parts-fresh-data")
+    require(
+        imported() == changed, "incremental separate parts differ from fresh import"
+    )
+    with sqlite3.connect(fixture.path) as db:
+        db.execute("DELETE FROM session_part WHERE message_id = 'msg_assistant'")
+    imported()
+    require(
+        not case.search("revisedbeacon", "--events")["results"]
+        and not case.search("insertbeacon", "--events")["results"],
+        "deleting all separate parts left stale assistant content",
+    )
+    require(
+        case.search("stalebeacon", "--events")["results"],
+        "deleting all parts did not restore inline fallback",
+    )
+    case.check(
+        "separate v2 parts preserve content and IDs; child edits, insertions, and deletions refresh"
     )
