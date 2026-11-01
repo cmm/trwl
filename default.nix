@@ -5,8 +5,6 @@
   rustPlatform,
   versionCheckHook,
   python3,
-  git,
-  time,
   intel-compute-runtime,
   stdenv,
   callPackage,
@@ -37,9 +35,7 @@ let
         ./Cargo.toml
         ./Cargo.lock
         ./LICENSE
-        ./skills
         ./src
-        ./tests
       ];
     };
     cargoLock.lockFile = ./Cargo.lock;
@@ -61,8 +57,6 @@ stdenv.mkDerivation {
   nativeInstallCheckInputs = [
     versionCheckHook
     python3
-    git
-    time
   ];
   installPhase = ''
     runHook preInstall
@@ -80,11 +74,7 @@ stdenv.mkDerivation {
     chmod -R u+w tests
     patchShebangs tests
     tests/e2e.py --binary "$out/bin/trwl" \
-      --case discovery --case retrieval --case opencode-v2 --case selection --case workspaces --case updates \
-      --case refresh-restart --case hybrid-grouping --case semantic-cache
-    tests/test-perf-compare.py
-    tests/test-perf-runner.py
-    tests/test-realm-corpus.py
+      --case semantic-passive
   '';
 
   passthru = {

@@ -37,6 +37,14 @@ impl Config {
                 .context("indexing.mode must be a string")?
                 .parse::<IndexMode>()?;
         }
+        if let Some(rebuild) = document
+            .get("indexing")
+            .and_then(|table| table.get("rebuild_incompatible"))
+        {
+            rebuild
+                .as_bool()
+                .context("indexing.rebuild_incompatible must be a boolean")?;
+        }
         Ok(Self {
             directories: directories.clone(),
             document,
@@ -57,6 +65,10 @@ impl Config {
 
     pub fn automatic(&self) -> bool {
         self.mode() == IndexMode::Auto
+    }
+
+    pub fn rebuild_incompatible(&self) -> bool {
+        self.flag("indexing", "rebuild_incompatible", false)
     }
 
     pub fn mode(&self) -> IndexMode {

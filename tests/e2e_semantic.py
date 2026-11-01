@@ -10,6 +10,7 @@ import sqlite3
 import struct
 import time
 from collections import Counter
+from contextlib import closing
 from pathlib import Path
 
 from e2e_support import (
@@ -70,17 +71,27 @@ def executor_reuse(case):
     case.env["ORT_DYLIB_PATH"] = str(case.root / "missing-runtime.so")
     try:
         failed = case.command(
-            "search", QUERY, "--events", "--backend", "semantic", "--refresh", "off",
+            "search",
+            QUERY,
+            "--events",
+            "--backend",
+            "semantic",
+            "--refresh",
+            "off",
             expect_failure=True,
         )
-        require("missing-runtime.so" in failed.stderr,
-                "runtime switch did not attempt to load the requested library")
+        require(
+            "missing-runtime.so" in failed.stderr,
+            "runtime switch did not attempt to load the requested library",
+        )
     finally:
         case.env.pop("ORT_DYLIB_PATH", None)
         case.command("daemon", "stop")
     query()
     pid_file, pid = worker()
-    case.check("a warm inference server cannot override the client's ONNX runtime selection")
+    case.check(
+        "a warm inference server cannot override the client's ONNX runtime selection"
+    )
 
     data_home = case.env["XDG_DATA_HOME"]
     copied_home = case.root / "copied-data"
@@ -341,7 +352,7 @@ def device_policy(case):
     case.check("worker releases its lock on exit; competing full builds finish on CPU")
 
     database = case.cache / "semantic/cache.sqlite3"
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         total = connection.execute("SELECT count(*) FROM vectors").fetchone()[0]
         require(total > 1, "resume fixture needs multiple vectors")
         connection.executescript("""
@@ -357,7 +368,7 @@ def device_policy(case):
         "embedding update using " in resumed.stderr,
         "resumed build lost GPU eligibility",
     )
-    with sqlite3.connect(database) as connection:
+    with closing(sqlite3.connect(database)) as connection, connection:
         # Resumption restores the missing vector without rewriting completed ones.
         require(
             connection.execute("SELECT count(*) FROM test_vector_writes").fetchone()[0]
@@ -404,7 +415,7 @@ def device_policy(case):
     for number in range(40):
         fixture.message(SESSION, f"msg_heavy_{number}", text)
     case.command("setup", "--wait", timeout=180)
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         for number in range(40):
             db.execute(
                 "UPDATE part SET data=?, time_updated=? WHERE id=?",
@@ -418,7 +429,7 @@ def device_policy(case):
     require(
         "opening GPU lock" in heavy.stderr, "heavy incremental fill did not try GPU"
     )
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute("DELETE FROM part WHERE message_id LIKE 'msg_heavy_%'")
         db.execute("DELETE FROM message WHERE id LIKE 'msg_heavy_%'")
     case.command("setup", "--wait")
@@ -680,7 +691,7 @@ def semantic(case):
             fixture.message(changed_session, "msg_semantic_changes", body)
         else:
             stamp = fixture.stamp()
-            with sqlite3.connect(fixture.path) as db:
+            with closing(sqlite3.connect(fixture.path)) as db, db:
                 db.execute(
                     "UPDATE part SET data = ?, time_updated = ? WHERE message_id = ?",
                     (
@@ -736,7 +747,7 @@ def semantic(case):
     )
 
     stamp = fixture.stamp()
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute("DELETE FROM part WHERE message_id = ?", ("msg_semantic_changes",))
         db.execute("DELETE FROM message WHERE id = ?", ("msg_semantic_changes",))
         db.execute(

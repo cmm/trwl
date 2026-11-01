@@ -275,6 +275,7 @@ indexing with built-in embeddings:
 ```toml
 [indexing]
 mode = "auto"
+rebuild_incompatible = false
 
 [sources]
 automatic = true
@@ -298,9 +299,9 @@ Nix package or configured at build time for a Cargo installation.
 Indexes and exports contain private session history data, so access to
 files created by trwl is restricted to the current user.
 
-If trwl reports an incompatible history index, remove (or move aside) the data
-directory's `index/` and re-setup or re-build as appropriate. There
-is no automatic rebuild at the moment.
+Enable `indexing.rebuild_incompatible` to rebuild obsolete indexes from your
+history files after upgrades. With it disabled (the default), move the data
+directory's `index/` aside and run `trwl setup --wait`.
 
 # Motivation
 

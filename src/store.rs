@@ -36,10 +36,11 @@ use serde_json::{Value, json};
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
+    ffi::CString,
     fs::{self, File},
     hash::Hash,
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    os::unix::fs::MetadataExt,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
 };
 use tantivy::{
@@ -129,6 +130,52 @@ struct Change {
 const CHECKPOINT_ID: &str = "input-checkpoint";
 
 const RECORD_VERSION: u32 = 6;
+
+#[derive(Debug)]
+enum IncompatibleHistory {
+    Schema(PathBuf),
+    Records,
+}
+
+impl std::fmt::Display for IncompatibleHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Schema(path) => write!(
+                f,
+                "incompatible history index at {}; move that directory aside, then re-import your sources",
+                path.display()
+            ),
+            Self::Records => f.write_str(
+                "incompatible history records; move the index directory aside, then re-import your sources",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IncompatibleHistory {}
+
+fn check_schema(index: &Index, expected: &Schema, path: &Path) -> Result<()> {
+    if index.schema() != *expected {
+        return Err(IncompatibleHistory::Schema(path.into()).into());
+    }
+    Ok(())
+}
+
+pub(crate) fn incompatible(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<IncompatibleHistory>()
+            || matches!(
+                cause.downcast_ref::<tantivy::TantivyError>(),
+                Some(tantivy::TantivyError::IncompatibleIndex(_))
+            )
+            || matches!(
+                cause.downcast_ref::<tantivy::directory::error::OpenReadError>(),
+                Some(tantivy::directory::error::OpenReadError::IncompatibleIndex(
+                    _
+                ))
+            )
+    })
+}
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     #[serde(default)]
@@ -156,10 +203,9 @@ fn decode_manifest(payload: Option<&str>) -> Result<Manifest> {
         .transpose()
         .context("invalid source manifest")?
         .unwrap_or_default();
-    ensure!(
-        manifest.record_version == RECORD_VERSION,
-        "incompatible history records; move the index directory aside, then re-import your sources"
-    );
+    if manifest.record_version != RECORD_VERSION {
+        return Err(IncompatibleHistory::Records.into());
+    }
     Ok(manifest)
 }
 
@@ -590,11 +636,7 @@ impl ReadIndex {
         }
         let index = Index::open_in_dir(&path)?;
         let (expected, fields) = schema();
-        ensure!(
-            index.schema() == expected,
-            "incompatible history index at {}; move that directory aside, then re-import your sources",
-            path.display()
-        );
+        check_schema(&index, &expected, &path)?;
         let reader: tantivy::IndexReader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
@@ -1343,11 +1385,7 @@ pub fn semantic_version(root: &Path) -> Result<Option<String>> {
         return Ok(None);
     }
     let index = Index::open_in_dir(&path)?;
-    ensure!(
-        index.schema() == schema().0,
-        "incompatible history index at {}; move that directory aside, then re-import your sources",
-        path.display()
-    );
+    check_schema(&index, &schema().0, &path)?;
     let meta = index.load_metas()?;
     Ok(Some(conversation_version(
         &decode_manifest(meta.payload.as_deref())?
@@ -1584,11 +1622,7 @@ pub fn status(config: &Config) -> Result<LexicalStatus> {
     let initialized = path.join("meta.json").try_exists()?;
     let (manifest, events) = if initialized {
         let index = Index::open_in_dir(&path)?;
-        ensure!(
-            index.schema() == schema().0,
-            "incompatible history index at {}; move that directory aside, then re-import your sources",
-            path.display()
-        );
+        check_schema(&index, &schema().0, &path)?;
         // Counts and source stamps must describe the same published commit.
         let meta = index.load_metas()?;
         let manifest = decode_manifest(meta.payload.as_deref())?;
@@ -1731,22 +1765,71 @@ fn update_with_parser(
         );
     }
     let path = config.directories.data.join("index");
-    fs::create_dir_all(&path)?;
+    match update_index(config, sources, &path, full, &mut parse) {
+        Err(error) if config.rebuild_incompatible() && incompatible(&error) => {
+            // Rebuilding an entire index must include configured histories even
+            // when this invocation requested only one explicit input.
+            let mut rebuild_sources = config.sources()?;
+            rebuild_sources.extend_from_slice(sources);
+            let staging = tempfile::Builder::new()
+                .prefix(".index-rebuild-")
+                .tempdir_in(&config.directories.data)?;
+            let report = update_index(config, &rebuild_sources, staging.path(), true, &mut parse)?;
+            if report.completed() {
+                // The update lock covers both the build and publication. Exchange
+                // directories atomically so a crash cannot leave the index absent.
+                exchange_directories(staging.path(), &path)?;
+                File::open(&config.directories.data)?.sync_all()?;
+                // After the exchange this directory contains the obsolete index.
+                staging.close().context("removing obsolete history index")?;
+            }
+            Ok(report)
+        }
+        result => result,
+    }
+}
+
+fn exchange_directories(left: &Path, right: &Path) -> Result<()> {
+    let left = CString::new(left.as_os_str().as_bytes())?;
+    let right = CString::new(right.as_os_str().as_bytes())?;
+    // Both paths are NUL-terminated and remain alive for the system call.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("publishing rebuilt history index");
+    }
+    Ok(())
+}
+
+fn update_index(
+    config: &Config,
+    sources: &[Source],
+    path: &Path,
+    full: bool,
+    parse: &mut impl FnMut(
+        Provider,
+        &Path,
+        Option<&providers::Checkpoint>,
+        &mut dyn FnMut(&Record) -> Result<()>,
+    ) -> Result<providers::Parsed>,
+) -> Result<ImportReport> {
+    fs::create_dir_all(path)?;
     let (schema, fields) = schema();
     let index = if path.join("meta.json").exists() {
-        Index::open_in_dir(&path)?
+        Index::open_in_dir(path)?
     } else {
-        Index::create_in_dir(&path, schema.clone())?
+        Index::create_in_dir(path, schema.clone())?
     };
-    ensure!(
-        index.schema() == schema,
-        "incompatible history index at {}; move that directory aside, then re-import your sources",
-        path.display()
-    );
+    check_schema(&index, &schema, path)?;
     let meta = index.load_metas()?;
     let mut manifest = decode_manifest(meta.payload.as_deref())?;
-    // Also collect forgotten files when no source has changed and no writer is needed.
-    remove_orphaned_files(&index, &path)?;
     let previous_version = manifest.semantic_version.clone().unwrap_or_else(|| {
         segment_version(
             meta.segments
@@ -1761,6 +1844,9 @@ fn update_with_parser(
         .reload_policy(ReloadPolicy::Manual)
         .try_into()?
         .searcher();
+    // The reader checks segment compatibility before any files are removed.
+    // Also collect forgotten files when no source has changed and no writer is needed.
+    remove_orphaned_files(&index, path)?;
     let plan = plan_inputs(sources, &manifest);
     let mut failed = !plan.errors.is_empty();
     let mut reports: Vec<_> = plan.errors.into_iter().map(ImportSource::Failed).collect();
@@ -1791,13 +1877,7 @@ fn update_with_parser(
             _ => Ok(None),
         };
         let parsed = previous.and_then(|previous| {
-            stage_input(
-                &input,
-                previous,
-                &mut spool,
-                &config.directories,
-                &mut parse,
-            )
+            stage_input(&input, previous, &mut spool, &config.directories, parse)
         });
         match parsed {
             Ok((parsed, range, unchanged)) => {

@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 from e2e_support import OpenCodeFixture, codex_fixture, git, require
@@ -133,7 +134,7 @@ def selection(case):
         },
     )
     # Provider timestamps put real matching records on both sides of --since.
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute(
             "UPDATE session SET directory = ? WHERE id = ?", (str(other_work), other)
         )
@@ -454,7 +455,7 @@ def updates(case):
         "append appears in full; original IDs/content and unrelated history remain"
     )
 
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         stamp = fixture.stamp()
         db.execute(
             "UPDATE part SET data = ?, time_updated = ? WHERE id = ?",
@@ -483,7 +484,7 @@ def updates(case):
         "edit replaces complete content; unchanged IDs/text and unrelated history remain"
     )
 
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute("DELETE FROM part WHERE message_id = ?", ("msg_delete",))
         db.execute("DELETE FROM message WHERE id = ?", ("msg_delete",))
         db.execute(
@@ -568,7 +569,7 @@ def updates(case):
     # row. Suffix updates must resume event sequences and rejection diagnostics,
     # not infer either from the number of native rows they skip.
     fixture.part(session, "msg_edit", "prefix_bad_part", {})
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute("UPDATE part SET data = '{' WHERE id = 'prefix_bad_part'")
     fixture.part(
         session,
@@ -607,7 +608,7 @@ def updates(case):
     tool["state"].update(
         status="completed", output="poolresultbeacon Active connections: 12."
     )
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute(
             "UPDATE part SET data = ?, time_updated = ? WHERE id = 'part_tool'",
             (json.dumps(tool), fixture.stamp()),
@@ -621,7 +622,7 @@ def updates(case):
     require(_events(case, "poolresultbeacon"), "completed tool output is missing")
 
     # One source can append to one session and replace another in the same import.
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute(
             "UPDATE part SET data = ?, time_updated = ? WHERE id = 'part_msg_sibling'",
             (
@@ -643,13 +644,13 @@ def updates(case):
         "000_earlier_part",
         {"type": "text", "text": "earlierbeacon Insert before the saved tail."},
     )
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute(
             "UPDATE part SET time_created = (SELECT time_created FROM part WHERE id = 'part_tool') WHERE id = '000_earlier_part'"
         )
     matches_full_import()
 
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute(
             "UPDATE message SET data = ?, time_updated = ? WHERE id = 'msg_tool'",
             (json.dumps({"role": "user"}), fixture.stamp()),
@@ -663,20 +664,20 @@ def updates(case):
     matches_full_import()
 
     fixture.part(session, "msg_metadata_tail", "bad_part", {})
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute("UPDATE part SET data = '{' WHERE id = 'bad_part'")
     matches_full_import()
     fixture.message(
         session, "msg_after_bad", "rejectiontailbeacon Append after a rejected part."
     )
     matches_full_import()
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute("DELETE FROM part WHERE id = 'bad_part'")
     matches_full_import()
 
     # Truncating inside the unchanged beginning must remove all later indexed
     # events even though no new native row is available to emit at the old end.
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute(
             "DELETE FROM part WHERE session_id = ? AND time_created >= "
             "(SELECT time_created FROM part WHERE id = 'part_msg_prefix_100')",

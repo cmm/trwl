@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import tempfile
+import time
 import traceback
 from pathlib import Path
 
@@ -18,6 +19,13 @@ from e2e_live import busy_source, many_inputs, semantic_live, semantic_recovery
 from e2e_opencode import opencode_v2
 from e2e_processes import interruption, overlap, refresh_restart
 from e2e_providers import provider_cases
+from e2e_rebuild import (
+    index_rebuild,
+    rebuild_background,
+    rebuild_failure,
+    rebuild_semantic,
+    rebuild_takeover,
+)
 from e2e_retrieval import retrieval
 from e2e_semantic import (
     background_semantic,
@@ -52,6 +60,11 @@ CASES = {
     "workspaces": workspaces,
     "updates": updates,
     "index-storage": index_storage,
+    "index-rebuild": index_rebuild,
+    "rebuild-failure": rebuild_failure,
+    "rebuild-background": rebuild_background,
+    "rebuild-takeover": rebuild_takeover,
+    "rebuild-semantic": rebuild_semantic,
     "busy-source": busy_source,
     "many-inputs": many_inputs,
     "jsonl-updates": jsonl_updates,
@@ -141,6 +154,8 @@ def main():
         model_dir = args.model_dir.resolve() if args.model_dir is not None else None
         report["model_dir"] = str(model_dir) if model_dir is not None else None
         for name in selected:
+            started = time.monotonic()
+            print(f"{name}: starting", flush=True)
             case = None
             result = report["cases"][name]
             try:
@@ -172,7 +187,18 @@ def main():
                             cleanup_traceback=traceback.format_exc(),
                         )
                     result["checks"] = case.checks
+                result["elapsed_seconds"] = time.monotonic() - started
                 write_json(root / f"{name}-result.json", result)
+                print(
+                    f"{name}: {result['result']} ({result['elapsed_seconds']:.2f}s)"
+                    + (f" — {result['error']}" if "error" in result else ""),
+                    flush=True,
+                )
+                if "missing_prerequisite" in result:
+                    print(
+                        f"  Missing prerequisite: {result['missing_prerequisite']}",
+                        flush=True,
+                    )
         outcomes = {report["cases"][name]["result"] for name in selected}
         report["result"] = (
             "selected_cases_passed"
@@ -189,16 +215,8 @@ def main():
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
         for name, result in report["cases"].items():
-            print(
-                f"{name}: {result['result']}"
-                + (f" — {result['error']}" if "error" in result else ""),
-                flush=True,
-            )
-            if "missing_prerequisite" in result:
-                print(
-                    f"  Missing prerequisite: {result['missing_prerequisite']}",
-                    flush=True,
-                )
+            if result["result"] == "not_run":
+                print(f"{name}: not_run", flush=True)
         if "error" in report:
             print(f"Runner failed: {report['error']}", flush=True)
         if set(selected) != set(CASES):

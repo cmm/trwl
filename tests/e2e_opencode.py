@@ -9,6 +9,7 @@ It is hand-built, not a recording from a running OpenCode v2 instance.
 
 import json
 import sqlite3
+from contextlib import closing
 
 from e2e_support import OpenCodeFixture, require
 
@@ -20,7 +21,7 @@ def opencode_v2(case):
     case.json_command("import", "--provider", "opencode", "--path", fixture.path)
     legacy = case.json_command("show", "session", "ses_v1")["events"]
 
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.executescript("""
             CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL,
                 parent_id TEXT);
@@ -40,7 +41,7 @@ def opencode_v2(case):
     def message(message_id, kind, data, seq, session="ses_v2"):
         stamp = fixture.stamp()
         data = {"time": {"created": stamp}, **data}
-        with sqlite3.connect(fixture.path) as db:
+        with closing(sqlite3.connect(fixture.path)) as db, db:
             db.execute(
                 "INSERT INTO session_message VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (message_id, session, kind, seq, stamp, stamp, json.dumps(data)),
@@ -69,7 +70,7 @@ def opencode_v2(case):
     # V2's seq orders messages even when IDs, insertion order, and tied
     # timestamps would otherwise put this inserted message after msg_user.
     message("msg_z_early", "user", {"text": "earliestbeacon Inserted earlier."}, 0)
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute(
             "UPDATE session_message SET time_created = "
             "(SELECT time_created FROM session_message WHERE id = 'msg_user') "
@@ -200,7 +201,7 @@ def opencode_v2(case):
     assistant["content"].insert(
         0, {"type": "text", "text": "prefacebeacon New preface."}
     )
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute(
             "UPDATE session_message SET data = ?, time_updated = ? WHERE id = ?",
             (json.dumps(assistant), fixture.stamp(), "msg_assistant"),
@@ -232,7 +233,7 @@ def opencode_v2(case):
         "streaming tools complete with stable IDs, searchable output/errors, and a resequenced suffix"
     )
 
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute(
             "INSERT INTO session_v2 VALUES (?, ?, ?)",
             ("ses_child", str(case.work), "ses_v2"),
@@ -261,22 +262,44 @@ def opencode_v2(case):
     message(
         "msg_compact_empty",
         "compaction",
-        {"status": "completed", "reason": "auto", "summary": "", "native": {"messages": []}},
+        {
+            "status": "completed",
+            "reason": "auto",
+            "summary": "",
+            "native": {"messages": []},
+        },
         83,
     )
-    message("msg_after_compact", "user", {"text": "aftercompactbeacon Continue work."}, 84)
+    message(
+        "msg_after_compact", "user", {"text": "aftercompactbeacon Continue work."}, 84
+    )
     attempts = [
-        ("running", {"status": "running", "summary": "runningcompactbeacon Partial summary."}),
-        ("unknown", {"status": "unknown", "summary": "unknowncompactbeacon Partial summary."}),
+        (
+            "running",
+            {"status": "running", "summary": "runningcompactbeacon Partial summary."},
+        ),
+        (
+            "unknown",
+            {"status": "unknown", "summary": "unknowncompactbeacon Partial summary."},
+        ),
         ("missing", {"summary": "missingcompactbeacon Partial summary."}),
-        ("failed", {"status": "failed", "error": {
-            "_tag": "UnknownError", "message": "failedcompactbeacon Compaction was not applied."
-        }}),
+        (
+            "failed",
+            {
+                "status": "failed",
+                "error": {
+                    "_tag": "UnknownError",
+                    "message": "failedcompactbeacon Compaction was not applied.",
+                },
+            },
+        ),
     ]
     for index, (outcome, data) in enumerate(attempts, 85):
         message(f"msg_compact_{outcome}", "compaction", data, index)
     with_compactions = imported()
-    compact = next(e for e in with_compactions if e["provider_event_id"] == "msg_compact")
+    compact = next(
+        e for e in with_compactions if e["provider_event_id"] == "msg_compact"
+    )
     empty_compact = next(
         e for e in with_compactions if e["provider_event_id"] == "msg_compact_empty"
     )
@@ -295,48 +318,71 @@ def opencode_v2(case):
     require(
         [
             hit["trwl_event_id"]
-            for hit in case.search("summarybeacon", "--events", "--event-type", "compaction")["results"]
-        ] == [compact["trwl_event_id"]],
+            for hit in case.search(
+                "summarybeacon", "--events", "--event-type", "compaction"
+            )["results"]
+        ]
+        == [compact["trwl_event_id"]],
         "v2 compaction summary is not searchable as a compaction event",
     )
     require(imported() == with_compactions, "unchanged v2 import changed compactions")
-    case.check("v2 summaries and text-free compaction boundaries keep their native content and kind")
+    case.check(
+        "v2 summaries and text-free compaction boundaries keep their native content and kind"
+    )
     require(
         [
             event["trwl_event_id"]
             for event in case.json_command(
                 "list", "events", "--session", "ses_v2", "--event-type", "compaction"
             )["events"]
-        ] == [compact["trwl_event_id"], empty_compact["trwl_event_id"]],
+        ]
+        == [compact["trwl_event_id"], empty_compact["trwl_event_id"]],
         "v2 unsuccessful or incomplete compaction became a boundary",
     )
     for outcome, data in attempts:
         event = next(
-            event for event in with_compactions
+            event
+            for event in with_compactions
             if event["provider_event_id"] == f"msg_compact_{outcome}"
         )
         body = data.get("summary", data.get("error", {}).get("message"))
         require(
             event["event_type"] == "metadata"
             and body in event["text"]
-            and all(event["structured_content"][key] == value for key, value in data.items()),
+            and all(
+                event["structured_content"][key] == value for key, value in data.items()
+            ),
             f"v2 {outcome} compaction lost its metadata or native content",
         )
         require(
             [
-                hit["trwl_event_id"] for hit in case.search(
-                    body.split()[0], "--events", "--session", "ses_v2", "--event-type", "metadata"
+                hit["trwl_event_id"]
+                for hit in case.search(
+                    body.split()[0],
+                    "--events",
+                    "--session",
+                    "ses_v2",
+                    "--event-type",
+                    "metadata",
                 )["results"]
-            ] == [event["trwl_event_id"]],
+            ]
+            == [event["trwl_event_id"]],
             f"v2 {outcome} compaction text is not searchable as metadata",
         )
     require(
         case.search(
-            "aftercompactbeacon", "--events", "--session", "ses_v2", "--after-compaction", "latest"
+            "aftercompactbeacon",
+            "--events",
+            "--session",
+            "ses_v2",
+            "--after-compaction",
+            "latest",
         )["results"],
         "v2 latest boundary selection used a later unsuccessful compaction",
     )
-    case.check("v2 running, failed, unknown-status and status-free compactions remain metadata and do not advance latest")
+    case.check(
+        "v2 running, failed, unknown-status and status-free compactions remain metadata and do not advance latest"
+    )
     child = case.json_command("show", "session", "ses_child")["events"][0]
     require(
         child["parent_trwl_session_id"] == user["trwl_session_id"],
@@ -350,7 +396,7 @@ def opencode_v2(case):
     ):
         require(case.search(marker, "--events")["results"], f"missing {marker}")
 
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute("DELETE FROM session_message WHERE id = 'msg_tail_00'")
         db.execute("DELETE FROM session_v2 WHERE id = 'ses_child'")
         db.execute(
@@ -379,7 +425,7 @@ def opencode_v2(case):
     )
 
     # OpenCode migrates into session_v2 while keeping the v1 rows and session ID.
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute(
             "INSERT INTO session_v2 VALUES (?, ?, NULL)", ("ses_v1", str(case.work))
         )
@@ -398,7 +444,7 @@ def opencode_v2(case):
         and migrated[0]["provider_event_id"] == "msg_migrated",
         "migration duplicated the transcript or lost session identity",
     )
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute("DELETE FROM session_message WHERE session_id = 'ses_v1'")
     imported()
     require(
@@ -410,7 +456,7 @@ def opencode_v2(case):
     )
 
     # A v2-only database must not need empty legacy tables to parse successfully.
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         for table in ("part", "message", "session"):
             db.execute(f"DROP TABLE {table}")
     require(imported() == after, "dropping legacy tables changed v2 history")
@@ -422,7 +468,7 @@ def opencode_v2(case):
 
     # OpenCode 2.2.5 session/history.ts withParts restores data.content from
     # session_part in ordinal order, falling back to inline content without parts.
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.executescript("""
             CREATE TABLE session_part (
                 message_id TEXT NOT NULL REFERENCES session_message(id) ON DELETE CASCADE,
@@ -457,8 +503,10 @@ def opencode_v2(case):
         "separate v2 parts made thinking searchable",
     )
     for secret in ("reasonbeacon", "v2-signature", "v2-data", "empty-signature"):
-        require(secret not in json.dumps(separate),
-                f"separate V2 parts exposed thinking payload: {secret}")
+        require(
+            secret not in json.dumps(separate),
+            f"separate V2 parts exposed thinking payload: {secret}",
+        )
 
     message(
         "msg_inline",
@@ -472,7 +520,7 @@ def opencode_v2(case):
         "part table suppressed an assistant without separate parts",
     )
 
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute(
             "UPDATE session_message SET data = ?, time_updated = ? WHERE id = 'msg_assistant'",
             (
@@ -509,7 +557,7 @@ def opencode_v2(case):
             "content": [{"type": "text", "text": "revisedoutputbeacon Revised file."}],
         },
     }
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         for ordinal, part in [(20, replacement), (30, tool)]:
             db.execute(
                 "UPDATE session_part SET data = ?, time_updated = ? "
@@ -548,7 +596,7 @@ def opencode_v2(case):
         "part-only edit changed tool-call identities",
     )
 
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         stamp = fixture.stamp()
         db.execute(
             "INSERT INTO session_part VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -598,7 +646,7 @@ def opencode_v2(case):
     require(
         imported() == changed, "incremental separate parts differ from fresh import"
     )
-    with sqlite3.connect(fixture.path) as db:
+    with closing(sqlite3.connect(fixture.path)) as db, db:
         db.execute("DELETE FROM session_part WHERE message_id = 'msg_assistant'")
     imported()
     require(

@@ -50,13 +50,31 @@ const DAEMON_LOCK: &str = "daemon.lock";
 // namespaces still coordinate. Holding the stop lock requests shutdown without
 // leaving a stale request after the requesting process exits.
 const DAEMON_STOP: &str = "daemon-stop.lock";
+// Serialize takeover decisions with daemon ownership and version publication.
+const DAEMON_START: &str = "daemon-start.lock";
 // Failed fills start with a two-second retry delay and double up to this cap.
 // A configuration edit retries at once.
 const EMBEDDING_RETRY_CAP: Duration = Duration::from_secs(300);
 
 fn start_daemon(config: &Config) -> Result<()> {
-    if !config.automatic() || daemon_running(&config.directories.data)? {
+    if !config.automatic() {
         return Ok(());
+    }
+    let _startup = config::lock(&config.directories.data, DAEMON_START)?;
+    if daemon_running(&config.directories.data)? {
+        // A daemon from an older executable may keep accepting the old format.
+        // Do not interrupt a current daemon while it is rebuilding that index.
+        let current = fs::read_to_string(config.directories.data.join(DAEMON_LOCK))
+            .is_ok_and(|version| version == env!("CARGO_PKG_VERSION"));
+        if !config.rebuild_incompatible()
+            || current
+            || !store::ReadIndex::open(&config.directories.data)
+                .err()
+                .is_some_and(|error| store::incompatible(&error))
+        {
+            return Ok(());
+        }
+        stop_daemon(&config.directories)?;
     }
     fs::create_dir_all(&config.directories.state)?;
     let log = OpenOptions::new()
@@ -102,9 +120,13 @@ fn stop_daemon(directories: &Directories) -> Result<()> {
 }
 
 fn run_daemon(directories: &Directories, interval: u64) -> Result<()> {
-    let Some(_guard) = config::try_lock(&directories.data, DAEMON_LOCK)? else {
+    let startup = config::lock(&directories.data, DAEMON_START)?;
+    let Some(mut guard) = config::try_lock(&directories.data, DAEMON_LOCK)? else {
         return Ok(());
     };
+    guard.set_len(0)?;
+    guard.write_all(env!("CARGO_PKG_VERSION").as_bytes())?;
+    drop(startup);
     let mut embedding = EmbeddingUpdater::default();
     // Exiting ends the embedding thread with the process; an interrupted fill
     // keeps completed batches and the next updater resumes it.

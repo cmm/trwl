@@ -5,6 +5,7 @@ import json
 import sqlite3
 import threading
 from collections.abc import Callable
+from contextlib import closing
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from e2e_providers import copilot_records, write_jsonl
@@ -299,7 +300,7 @@ def semantic_cache(case):
         def no_transaction_during_inference(_path, _model, texts):
             nonlocal probed_documents
             if database.exists():
-                with sqlite3.connect(database, timeout=0) as db:
+                with closing(sqlite3.connect(database, timeout=0)) as db, db:
                     db.execute("BEGIN IMMEDIATE")
                     db.execute("UPDATE selections SET touched=touched+1")
                     db.commit()
@@ -325,7 +326,7 @@ def semantic_cache(case):
             [req["texts"] for req in api.requests[before:]] == [["cachebeacon"]],
             "unchanged fill re-embedded history",
         )
-        with sqlite3.connect(database) as db:
+        with closing(sqlite3.connect(database)) as db, db:
             db.execute(
                 "DELETE FROM vectors WHERE key=(SELECT key FROM vectors ORDER BY key LIMIT 1)"
             )
@@ -337,7 +338,7 @@ def semantic_cache(case):
             and len(partial["results"]) == 1,
             "missing vector coverage was hidden",
         )
-        with sqlite3.connect(database) as db:
+        with closing(sqlite3.connect(database)) as db, db:
             db.execute("UPDATE selections SET touched=0")
         fallback = case.search(
             "cachebeacon", "--events", backend="hybrid", refresh="off"
@@ -375,12 +376,12 @@ def semantic_cache(case):
             case.command("setup", "--wait")
 
         def plans():
-            with sqlite3.connect(database) as db:
+            with closing(sqlite3.connect(database)) as db, db:
                 return dict(db.execute("SELECT event,input FROM prepared"))
 
         original = plans()
         require(len(original) == 2, "prepared plans were not persisted")
-        with sqlite3.connect(database) as db:
+        with closing(sqlite3.connect(database)) as db, db:
             db.execute("CREATE TABLE test_plan_writes (kind TEXT)")
             for table in ("documents", "chunks", "prepared"):
                 for operation in ("INSERT", "UPDATE", "DELETE"):
@@ -422,7 +423,7 @@ def semantic_cache(case):
             plans() == original and len(api.requests) == before,
             "selected-only update changed semantic input",
         )
-        with sqlite3.connect(fixture.path) as db:
+        with closing(sqlite3.connect(fixture.path)) as db, db:
             db.execute(
                 "UPDATE part SET data=?, time_updated=? WHERE id='detail'",
                 (
@@ -447,7 +448,7 @@ def semantic_cache(case):
             "semantic snippets exposed additional parts",
         )
         before = len(api.requests)
-        with sqlite3.connect(database) as db:
+        with closing(sqlite3.connect(database)) as db, db:
             require(
                 db.execute("SELECT count(*) FROM test_plan_writes").fetchone()[0] == 0,
                 "unchanged plan rows were rewritten",
@@ -474,7 +475,7 @@ def semantic_cache(case):
         moved.mkdir()
         git(moved, "init", "--quiet")
         before = len(api.requests)
-        with sqlite3.connect(fixture.path) as db:
+        with closing(sqlite3.connect(fixture.path)) as db, db:
             db.execute(
                 "UPDATE session SET directory=?, time_updated=?",
                 (str(moved), fixture.stamp()),
@@ -509,7 +510,7 @@ def semantic_cache(case):
             "old workspace retained semantic results",
         )
 
-        with sqlite3.connect(fixture.path) as db:
+        with closing(sqlite3.connect(fixture.path)) as db, db:
             db.execute("DELETE FROM part WHERE message_id='first'")
             db.execute("DELETE FROM message WHERE id='first'")
         refresh()
@@ -523,7 +524,7 @@ def semantic_cache(case):
             refresh="off",
         )["results"]
         require(len(remaining) == 1, "deleted message retained its semantic result")
-        with sqlite3.connect(database) as db:
+        with closing(sqlite3.connect(database)) as db, db:
             require(
                 db.execute("SELECT count(*) FROM vectors").fetchone()[0] == 1,
                 "deleted message retained unreferenced vectors",
@@ -531,7 +532,7 @@ def semantic_cache(case):
             db.execute("DELETE FROM test_plan_writes")
             db.execute("UPDATE selections SET touched=0")
         case.json_command("semantic", "status")
-        with sqlite3.connect(database) as db:
+        with closing(sqlite3.connect(database)) as db, db:
             require(
                 db.execute(
                     "SELECT count(*) FROM test_plan_writes WHERE kind='prepared_DELETE'"

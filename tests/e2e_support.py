@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import time
 import traceback
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -369,7 +370,7 @@ class OpenCodeFixture:
         self.path = path
         self.workspace = workspace
         self.sequence = 0
-        with sqlite3.connect(path) as db:
+        with self._connect() as db:
             db.executescript("""
                 CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT,
                     directory TEXT, branch TEXT, agent TEXT,
@@ -384,13 +385,20 @@ class OpenCodeFixture:
                 CREATE INDEX part_session_idx ON part(session_id);
             """)
 
+    @contextmanager
+    def _connect(self):
+        with closing(sqlite3.connect(self.path)) as db, db:
+            # Power-loss durability is unnecessary for generated fixtures.
+            db.execute("PRAGMA synchronous = OFF")
+            yield db
+
     def stamp(self):
         self.sequence += 1
         return 1_790_000_000_000 + self.sequence * 1000
 
     def session(self, session_id, *, parent=None, agent="build"):
         stamp = self.stamp()
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.execute(
                 "INSERT INTO session VALUES (?, ?, ?, 'main', ?, ?, ?)",
                 (session_id, parent, str(self.workspace), agent, stamp, stamp),
@@ -398,7 +406,7 @@ class OpenCodeFixture:
 
     def message(self, session_id, message_id, text, *, role="user"):
         stamp = self.stamp()
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.execute(
                 "INSERT INTO message VALUES (?, ?, ?, ?, ?)",
                 (message_id, session_id, stamp, stamp, json.dumps({"role": role})),
@@ -409,7 +417,7 @@ class OpenCodeFixture:
 
     def part(self, session_id, message_id, part_id, content):
         stamp = self.stamp()
-        with sqlite3.connect(self.path) as db:
+        with self._connect() as db:
             db.execute(
                 "INSERT INTO part VALUES (?, ?, ?, ?, ?, ?)",
                 (part_id, message_id, session_id, stamp, stamp, json.dumps(content)),

@@ -84,6 +84,9 @@
                   cat .cache/trwl-e2e-*/report.json
                   exit 1
                 fi
+                python3 tests/test-perf-compare.py
+                python3 tests/test-perf-runner.py
+                python3 tests/test-realm-corpus.py
                 mkdir -p "$out"
                 cp .cache/trwl-e2e-*/report.json "$out/report.json"
               '';
