@@ -102,16 +102,22 @@ fn directory(directories: &crate::directories::Directories) -> Result<Directory>
     let executable = fs::metadata(std::env::current_exe()?)?;
     fs::create_dir_all(&directories.cache)?;
     let cache = fs::metadata(&directories.cache)?;
-    let identity = digest(&[&format!(
-        "{}:{}:{}:{}:{}:{}:{}",
-        executable.dev(),
-        executable.ino(),
-        executable.len(),
-        executable.ctime(),
-        executable.ctime_nsec(),
-        cache.dev(),
-        cache.ino()
-    )]);
+    // One executable can load different runtimes through package wrappers.
+    // A resident server must keep the requesting client's runtime selection.
+    let identity = digest(&[
+        &format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            executable.dev(),
+            executable.ino(),
+            executable.len(),
+            executable.ctime(),
+            executable.ctime_nsec(),
+            cache.dev(),
+            cache.ino()
+        ),
+        &format!("{:?}", std::env::var_os("ORT_DYLIB_PATH")),
+        &format!("{:?}", std::env::var_os("OCL_ICD_VENDORS")),
+    ]);
     let parent = directories.index_runtime()?.join("inference");
     fs::DirBuilder::new()
         .recursive(true)

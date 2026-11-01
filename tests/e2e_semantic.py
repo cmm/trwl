@@ -65,6 +65,23 @@ def executor_reuse(case):
     )
     query()
     require(worker()[1] == pid, "fresh CLI process did not reuse inference")
+
+    # A warm server must not hide a client's change of ONNX runtime.
+    case.env["ORT_DYLIB_PATH"] = str(case.root / "missing-runtime.so")
+    try:
+        failed = case.command(
+            "search", QUERY, "--events", "--backend", "semantic", "--refresh", "off",
+            expect_failure=True,
+        )
+        require("missing-runtime.so" in failed.stderr,
+                "runtime switch did not attempt to load the requested library")
+    finally:
+        case.env.pop("ORT_DYLIB_PATH", None)
+        case.command("daemon", "stop")
+    query()
+    pid_file, pid = worker()
+    case.check("a warm inference server cannot override the client's ONNX runtime selection")
+
     data_home = case.env["XDG_DATA_HOME"]
     copied_home = case.root / "copied-data"
     shutil.copytree(case.data, copied_home / "trwl")

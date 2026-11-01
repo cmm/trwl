@@ -11,10 +11,10 @@ It probably won't work on a non-Linux system out of the box.
 
 ## Nix
 
-The build requires a CUDA-enabled `onnxruntime`. This is not
-configurable at the moment. To avoid building CUDA things and
-`onnxruntime` locally, enable the [NixOS-CUDA community cache](https://cache.nixos-cuda.org/)
-before building trwl.
+The default package includes CUDA-enabled ONNX Runtime. To avoid building
+CUDA dependencies and ONNX Runtime locally, enable the
+[NixOS-CUDA community cache](https://cache.nixos-cuda.org/) before building trwl.
+A CPU-only package is available through the `enableGpu = false` override.
 
 With Nix's `nix-command` and `flakes` features enabled:
 
@@ -38,6 +38,14 @@ inputs.trwl.url = "github:cmm/trwl";
 
 Add `inputs.trwl.packages.${pkgs.stdenv.hostPlatform.system}.trwl` to
 `home.packages` or `environment.systemPackages`.
+
+For the CPU-only package, use:
+
+```nix
+(inputs.trwl.packages.${pkgs.stdenv.hostPlatform.system}.trwl.override {
+  enableGpu = false;
+})
+```
 
 ## Cargo
 

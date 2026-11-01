@@ -99,14 +99,15 @@
         {
           default =
             (pkgs.mkShell {
-              inputsFrom = [ trwl ];
+              inputsFrom = [ trwl.unwrapped ];
               packages = [
                 pkgs.rustfmt
                 pkgs.clippy
                 pkgs.nixfmt
               ]
               ++ testInputs pkgs;
-              inherit (trwl) ORT_LIB_PATH TRWL_SEMANTIC_MODEL_DIR;
+              ORT_LIB_PATH = "${trwl.onnxruntime}/lib";
+              TRWL_SEMANTIC_MODEL_DIR = trwl.model;
               OCL_ICD_VENDORS = "${pkgs.intel-compute-runtime}/etc/OpenCL/vendors";
             }).overrideAttrs
               {

@@ -1,14 +1,15 @@
 # Regression and releases
 
 GitHub Actions runs `nix build .#checks.x86_64-linux.regression` on pull
-requests to `main`, pushes to `main`, and manual CI runs. This builds a CPU-only
-variant of the Nix package with its Rust and install checks, then runs every
-CLI end-to-end case, including real-model CPU and HTTP inference. Timing-based performance
-comparisons are not part of this gate.
+requests to `main`, pushes to `main`, and manual CI runs. This builds the shared
+Rust binary with its Rust checks, runs the CPU package's install checks, then
+runs every CLI end-to-end case, including real-model CPU and HTTP inference.
+Timing-based performance comparisons are not part of this gate.
 
 Regression uses `ubuntu-24.04`; tagging and auto-merge use `ubuntu-slim`.
-The default Nix package includes GPU runtimes; the regression variant omits
-them and the Intel OpenCL wrapper.
+CPU and GPU packages share the Rust build; their wrappers select the runtime.
+The default package includes GPU runtimes and Intel OpenCL configuration;
+the regression package uses the CPU runtime.
 
 ## GitHub settings
 

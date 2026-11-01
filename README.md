@@ -300,8 +300,8 @@ retrieval defaults to disabled.
 `TRWL_SEMANTIC_MODEL_DIR` overrides the model directory configured at
 `trwl` build time.
 
-`ORT_DYLIB_PATH` overrides the ONNX Runtime shared library configured
-at `trwl` build time.
+`ORT_DYLIB_PATH` overrides the ONNX Runtime shared library selected by the
+Nix package or configured at build time for a Cargo installation.
 
 Indexes and exports contain private session history data, so access to
 files created by trwl is restricted to the current user.
