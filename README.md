@@ -13,7 +13,6 @@ See [INSTALL.md](INSTALL.md) for build & install instructions.
 ## Contents
 
 - [Quick start](#quick-start)
-- [History and search](#history-and-search)
 - [Searching](#searching)
   - [Workspace selection](#workspace-selection)
 - [Reading transcripts](#reading-transcripts)
@@ -33,10 +32,7 @@ trwl show session SESSION_ID
 ```
 
 `setup --wait` imports every configured and discovered history and waits for
-the import to finish. Discovery covers OpenCode's XDG data directory,
-`$CODEX_HOME/sessions`, `~/.pi/agent/sessions`, `$CLAUDE_CONFIG_DIR/projects`
-and `~/.copilot/session-state`; unset Codex and Claude paths default to
-`~/.codex` and `~/.claude`.
+the import to finish.
 
 By default a search outputs one match per session, with event and
 session IDs and a snippet. Copy a session ID into `show session` to
@@ -45,17 +41,11 @@ surrounding context. Searches cover the current workspace by default;
 `--workspace '**'` searches all history (see [Workspace
 selection](#workspace-selection)).
 
-## History and search
-
-`setup` imports each provider's native history — OpenCode v1/v2 SQLite, and
-Codex, Pi, Claude Code and Copilot CLI JSONL. Imported history remains
-available even if the original history moves away.
-
-There are three search backends: `lexical` (default) matches words and
-phrases, `semantic` (if enabled in configuration) matches meaning, and
-`hybrid` (if `semantic` is enabled) combines both.
-
 ## Searching
+
+Search defaults to `lexical` word and phrase matching. With
+[semantic search](#semantic-search) enabled, `semantic` matches meaning
+and `hybrid` combines both.
 
 ```sh
 trwl search "connection pool" --events --refresh wait
@@ -73,7 +63,8 @@ trwl search "why do requests wait for connections?" --backend hybrid
   it and put `"two words"` in the query for a phrase. Other
   punctuation has no special meaning.
 - **Filters:** `--provider`, `--session`, `--workspace`,
-  `--since`/`--until`, `--event-type`, `--content-scope`, `--file`
+  `--since`/`--until`, `--before-compaction`/`--after-compaction`,
+  `--event-type`, `--content-scope`, `--file`
   (records that mention a file) and `--primary-only`. Dates are
   `YYYY-MM-DD` UTC days, inclusive on both ends, or RFC 3339
   timestamps.
@@ -81,12 +72,9 @@ trwl search "why do requests wait for connections?" --backend hybrid
   the trwl session ID or the provider's native one; the value is
   matched against both, and the complete ID is required — prefixes
   are not accepted.
-- **Refresh:** `off` reads the current index — instant, but with no
-  indication that history is missing; `wait` imports before searching
-  — fresh, but the search waits out the import; `background` (the
-  default) searches indexed history immediately and restarts the
-  updater in automatic mode, so freshness is restored without
-  blocking the search.
+- **Refresh:** `off` reads the current index; `wait` imports before
+  searching; `background` (the default) searches indexed history and
+  starts the updater in automatic mode.
 - **Current session:** excluded when `OPENCODE_SESSION_ID`,
   `CODEX_THREAD_ID` or `CLAUDE_SESSION_ID` identifies it;
   `--include-current-session` restores it. `--exclude-session` omits
@@ -94,9 +82,11 @@ trwl search "why do requests wait for connections?" --backend hybrid
   automatically.
 
 Text results contain event and session IDs, the workspace root,
-retrieval mode and snippets around matches. Hybrid search combines
-lexical and semantic matches (see [Semantic
-search](#semantic-search)).
+retrieval mode and snippets around matches.
+
+Use `--event-type compaction` to find boundaries and summaries, and
+`--before-compaction` / `--after-compaction` to select session segments.
+See `trwl search --help` for bounds.
 
 ### Workspace selection
 
@@ -136,6 +126,12 @@ and the canonical root. `--out PATH` writes any format to a file (see
 
 ## Indexing
 
+trwl imports OpenCode v1/v2 SQLite and Codex, Pi, Claude Code and Copilot CLI
+JSONL. Discovery covers OpenCode's XDG data directory, `$CODEX_HOME/sessions`,
+`~/.pi/agent/sessions`, `$CLAUDE_CONFIG_DIR/projects` and
+`~/.copilot/session-state`; unset Codex and Claude paths default to
+`~/.codex` and `~/.claude`.
+
 ```sh
 trwl sources list
 trwl sources add work --provider opencode --root /path/to/opencode.db
@@ -147,18 +143,17 @@ trwl status
 
 Provider selectors are `opencode`, `codex`, `pi`, `claude` and
 `copilot-cli`. `sources add` registers a history for repeated
-imports, and `sources remove` drops the registration; one-time `import
---path` accepts a file or directory, and automatic discovery can
-re-include a removed input. Imports pick up new, changed, and deleted
-history. `trwl import --all --full` forces a complete re-import.
+imports; `sources remove` drops only the registration, and automatic
+discovery can re-include the input. One-time `import --path` accepts a file
+or directory. Imports pick up new, changed, and deleted history.
+`trwl import --all --full` forces a complete re-import.
 
 There is no command that removes records from the index. Records leave
 only when the source drops them — a session deleted in OpenCode, or
 lines removed from a rollout file, picked up on the next import — or
 when the index is rebuilt from scratch (see [Data and
-configuration](#data-and-configuration)). `sources remove` removes
-only the registration, and one-time imports are not monitored: their
-history stays indexed after the input file disappears.
+configuration](#data-and-configuration)). One-time imports are not
+monitored: their history stays indexed after the input file disappears.
 
 In automatic mode a polling updater imports changes in the background;
 in manual mode imports happen only when you run them. `daemon run`
@@ -257,10 +252,7 @@ still emit one, and single-object commands such as `status` and
 
 For `list events` and `list sessions`, pass the completion record's `next_cursor`
 to the next `--cursor` request until `terminal` is true. Keep filters unchanged
-between pages. Changing filters does not restart pagination: if the cursor still
-identifies a row in the new selection, the command continues after it using that
-selection; otherwise it fails with `cursor no longer matches this selection`.
-Concurrent updates can change later pages.
+between pages. Concurrent updates can change later pages.
 
 ## Data and configuration
 

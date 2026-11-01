@@ -55,6 +55,7 @@ string_enum!(EventType {
     Message => "message",
     ToolCall => "tool_call",
     ToolOutput => "tool_output",
+    Compaction => "compaction",
     Metadata => "metadata",
 });
 string_enum!(#[derive(Default)] ContentScope {

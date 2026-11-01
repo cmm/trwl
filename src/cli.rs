@@ -140,6 +140,24 @@ pub struct Search {
     pub filters: Filters,
 }
 
+#[derive(Clone, Debug)]
+pub enum CompactionAnchor {
+    Latest,
+    Event(String),
+}
+
+impl std::str::FromStr for CompactionAnchor {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "latest" => Ok(Self::Latest),
+            "" => Err("expected 'latest' or a trwl compaction event ID".into()),
+            id => Ok(Self::Event(id.into())),
+        }
+    }
+}
+
 #[derive(Args, Default)]
 pub struct Filters {
     #[arg(long, value_enum)]
@@ -160,6 +178,18 @@ pub struct Filters {
     pub since: Option<String>,
     #[arg(long)]
     pub until: Option<String>,
+    /// Select events strictly after a compaction in transcript order. Use a complete
+    /// trwl event ID to select its session, or 'latest' for each session's last boundary.
+    /// Sessions without a boundary do not match 'latest'.
+    /// Boundaries are resolved independently of date and content filters.
+    #[arg(long, value_name = "latest|EVENT_ID")]
+    pub after_compaction: Option<CompactionAnchor>,
+    /// Select events strictly before a compaction in transcript order. Use a complete
+    /// trwl event ID to select its session, or 'latest' for each session's last boundary.
+    /// Sessions without a boundary do not match 'latest'.
+    /// Boundaries are resolved independently of date and content filters.
+    #[arg(long, value_name = "latest|EVENT_ID")]
+    pub before_compaction: Option<CompactionAnchor>,
     #[arg(long, value_enum)]
     pub event_type: Option<EventType>,
     #[arg(long, value_enum, default_value = "all")]

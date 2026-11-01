@@ -258,12 +258,85 @@ def opencode_v2(case):
         },
         82,
     )
-    compact = next(e for e in imported() if e["provider_event_id"] == "msg_compact")
+    message(
+        "msg_compact_empty",
+        "compaction",
+        {"status": "completed", "reason": "auto", "summary": "", "native": {"messages": []}},
+        83,
+    )
+    message("msg_after_compact", "user", {"text": "aftercompactbeacon Continue work."}, 84)
+    attempts = [
+        ("running", {"status": "running", "summary": "runningcompactbeacon Partial summary."}),
+        ("unknown", {"status": "unknown", "summary": "unknowncompactbeacon Partial summary."}),
+        ("missing", {"summary": "missingcompactbeacon Partial summary."}),
+        ("failed", {"status": "failed", "error": {
+            "_tag": "UnknownError", "message": "failedcompactbeacon Compaction was not applied."
+        }}),
+    ]
+    for index, (outcome, data) in enumerate(attempts, 85):
+        message(f"msg_compact_{outcome}", "compaction", data, index)
+    with_compactions = imported()
+    compact = next(e for e in with_compactions if e["provider_event_id"] == "msg_compact")
+    empty_compact = next(
+        e for e in with_compactions if e["provider_event_id"] == "msg_compact_empty"
+    )
+    require(
+        compact["event_type"] == empty_compact["event_type"] == "compaction"
+        and compact["text"] == "summarybeacon Summary."
+        and empty_compact["text"] == ""
+        and empty_compact["structured_content"]["native"] == {"messages": []},
+        "v2 summary or text-free compaction boundary lost its kind or native data",
+    )
     require(
         compact["structured_content"]["tokens"]
         == {"input": 8, "output": 5, "detail_tokens": 3},
         "v2 compaction exposed category-only token metadata",
     )
+    require(
+        [
+            hit["trwl_event_id"]
+            for hit in case.search("summarybeacon", "--events", "--event-type", "compaction")["results"]
+        ] == [compact["trwl_event_id"]],
+        "v2 compaction summary is not searchable as a compaction event",
+    )
+    require(imported() == with_compactions, "unchanged v2 import changed compactions")
+    case.check("v2 summaries and text-free compaction boundaries keep their native content and kind")
+    require(
+        [
+            event["trwl_event_id"]
+            for event in case.json_command(
+                "list", "events", "--session", "ses_v2", "--event-type", "compaction"
+            )["events"]
+        ] == [compact["trwl_event_id"], empty_compact["trwl_event_id"]],
+        "v2 unsuccessful or incomplete compaction became a boundary",
+    )
+    for outcome, data in attempts:
+        event = next(
+            event for event in with_compactions
+            if event["provider_event_id"] == f"msg_compact_{outcome}"
+        )
+        body = data.get("summary", data.get("error", {}).get("message"))
+        require(
+            event["event_type"] == "metadata"
+            and body in event["text"]
+            and all(event["structured_content"][key] == value for key, value in data.items()),
+            f"v2 {outcome} compaction lost its metadata or native content",
+        )
+        require(
+            [
+                hit["trwl_event_id"] for hit in case.search(
+                    body.split()[0], "--events", "--session", "ses_v2", "--event-type", "metadata"
+                )["results"]
+            ] == [event["trwl_event_id"]],
+            f"v2 {outcome} compaction text is not searchable as metadata",
+        )
+    require(
+        case.search(
+            "aftercompactbeacon", "--events", "--session", "ses_v2", "--after-compaction", "latest"
+        )["results"],
+        "v2 latest boundary selection used a later unsuccessful compaction",
+    )
+    case.check("v2 running, failed, unknown-status and status-free compactions remain metadata and do not advance latest")
     child = case.json_command("show", "session", "ses_child")["events"][0]
     require(
         child["parent_trwl_session_id"] == user["trwl_session_id"],

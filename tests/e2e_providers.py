@@ -213,6 +213,237 @@ def claude_code_jsonl(case):
     native_jsonl(case, "claude")
 
 
+def provider_compactions(case):
+    # Native schemas: Codex RolloutItem::Compacted, Pi CompactionEntry,
+    # Claude Code's persisted compact_boundary, and Copilot CompactionCompleteData.
+    # These fixtures are hand-built from the producer schemas.
+    for provider in ("codex", "pi", "claude", "copilot_cli"):
+        session = f"{provider}-compactions"
+        marker = f"{provider.replace('_', '')}compactsummarybeacon"
+        summary = f"{marker} Preserve 日本語 and the pending parser work."
+        stamp = "2026-10-01T00:00:00.000Z"
+        if provider == "codex":
+            header = {
+                "type": "session_meta",
+                "payload": {"id": session, "cwd": str(case.work)},
+            }
+            boundary = {
+                "type": "compacted",
+                "timestamp": stamp,
+                "payload": {
+                    "message": summary,
+                    "replacement_history": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": summary}],
+                        }
+                    ],
+                },
+            }
+            empty = {
+                "type": "compacted",
+                "timestamp": stamp,
+                "payload": {"message": ""},
+            }
+            notice = {"type": "event_msg", "payload": {"type": "context_compacted"}}
+        elif provider == "pi":
+            header = {
+                "type": "session",
+                "version": 3,
+                "id": session,
+                "cwd": str(case.work),
+            }
+            boundary = {
+                "type": "compaction",
+                "id": "compact-summary",
+                "parentId": None,
+                "timestamp": stamp,
+                "summary": summary,
+                "firstKeptEntryId": "compact-summary",
+                "tokensBefore": 24000,
+                "details": {"readFiles": ["src/parser.rs"]},
+            }
+            empty = {**boundary, "id": "compact-empty", "summary": ""}
+            notice = {
+                "type": "branch_summary",
+                "id": "branch-summary",
+                "timestamp": stamp,
+                "fromId": "another-branch",
+                "summary": "Branch navigation is not a compaction boundary.",
+            }
+        elif provider == "claude":
+            header = {"type": "summary", "sessionId": session, "cwd": str(case.work)}
+            boundary = {
+                "type": "system",
+                "subtype": "compact_boundary",
+                "uuid": "compact-summary",
+                "timestamp": stamp,
+                "sessionId": session,
+                "cwd": str(case.work),
+                "content": summary,
+                "compactMetadata": {"trigger": "manual", "preTokens": 24000},
+            }
+            empty = {key: value for key, value in boundary.items() if key != "content"}
+            empty["uuid"] = "compact-empty"
+            notice = {
+                "type": "summary",
+                "summary": "A session title is not a compaction boundary.",
+                "leafUuid": "compact-empty",
+            }
+        else:
+            header = {
+                "type": "session.start",
+                "data": {"sessionId": session, "context": {"cwd": str(case.work)}},
+            }
+            boundary = {
+                "type": "session.compaction_complete",
+                "id": "compact-summary",
+                "parentId": "compact-start",
+                "timestamp": stamp,
+                "data": {
+                    "success": True,
+                    "summaryContent": summary,
+                    "checkpointNumber": 1,
+                    "checkpointPath": "checkpoints/1.json",
+                    "tokensRemoved": 12000,
+                },
+            }
+            empty = {
+                **boundary,
+                "id": "compact-empty",
+                "data": {"success": True, "checkpointNumber": 2},
+            }
+            notice = {"type": "session.usage_checkpoint", "data": {"totalNanoAiu": 123}}
+        path = case.providers / session / "events.jsonl"
+        attempts = []
+        if provider == "copilot_cli":
+            for outcome in ("failed", "missing"):
+                data = {
+                    "summaryContent": f"{outcome}copilotcompactbeacon Partial summary.",
+                    "error": f"{outcome}copiloterrorbeacon Compaction was not applied.",
+                }
+                if outcome == "failed":
+                    data["success"] = False
+                attempts.append({**boundary, "id": f"compact-{outcome}", "data": data})
+        rows = [header, boundary, notice, empty, *attempts]
+        write_jsonl(path, rows)
+        args = ("import", "--provider", provider, "--path", path)
+
+        def imported(args=args, session=session):
+            case.command(*args)
+            return case.json_command("show", "session", session)["events"]
+
+        before = imported()
+        compactions = [event for event in before if event["event_type"] == "compaction"]
+        require(
+            len(compactions) == 2,
+            f"{provider}: missing or unexpected compaction boundaries",
+        )
+        require(
+            [event["structured_content"] for event in compactions] == [boundary, empty],
+            f"{provider}: native compaction fields lost",
+        )
+        require(
+            [event["text"] for event in compactions] == [summary, ""],
+            f"{provider}: compaction summary or empty boundary changed",
+        )
+        hits = case.search(marker, "--events", "--event-type", "compaction")["results"]
+        require(
+            [hit["trwl_event_id"] for hit in hits] == [compactions[0]["trwl_event_id"]],
+            f"{provider}: compaction summary is not searchable",
+        )
+        for attempt in attempts:
+            event = next(
+                event for event in before if event["provider_event_id"] == attempt["id"]
+            )
+            require(
+                event["event_type"] == "metadata"
+                and event["structured_content"] == attempt
+                and all(
+                    value in event["text"]
+                    for value in (
+                        attempt["data"]["summaryContent"],
+                        attempt["data"]["error"],
+                    )
+                ),
+                "Copilot unsuccessful compaction lost its metadata or summary/error text",
+            )
+            marker = attempt["data"]["error"].split()[0]
+            require(
+                [
+                    hit["trwl_event_id"]
+                    for hit in case.search(
+                        marker, "--events", "--event-type", "metadata"
+                    )["results"]
+                ]
+                == [event["trwl_event_id"]]
+                and not case.search(marker, "--events", "--event-type", "compaction")[
+                    "results"
+                ],
+                "Copilot unsuccessful compaction is not searchable only as metadata",
+            )
+        require(
+            imported() == before, f"{provider}: unchanged import changed boundaries"
+        )
+        appended = deepcopy(empty)
+        if provider == "claude":
+            appended["uuid"] = "compact-appended"
+        elif provider != "codex":
+            appended["id"] = "compact-appended"
+        write_jsonl(path, [*rows, appended])
+        after = imported()
+        require(
+            after[: len(before)] == before, f"{provider}: append changed old boundaries"
+        )
+        require(
+            len(after) == len(before) + 1
+            and after[-1]["event_type"] == "compaction"
+            and after[-1]["text"] == ""
+            and after[-1]["structured_content"] == appended
+            and after[-1]["trwl_event_id"] != compactions[-1]["trwl_event_id"],
+            f"{provider}: appended empty boundary lost or collapsed",
+        )
+        require(
+            imported() == after, f"{provider}: resumed import duplicated boundaries"
+        )
+        case.check(
+            f"{provider}: summaries and empty native boundaries survive import, search and append"
+        )
+
+    fixture = OpenCodeFixture(case.providers / "compaction-v1.db", case.work)
+    fixture.session("opencode-v1-compactions")
+    fixture.message("opencode-v1-compactions", "compact-request", "", role="user")
+    boundary = {"type": "compaction", "auto": True, "overflow": False}
+    fixture.part("opencode-v1-compactions", "compact-request", "compact-part", boundary)
+    args = ("import", "--provider", "opencode", "--path", fixture.path)
+    case.command(*args)
+    events = case.json_command("show", "session", "opencode-v1-compactions")["events"]
+    compactions = [event for event in events if event["event_type"] == "compaction"]
+    require(
+        len(compactions) == 1
+        and compactions[0]["text"] == ""
+        and compactions[0]["structured_content"] == boundary,
+        "OpenCode v1 lost the native text-free compaction part",
+    )
+    fixture.part(
+        "opencode-v1-compactions", "compact-request", "compact-appended", boundary
+    )
+    case.command(*args)
+    after = case.json_command("show", "session", "opencode-v1-compactions")["events"]
+    require(
+        after[: len(events)] == events and after[-1]["event_type"] == "compaction",
+        "OpenCode v1 compaction append changed the existing transcript",
+    )
+    case.command(*args)
+    require(
+        case.json_command("show", "session", "opencode-v1-compactions")["events"]
+        == after,
+        "OpenCode v1 repeated import changed compaction parts",
+    )
+    case.check("OpenCode v1 text-free compaction parts retain identity across appends")
+
+
 def copilot_records(workspace, session):
     expected = [
         (
@@ -1261,4 +1492,5 @@ provider_cases = {
     "claude-code-jsonl": claude_code_jsonl,
     "copilot-cli-jsonl": copilot_cli_jsonl,
     "provider-details": provider_details,
+    "provider-compactions": provider_compactions,
 }

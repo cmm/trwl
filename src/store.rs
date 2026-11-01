@@ -22,10 +22,10 @@
 //! byte ranges of that text and are restored for full retrieval.
 
 use crate::{
-    cli::Filters,
+    cli::{CompactionAnchor, Filters},
     config::{Config, Source, is_locked, lock},
     providers,
-    record::{ConversationMessage, Provider, Record, digest},
+    record::{ConversationMessage, EventType, Provider, Record, digest},
     redaction::SourceSpans,
     report::{Diagnostic, ImportReport, ImportSource, LexicalStatus, Outcome, State},
     workspace,
@@ -691,8 +691,8 @@ impl ReadIndex {
         Ok(roots)
     }
 
-    /// The selection is shared by lexical and semantic search. Checkpoints
-    /// never match, including an otherwise empty filter.
+    /// The selection is shared by lexical and semantic search. Import parser
+    /// checkpoints never match, including an otherwise empty filter.
     pub fn selection(
         &self,
         filters: &Filters,
@@ -736,6 +736,27 @@ impl ReadIndex {
                     .iter()
                     .map(|root| Term::from_field_text(f.workspace_root, root.text()));
                 clauses.push((Occur::Must, Box::new(TermSetQuery::new(terms))));
+            }
+        }
+        // Resolve boundaries using session/workspace identity only. In particular,
+        // a date, content, or event-type filter must not hide the latest boundary.
+        if filters.after_compaction.is_some() || filters.before_compaction.is_some() {
+            let identities = BooleanQuery::new(
+                clauses
+                    .iter()
+                    .map(|(occur, query)| (*occur, query.box_clone()))
+                    .collect(),
+            );
+            for (anchor, after) in [
+                (filters.after_compaction.as_ref(), true),
+                (filters.before_compaction.as_ref(), false),
+            ] {
+                if let Some(anchor) = anchor {
+                    clauses.push((
+                        Occur::Must,
+                        self.compaction_range(anchor, after, &identities)?,
+                    ));
+                }
             }
         }
         if filters.since.is_some() || filters.until.is_some() {
@@ -799,6 +820,76 @@ impl ReadIndex {
             Box::new(BooleanQuery::new(clauses)),
             0.0,
         )))
+    }
+
+    fn compaction_range(
+        &self,
+        anchor: &CompactionAnchor,
+        after: bool,
+        identities: &dyn Query,
+    ) -> Result<Box<dyn Query>> {
+        use std::ops::Bound;
+
+        let f = self.fields;
+        let boundaries = match anchor {
+            CompactionAnchor::Event(id) => {
+                let query = term_query(Term::from_field_text(f.id, id));
+                let address = self
+                    .addresses(&*query)?
+                    .into_iter()
+                    .next()
+                    .with_context(|| format!("compaction event not found: {id}"))?;
+                let record = self.summary(address)?;
+                ensure!(
+                    record.event_type == EventType::Compaction,
+                    "event is not a compaction boundary: {id}"
+                );
+                vec![(record.session_id, record.sequence)]
+            }
+            CompactionAnchor::Latest => {
+                let query = BooleanQuery::new(vec![
+                    (Occur::Must, identities.box_clone()),
+                    (
+                        Occur::Must,
+                        term_query(Term::from_field_text(
+                            f.event_type,
+                            EventType::Compaction.as_str(),
+                        )),
+                    ),
+                ]);
+                let mut latest = HashMap::<String, u64>::new();
+                for address in self.addresses(&query)? {
+                    let record = self.summary(address)?;
+                    latest
+                        .entry(record.session_id)
+                        .and_modify(|sequence| *sequence = (*sequence).max(record.sequence))
+                        .or_insert(record.sequence);
+                }
+                latest.into_iter().collect()
+            }
+        };
+        let ranges = boundaries
+            .into_iter()
+            .map(|(session, sequence)| {
+                let bound = Bound::Excluded(Term::from_field_u64(f.sequence, sequence));
+                let (lower, upper) = if after {
+                    (bound, Bound::Unbounded)
+                } else {
+                    (Bound::Unbounded, bound)
+                };
+                (
+                    Occur::Should,
+                    Box::new(BooleanQuery::new(vec![
+                        (
+                            Occur::Must,
+                            term_query(Term::from_field_text(f.session, &session)),
+                        ),
+                        (Occur::Must, Box::new(RangeQuery::new(lower, upper))),
+                    ])) as Box<dyn Query>,
+                )
+            })
+            .collect();
+        Ok(Box::new(BooleanQuery::new(ranges)))
     }
 
     pub fn selected_ids(&self, selection: &dyn Query) -> Result<HashSet<String>> {

@@ -199,10 +199,10 @@ pub fn parse(
 /// Invalidate cached parses when normalized content or supported formats change.
 pub fn parser_revision(provider: Provider) -> u32 {
     match provider {
-        Provider::Opencode => 4,
-        Provider::Pi | Provider::Claude => 3,
-        Provider::CopilotCli => 2,
-        Provider::Codex => 1,
+        Provider::Opencode => 5,
+        Provider::Pi | Provider::Claude => 4,
+        Provider::CopilotCli => 3,
+        Provider::Codex => 2,
     }
 }
 
@@ -824,6 +824,7 @@ fn opencode_part(
         "text" | "reasoning" => EventType::Message,
         "tool" => EventType::ToolCall,
         "tool_result" => EventType::ToolOutput,
+        "compaction" => EventType::Compaction,
         _ => EventType::Metadata,
     };
     let mut record = Record::new(Provider::Opencode, native_session, &id, kind, path);
@@ -843,6 +844,9 @@ fn opencode_part(
         record.files = file_paths(tool, args);
     } else {
         record.text = text(&value["text"]);
+        if kind == EventType::Compaction && record.text.is_empty() {
+            record.text = text(&value["summary"]);
+        }
         if kind == EventType::Metadata {
             // Step bookkeeping has no transcript text; other native parts
             // can carry prompts, file changes, or provider-specific content.
@@ -966,6 +970,15 @@ fn opencode_v2_message(
         Ok(())
     };
     match kind.as_str() {
+        "compaction" if value["status"] == "completed" => {
+            emit(
+                "",
+                EventType::Compaction,
+                text(&value["summary"]),
+                value,
+                Vec::new(),
+            )?;
+        }
         "user" | "system" | "synthetic" | "skill" => {
             emit(
                 "",
@@ -1173,23 +1186,34 @@ fn jsonl(
             }
             _ => {}
         }
-        let message = match provider {
-            Provider::Codex if kind == "response_item" => &value["payload"],
-            Provider::Pi if kind == "message" => &value["message"],
-            Provider::Claude if matches!(kind, "user" | "assistant") => &value["message"],
-            Provider::CopilotCli
-                if matches!(
-                    kind,
-                    "user.message"
-                        | "assistant.message"
-                        | "assistant.reasoning"
-                        | "tool.execution_start"
-                        | "tool.execution_complete"
-                ) =>
-            {
-                &value["data"]
+        let compaction = match provider {
+            Provider::Codex => kind == "compacted",
+            Provider::Pi => kind == "compaction",
+            Provider::Claude => kind == "system" && value["subtype"] == "compact_boundary",
+            Provider::CopilotCli => kind == "session.compaction_complete",
+            Provider::Opencode => false,
+        };
+        let message = if compaction {
+            &value
+        } else {
+            match provider {
+                Provider::Codex if kind == "response_item" => &value["payload"],
+                Provider::Pi if kind == "message" => &value["message"],
+                Provider::Claude if matches!(kind, "user" | "assistant") => &value["message"],
+                Provider::CopilotCli
+                    if matches!(
+                        kind,
+                        "user.message"
+                            | "assistant.message"
+                            | "assistant.reasoning"
+                            | "tool.execution_start"
+                            | "tool.execution_complete"
+                    ) =>
+                {
+                    &value["data"]
+                }
+                _ => continue,
             }
-            _ => continue,
         };
         if state.session.is_empty() {
             parsed.diagnostics.push(Diagnostic::new(
@@ -1243,7 +1267,11 @@ fn jsonl(
             record.is_subagent =
                 state.parent.is_some() || value["isSidechain"].as_bool().unwrap_or(false);
             record.workspace = state.workspace.clone();
-            record.role = Some(role.into());
+            record.role = if compaction {
+                (provider == Provider::Claude).then_some(Role::System)
+            } else {
+                Some(role.into())
+            };
             record.occurred_at = time.clone();
             record.text = body;
             record.structured_content = structured;
@@ -1262,7 +1290,30 @@ fn jsonl(
             Ok(())
         };
         let message_kind = message["type"].as_str().unwrap_or("");
-        if provider == Provider::CopilotCli && kind == "assistant.reasoning" {
+        if compaction {
+            let summary = match provider {
+                Provider::Codex => &value["payload"]["message"],
+                Provider::Pi => &value["summary"],
+                Provider::Claude => &value["content"],
+                Provider::CopilotCli => &value["data"]["summaryContent"],
+                Provider::Opencode => unreachable!(),
+            };
+            let event_type = if provider == Provider::CopilotCli
+                && value["data"]["success"].as_bool() != Some(true)
+            {
+                EventType::Metadata
+            } else {
+                EventType::Compaction
+            };
+            let body = if event_type == EventType::Metadata {
+                let mut parts = Vec::new();
+                strings(&value["data"], &mut parts);
+                parts.join("\n")
+            } else {
+                text(summary)
+            };
+            emit("compaction", event_type, body, value.clone(), Vec::new())?;
+        } else if provider == Provider::CopilotCli && kind == "assistant.reasoning" {
             emit(
                 "message",
                 EventType::Message,

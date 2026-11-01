@@ -70,26 +70,20 @@ instructions meant for another task.
 2. Narrow results with filters or change the wording:
 
    ```sh
-   trwl search "connection pool" --provider opencode --since YYYY-MM-DD --refresh off
-   trwl search '+connection +pool' --content-scope transcript --refresh off
-   trwl search "connection pool" --file src/database.rs --refresh off
-   trwl search "connection pool" --session SESSION_ID --events --refresh off
-   trwl search "connection pool" --workspace '**/my-project' --refresh off
-   trwl search "connection pool" --workspace '**' --refresh off
+    trwl search '+connection +pool' --content-scope transcript --refresh off
+    trwl search "connection pool" --session SESSION_ID --events --refresh off
+    trwl search "connection pool" --workspace '**/my-project' --refresh off
    ```
 
-   Dates accept `YYYY-MM-DD`, a UTC day that both `--since` and `--until`
-   include, or RFC 3339 timestamps. Session filters accept complete trwl session
-   IDs or native provider session IDs. `--content-scope transcript` excludes
-   tool calls and outputs when looking for discussion; omit it when tracing tool
-   activity. Use `trwl search --help` for the supported flags.
+   Session filters accept complete trwl session IDs or native provider session
+   IDs. `--content-scope transcript` excludes tool calls and outputs when looking
+   for discussion; omit it when tracing tool activity. Use `trwl search --help`
+   for the supported flags.
 
    `--workspace` replaces the current-workspace restriction. Repeat it to combine
-   selectors with OR. Globs match full canonical roots and are case-insensitive:
-   `*` stays within a path component, `**` spans directories, and `{foo,bar}`
-   selects alternatives. Use absolute globs or `**/name` for a root name; literal
-   directories resolve to workspace roots. Quote patterns against shell expansion.
-   A trailing `/**` selects descendant roots without including the named root.
+   selectors with OR. Globs match full canonical roots and are case-insensitive.
+   Quote patterns against shell expansion. Literal directories resolve to
+   workspace roots.
    `--workspace '**'` searches all history, including unresolved workspace roots.
 
 3. Read the matching event and its neighbors, then expand to the session if needed:
@@ -110,9 +104,11 @@ instructions meant for another task.
    of structured fields.
 
    Text search output contains event and session IDs and snippets. Lexical
-   snippets show a passage around matching words. Semantic snippets show the
-   user message's beginning; the match can be in its paired reply. Use
-   `search --format json` for structured results. Filter large JSON and read
+   snippets show a passage around matching words. Semantic results identify user
+   messages, and their snippets show the message's beginning; the match can be in
+   its paired assistant reply. Read the surrounding turn to find that discussion.
+   Use lexical queries for other content, including tool calls and outputs.
+   Use `search --format json` for structured results. Filter large JSON and read
    bounded passages from exports.
 
 Automatic current-session exclusion requires `OPENCODE_SESSION_ID`,
@@ -124,11 +120,18 @@ inclusion alone does not restrict results to it. Repeat
 `--exclude-session SESSION_ID` to omit sessions explicitly. Exclusions override
 inclusion and do not extend to child sessions; specify those separately.
 
-Semantic results identify user messages and can match text in their paired
-assistant replies. With `--events`, several matching user-message anchors from
-one session can be returned. Read the surrounding turn to find the matching
-discussion.
-Use lexical queries for other recorded content, including tool calls and outputs.
+## Compaction checkpoints and session segments
+
+```sh
+trwl list events --session SESSION_ID --event-type compaction
+trwl search "authentication" --session SESSION_ID --after-compaction latest --events --refresh off
+```
+
+Bounds are exclusive and follow transcript sequence. Use `latest` per session
+or a complete trwl compaction event ID, which restricts results to its session.
+Sessions without boundaries do not match `latest`. Combine before/after bounds
+to select intervening events. Search summaries lexically with
+`--event-type compaction`; omit `--content-scope transcript`.
 
 ## If expected history is missing
 
@@ -139,11 +142,7 @@ indexing problem. Use these checks according to what is missing:
   keeping its query, filters and backend. This imports changes before searching.
 - **Index catch-up:** `trwl index status` compares configured/discovered inputs
   with the lexical index; `trwl semantic status` reports document/chunk embedding
-  coverage of indexed history. `ready` means no pending work for that index,
-  `pending` means work remains without an active worker, and `catching_up` means
-  a worker is active. The checks read state only, starting no indexing or
-  inference. Semantic readiness covers indexed history; source changes awaiting
-  lexical import and embedding-server availability are outside it.
+  coverage of indexed history. Both commands read status without starting work.
 - **History from another checkout or a deleted directory:** use an explicit
   workspace pattern, or `--workspace '**'`, and inspect each hit's
   `workspace_root`. The default restriction can also narrow `--session` searches.

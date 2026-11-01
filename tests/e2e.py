@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 
+from e2e_compaction import compaction_selection
 from e2e_history import bad_input, selection, updates
 from e2e_http import hybrid_grouping, semantic_cache, semantic_http
 from e2e_live import busy_source, many_inputs, semantic_live, semantic_recovery
@@ -47,6 +48,7 @@ CASES = {
     "retrieval": retrieval,
     "opencode-v2": opencode_v2,
     "selection": selection,
+    "compaction-selection": compaction_selection,
     "workspaces": workspaces,
     "updates": updates,
     "index-storage": index_storage,
