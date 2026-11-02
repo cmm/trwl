@@ -1205,9 +1205,28 @@ fn fill(
     executor: &mut Option<Executor>,
 ) -> Result<Cache> {
     let _lock = lock(&config.directories.cache, "semantic.lock")?;
-    let publish =
-        store::semantic_version(&config.directories.data)?.as_ref() == Some(&plan.version);
-    fill_locked(config, plan, tokenizer, executor, FillMode::Query, publish)
+    // A query can wait behind a newer fill. Its pinned inputs still need
+    // embeddings, but must not replace the newer persistent snapshot.
+    let publication =
+        if store::semantic_version(&config.directories.data)?.as_ref() == Some(&plan.version) {
+            Publication::Current
+        } else {
+            Publication::Local
+        };
+    fill_locked(
+        config,
+        plan,
+        tokenizer,
+        executor,
+        FillMode::Query,
+        publication,
+    )
+}
+
+#[derive(PartialEq, Eq)]
+enum Publication {
+    Current,
+    Local,
 }
 
 #[derive(PartialEq, Eq)]
@@ -1246,15 +1265,15 @@ fn fill_locked(
     tokenizer: &mut PlanningTokenizer,
     executor: &mut Option<Executor>,
     mode: FillMode,
-    publish: bool,
+    publication: Publication,
 ) -> Result<Cache> {
     let selection = plan.selection;
     let mut cache = cache::load(config, &selection.key)?;
-    if publish {
+    if publication == Publication::Current {
         cache::publish_mapping(config, plan)?;
     }
     if matches!(plan.vector_coverage(&cache), VectorCoverage::Complete) {
-        if publish {
+        if publication == Publication::Current {
             cache::repair_snapshot(config, plan, &cache)?;
             cache::mark_build_complete(config, plan)?;
         }
@@ -1329,12 +1348,12 @@ fn fill_locked(
             Some(batch) => backend.submit(batch),
             None => FillProgress::Finished(backend),
         };
-        if publish {
+        if publication == Publication::Current {
             cache::publish_batch(config, plan, &completed)?;
         }
         cache.vectors.extend(completed.vectors);
     };
-    if publish {
+    if publication == Publication::Current {
         // Retention may evict earlier batches while inference runs.
         cache::repair_snapshot(config, plan, &cache)?;
         cache::mark_build_complete(config, plan)?;
@@ -1399,7 +1418,7 @@ fn refresh_inner(config: &Config, rebuild: bool, tokenizer: &mut PlanningTokeniz
         tokenizer,
         &mut None,
         FillMode::Update,
-        true,
+        Publication::Current,
     )?;
     Ok(())
 }
@@ -1595,6 +1614,140 @@ pub(crate) mod tests {
         record::Provider,
         test_support::{codex_message, import, source},
     };
+
+    #[test]
+    fn pinned_search_and_waited_fill_preserve_the_newer_snapshot() {
+        use crate::test_support::EmbeddingServer;
+        use std::{sync::mpsc, thread};
+
+        for replace_first in [false, true] {
+            let api = EmbeddingServer::start(|_| true);
+            let dir = tempfile::tempdir().unwrap();
+            let mut config =
+                Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
+            config.document = format!(
+                "[search]\nsemantic=true\n[semantic]\nexecutor='{}'\nmodel='test'\n",
+                api.url
+            )
+            .parse()
+            .unwrap();
+            let path = dir.path().join("history.jsonl");
+            let write = |count: usize, replace: bool| {
+                let mut text =
+                    "{\"type\":\"session_meta\",\"payload\":{\"id\":\"snapshot\"}}\n".to_owned();
+                for n in 0..count {
+                    text.push_str(
+                        &codex_message(
+                            "user",
+                            &format!(
+                                "message {n} {}",
+                                if replace && n == 0 {
+                                    "edited"
+                                } else {
+                                    "original"
+                                }
+                            ),
+                        )
+                        .to_string(),
+                    );
+                    text.push('\n');
+                }
+                fs::write(&path, text).unwrap();
+                import(&config, Provider::Codex, &path)
+            };
+            let old = write(3, false);
+            Planner::default().refresh(&config).unwrap();
+            let selected = Selection::from_config(&config).unwrap();
+            // The newer writer owns the fill lock while the old query waits.
+            let lock = lock(&config.directories.cache, "semantic.lock").unwrap();
+            let (done, result) = mpsc::channel();
+            let (pinned, ready) = mpsc::channel();
+            let (begin, started) = mpsc::channel();
+            let query_config = config.clone();
+            let reader = thread::spawn(move || {
+                let old = ReadIndex::open(&query_config.directories.data)
+                    .unwrap()
+                    .unwrap();
+                pinned.send(()).unwrap();
+                started.recv().unwrap();
+                done.send(search(&query_config, &old, &["query".into()], true))
+                    .unwrap();
+            });
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            let current = write(4, replace_first);
+            let before = api.requests.lock().unwrap().len();
+            begin.send(()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while api.requests.lock().unwrap().len() == before {
+                assert!(std::time::Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(matches!(
+                result.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            let mut plan = document_plan(
+                &config,
+                &selected,
+                &current,
+                &mut PlanningTokenizer::default(),
+            )
+            .unwrap();
+            fill_locked(
+                &config,
+                &mut plan,
+                &mut PlanningTokenizer::default(),
+                &mut None,
+                FillMode::Update,
+                Publication::Current,
+            )
+            .unwrap();
+            let database = config.directories.cache.join("semantic/cache.sqlite3");
+            let observer = rusqlite::Connection::open(&database).unwrap();
+            // Make every publication stage observable, including a redundant warm
+            // repair and a completion update that would otherwise change nothing.
+            observer.execute_batch("UPDATE builds SET complete=0;
+                CREATE TRIGGER no_mapping BEFORE INSERT ON selections BEGIN SELECT RAISE(ABORT, 'stale mapping'); END;
+                CREATE TRIGGER no_vectors BEFORE INSERT ON vectors BEGIN SELECT RAISE(ABORT, 'stale vectors'); END;
+                CREATE TRIGGER no_completion BEFORE UPDATE ON builds BEGIN SELECT RAISE(ABORT, 'stale completion'); END;").unwrap();
+            let passive = search(&config, &old, &["query".into()], false).unwrap();
+            assert_eq!(passive.complete, !replace_first);
+            assert_eq!(passive.hits.len(), if replace_first { 2 } else { 3 });
+            assert!(Planner::covered(&config, &selected.key, &current.version()).unwrap());
+            assert!(status(&config).unwrap().state == State::Ready);
+            drop(lock);
+            let waited = result
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            reader.join().unwrap();
+            assert!(waited.complete);
+            assert_eq!(waited.hits.len(), 3);
+            assert!(
+                waited
+                    .hits
+                    .iter()
+                    .all(|(_, record)| !record.text.contains("edited"))
+            );
+            let disk = cache::load(&config, &selected.key).unwrap();
+            assert_eq!(disk.vectors.len(), 4);
+            assert!(Planner::covered(&config, &selected.key, &current.version()).unwrap());
+            let complete: bool = observer
+                .query_row("SELECT complete FROM builds", [], |r| r.get(0))
+                .unwrap();
+            assert!(!complete);
+            let latest = search(&config, &current, &["query".into()], false).unwrap();
+            assert!(latest.complete);
+            assert_eq!(latest.hits.len(), 4);
+            let requests = api.requests.lock().unwrap();
+            let documents: usize = requests
+                .iter()
+                .flatten()
+                .filter(|text| text.starts_with("user:"))
+                .count();
+            assert_eq!(documents, if replace_first { 6 } else { 4 });
+        }
+    }
 
     pub fn write_cache(config: &Config, bytes: &[u8]) {
         let path = config.directories.cache.join("semantic").join(format!(

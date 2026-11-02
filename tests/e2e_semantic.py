@@ -718,6 +718,114 @@ def background_semantic(case):
                 ]:
                     break
                 time.sleep(0.1)
+
+        def await_ready(version=None, chunks=None):
+            deadline = time.monotonic() + 60
+            while True:
+                require(daemon.process.poll() is None, "embedding daemon exited")
+                require(
+                    time.monotonic() < deadline,
+                    "unchanged daemon did not repair coverage",
+                )
+                if version is not None:
+                    # Observe disk first: a status/planning regression must not
+                    # repair the mapping on behalf of the daemon under test.
+                    with closing(sqlite3.connect(database)) as db:
+                        mapping = db.execute(
+                            "SELECT version FROM selections"
+                        ).fetchone()
+                        covered = (
+                            mapping == (version,)
+                            and db.execute("SELECT count(*) FROM chunks").fetchone()[0]
+                            == chunks
+                            and db.execute(
+                                "SELECT count(*) FROM chunks c WHERE NOT EXISTS "
+                                "(SELECT 1 FROM vectors v WHERE v.selection=c.selection AND v.key=c.key)"
+                            ).fetchone()[0]
+                            == 0
+                            and db.execute("SELECT complete FROM builds").fetchone()
+                            == (1,)
+                        )
+                    if not covered:
+                        time.sleep(0.1)
+                        continue
+                status = case.json_command("semantic", "status")
+                if status["state"] == "ready" and not status["active"]:
+                    # Allow the loop to collect the successful worker before damage.
+                    time.sleep(3)
+                    return
+                time.sleep(0.1)
+
+        await_ready()
+        database = case.cache / "semantic" / "cache.sqlite3"
+        with closing(sqlite3.connect(database)) as db, db:
+            version = db.execute("SELECT version FROM selections").fetchone()[0]
+            chunks = db.execute("SELECT count(*) FROM chunks").fetchone()[0]
+            require(chunks > 0, "background fixture has no chunks")
+            db.executescript(
+                "CREATE TABLE fill_observer (publications INTEGER);"
+                "INSERT INTO fill_observer VALUES (0);"
+                "CREATE TRIGGER observe_fill BEFORE INSERT ON selections BEGIN "
+                "UPDATE fill_observer SET publications=publications+1; END;"
+            )
+        time.sleep(3)
+        with closing(sqlite3.connect(database)) as db:
+            require(
+                db.execute("SELECT publications FROM fill_observer").fetchone()[0] == 0,
+                "healthy unchanged daemon started another fill",
+            )
+
+        for damage in (
+            "DELETE FROM vectors WHERE key=(SELECT key FROM vectors LIMIT 1)",
+            "UPDATE selections SET version='wrong-revision'",
+            "DELETE FROM selections",
+        ):
+            with closing(sqlite3.connect(database)) as db, db:
+                db.execute("PRAGMA foreign_keys=ON")
+                db.execute(damage)
+            await_ready(version, chunks)
+            with closing(sqlite3.connect(database)) as db:
+                require(
+                    db.execute("SELECT version FROM selections").fetchone()[0]
+                    == version,
+                    "repair did not restore the current mapping",
+                )
+                require(
+                    db.execute("SELECT count(*) FROM chunks").fetchone()[0] == chunks,
+                    "repair changed history coverage",
+                )
+                require(
+                    db.execute("SELECT complete FROM builds").fetchone()[0] == 1,
+                    "repair did not complete",
+                )
+                require(
+                    db.execute(
+                        "SELECT count(*) FROM chunks c WHERE NOT EXISTS "
+                        "(SELECT 1 FROM vectors v WHERE v.selection=c.selection AND v.key=c.key)"
+                    ).fetchone()[0]
+                    == 0,
+                    "repair left missing vectors",
+                )
+            repaired = case.search(
+                QUERY,
+                "--events",
+                "--limit",
+                "3",
+                backend="semantic",
+                refresh="off",
+                timeout=180,
+            )
+            require(
+                repaired["retrieval"]["semantic_status"] == "ready"
+                and any(
+                    hit["trwl_event_id"] == expected["trwl_event_id"]
+                    for hit in repaired["results"]
+                ),
+                "repaired disk coverage did not restore query results",
+            )
+        case.check(
+            "unchanged daemon repairs missing vectors, wrong revisions and lost selections"
+        )
     finally:
         try:
             case.command("index", "mode", "manual", timeout=20)

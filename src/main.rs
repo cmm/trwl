@@ -244,8 +244,9 @@ fn update_iteration(config: &Config) -> Result<Option<store::ConversationRevisio
 }
 
 /// One background embedding fill at a time. A fill runs when conversation inputs
-/// or configuration differs from the last successful fill, or coverage is lost. After a failure,
-/// unchanged configuration waits for a backoff delay before the next attempt.
+/// or configuration differs from the last successful fill, or coverage is lost.
+/// After a failure, unchanged configuration waits for a backoff delay before
+/// the next attempt.
 #[derive(Default)]
 struct EmbeddingUpdater {
     work: EmbeddingWork,

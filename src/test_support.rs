@@ -6,6 +6,85 @@ use crate::{
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
+/// A controlled HTTP producer for semantic tests, without model files.
+pub struct EmbeddingServer {
+    pub url: String,
+    pub requests: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl EmbeddingServer {
+    pub fn start(accept: impl Fn(&[String]) -> bool + Send + 'static) -> Self {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            while stopped.try_recv().is_err() {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("embedding server: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut length = None;
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                }
+                let mut body = vec![0; length.unwrap()];
+                reader.read_exact(&mut body).unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                let texts: Vec<String> = serde_json::from_value(body["input"].clone()).unwrap();
+                recorded.lock().unwrap().push(texts.clone());
+                let (status, response) = if accept(&texts) {
+                    (
+                        "200 OK",
+                        json!({"data": texts.iter().enumerate().map(|(index, _)| {
+                        json!({"index": index, "embedding": [1.0, 0.0]})
+                    }).collect::<Vec<_>>()})
+                        .to_string(),
+                    )
+                } else {
+                    ("500 Internal Server Error", "injected failure".into())
+                };
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            }
+        });
+        Self {
+            url,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for EmbeddingServer {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+
 pub fn history_file(name: &str) -> (tempfile::TempDir, Config, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
