@@ -1860,9 +1860,30 @@ fn segment_file_id(name: &str) -> Option<SegmentId> {
     Some(id)
 }
 
+fn is_orphaned_segment_file(
+    entry: &fs::DirEntry,
+    published: &HashSet<SegmentId>,
+    managed: &HashSet<PathBuf>,
+) -> Result<bool> {
+    let name = entry.file_name();
+    let Some(id) = name.to_str().and_then(segment_file_id) else {
+        return Ok(false);
+    };
+    Ok(!published.contains(&id)
+        && !managed.contains(Path::new(&name))
+        && entry.file_type()?.is_file())
+}
+
 /// Files lost from Tantivy's registry are invisible to its garbage collector.
 /// Published segments still own their files even when the registry omits them.
-fn remove_orphaned_files(index: &Index, path: &Path) -> Result<()> {
+fn open_searcher_and_reclaim(index: &Index, path: &Path) -> Result<Searcher> {
+    let searcher = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()?
+        .searcher();
+    // The reader checks segment compatibility before any files are removed.
+    // Also collect forgotten files when no source has changed and no writer is needed.
     let _writer_lock = index.directory().acquire_lock(&INDEX_WRITER_LOCK)?;
     // A reader of an older commit must finish opening its files before deletion.
     // Subsequent readers load the current commit, which this scan preserves.
@@ -1877,20 +1898,13 @@ fn remove_orphaned_files(index: &Index, path: &Path) -> Result<()> {
     let managed = index.directory().list_managed_files();
     for entry in fs::read_dir(path)? {
         let entry = entry?;
-        let name = entry.file_name();
-        let Some(id) = name.to_str().and_then(segment_file_id) else {
-            continue;
-        };
-        if !published.contains(&id)
-            && !managed.contains(Path::new(&name))
-            && entry.file_type()?.is_file()
-        {
+        if is_orphaned_segment_file(&entry, &published, &managed)? {
             fs::remove_file(entry.path()).with_context(|| {
                 format!("removing orphaned index file {}", entry.path().display())
             })?;
         }
     }
-    Ok(())
+    Ok(searcher)
 }
 
 fn update_with_parser(
@@ -2165,14 +2179,7 @@ fn stage_index(
     });
     // Checkpoints load from the commit the manifest belongs to; the update
     // lock excludes other writers.
-    let searcher = index
-        .reader_builder()
-        .reload_policy(ReloadPolicy::Manual)
-        .try_into()?
-        .searcher();
-    // The reader checks segment compatibility before any files are removed.
-    // Also collect forgotten files when no source has changed and no writer is needed.
-    remove_orphaned_files(&index, path)?;
+    let searcher = open_searcher_and_reclaim(&index, path)?;
     let plan = plan_inputs(sources, &manifest, full);
     let mut failed = false;
     let mut reports = Vec::new();
