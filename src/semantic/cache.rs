@@ -463,7 +463,9 @@ impl Database {
 
 fn remove(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("removing {}", path.display()))
+        }
         _ => Ok(()),
     }
 }
@@ -496,7 +498,7 @@ impl LegacyMigration {
         if vector_path.is_none() && document_path.is_none() {
             return Ok(None);
         }
-        let decoded = (|| {
+        let decoded: Result<Self> = (|| {
             let vectors = match &vector_path {
                 Some(path) => {
                     rmp_serde::from_slice(&fs::read(path)?).context("invalid semantic cache")?
@@ -513,7 +515,15 @@ impl LegacyMigration {
             Ok(Self { vectors, documents })
         })();
         for path in [vector_path, document_path].into_iter().flatten() {
-            remove(&path)?;
+            if let Err(cleanup) = remove(&path) {
+                return match decoded {
+                    Err(original) => Err(original.context(format!(
+                        "legacy cache cleanup failed (files may be partially cleared): {cleanup:#}"
+                    ))),
+                    Ok(_) => Err(cleanup
+                        .context("legacy cache cleanup failed (files may be partially cleared)")),
+                };
+            }
         }
         decoded.map(Some)
     }
@@ -578,7 +588,11 @@ impl LockedCache {
                 format!("{DATABASE}-wal"),
                 format!("{DATABASE}-shm"),
             ] {
-                remove(&self.directory.join(name))?;
+                if let Err(cleanup) = remove(&self.directory.join(name)) {
+                    return result.context(format!(
+                        "semantic cache cleanup failed (files may be partially cleared): {cleanup:#}"
+                    ));
+                }
             }
             return result.context("semantic cache exhausted disk space or its page limit; cache cleared, history unchanged; retry --refresh wait");
         }
