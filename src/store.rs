@@ -1833,7 +1833,7 @@ fn update_with_parser(
         &mut dyn FnMut(&Record) -> Result<()>,
     ) -> Result<providers::Parsed>,
 ) -> Result<ImportReport> {
-    let _guard = lock(&config.directories.data, "update.lock")?;
+    let guard = lock(&config.directories.data, "update.lock")?;
     if progress {
         eprintln!(
             "{}",
@@ -1841,8 +1841,8 @@ fn update_with_parser(
         );
     }
     let path = config.directories.data.join("index");
-    match update_index(config, sources, &path, full, &mut parse) {
-        Err(error) if config.rebuild_incompatible() && incompatible(&error) => {
+    match update_index(config, sources, &path, full, &mut parse, &guard) {
+        Err(error) if config.rebuild_incompatible() && incompatible(error.error()) => {
             // Rebuilding an entire index must include configured histories even
             // when this invocation requested only one explicit input.
             let mut rebuild_sources = config.sources()?;
@@ -1850,7 +1850,15 @@ fn update_with_parser(
             let staging = tempfile::Builder::new()
                 .prefix(".index-rebuild-")
                 .tempdir_in(&config.directories.data)?;
-            let report = update_index(config, &rebuild_sources, staging.path(), true, &mut parse)?;
+            let report = update_index(
+                config,
+                &rebuild_sources,
+                staging.path(),
+                true,
+                &mut parse,
+                &guard,
+            )
+            .map_err(ImportFailure::into_error)?;
             if report.completed() {
                 // The update lock covers both the build and publication. Exchange
                 // directories atomically so a crash cannot leave the index absent.
@@ -1861,7 +1869,7 @@ fn update_with_parser(
             }
             Ok(report)
         }
-        result => result,
+        result => result.map_err(ImportFailure::into_error),
     }
 }
 
@@ -1895,7 +1903,87 @@ fn update_index(
         Option<&providers::Checkpoint>,
         &mut dyn FnMut(&Record) -> Result<()>,
     ) -> Result<providers::Parsed>,
-) -> Result<ImportReport> {
+    update_lock: &File,
+) -> Result<ImportReport, ImportFailure> {
+    match stage_index(config, sources, path, full, parse)
+        .map_err(ImportFailure::BeforePublication)?
+    {
+        StagedImport::Unchanged(report) => Ok(report),
+        StagedImport::Ready(staging) => staging
+            .publish(update_lock)
+            .map_err(ImportFailure::BeforePublication)?
+            .shutdown()
+            .map_err(ImportFailure::AfterPublication),
+    }
+}
+
+enum ImportFailure {
+    BeforePublication(anyhow::Error),
+    AfterPublication(anyhow::Error),
+}
+
+impl ImportFailure {
+    fn error(&self) -> &anyhow::Error {
+        match self {
+            Self::BeforePublication(error) | Self::AfterPublication(error) => error,
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        // Publication status is internal; keep the existing CLI error and chain.
+        match self {
+            Self::BeforePublication(error) | Self::AfterPublication(error) => error,
+        }
+    }
+}
+
+enum StagedImport {
+    Unchanged(ImportReport),
+    Ready(Box<CompletedImport>),
+}
+
+struct CompletedImport {
+    index: Index,
+    searcher: Searcher,
+    fields: Fields,
+    manifest: Manifest,
+    previous_version: String,
+    changes: BTreeMap<String, Change>,
+    spool: Option<File>,
+    report: ImportReport,
+}
+
+struct PublishedImport<'lock> {
+    writer: tantivy::IndexWriter,
+    report: ImportReport,
+    // Keep import resources alive through writer shutdown, including merge waiting.
+    _spool: Option<File>,
+    _searcher: Searcher,
+    _index: Index,
+    _update_lock: &'lock File,
+}
+
+impl PublishedImport<'_> {
+    fn shutdown(self) -> Result<ImportReport> {
+        // Dropping a writer prevents its merges from publishing but does not stop
+        // their work. Finish them so later updates do not repeat discarded merges.
+        self.writer.wait_merging_threads()?;
+        Ok(self.report)
+    }
+}
+
+fn stage_index(
+    config: &Config,
+    sources: &[Source],
+    path: &Path,
+    full: bool,
+    parse: &mut impl FnMut(
+        Provider,
+        &Path,
+        Option<&providers::Checkpoint>,
+        &mut dyn FnMut(&Record) -> Result<()>,
+    ) -> Result<providers::Parsed>,
+) -> Result<StagedImport> {
     fs::create_dir_all(path)?;
     let (schema, fields) = schema();
     let index = if path.join("meta.json").exists() {
@@ -1991,10 +2079,44 @@ fn update_index(
             }
         }
     }
-    if !changes.is_empty() {
-        let mut spool = spool
-            .map(|writer| writer.into_inner().map_err(|error| error.into_error()))
-            .transpose()?;
+    let report = ImportReport {
+        outcome: if failed {
+            Outcome::CompletedWithSourceFailures
+        } else {
+            Outcome::Completed
+        },
+        sources: reports,
+    };
+    if changes.is_empty() {
+        return Ok(StagedImport::Unchanged(report));
+    }
+    let spool = spool
+        .map(|writer| writer.into_inner().map_err(|error| error.into_error()))
+        .transpose()?;
+    Ok(StagedImport::Ready(Box::new(CompletedImport {
+        index,
+        searcher,
+        fields,
+        manifest,
+        previous_version,
+        changes,
+        spool,
+        report,
+    })))
+}
+
+impl CompletedImport {
+    fn publish(self, update_lock: &File) -> Result<PublishedImport<'_>> {
+        let Self {
+            index,
+            searcher,
+            fields,
+            mut manifest,
+            previous_version,
+            changes,
+            mut spool,
+            report,
+        } = self;
         // The budget is split across workers. Small per-worker buffers cause
         // frequent segment flushes and merges for content-heavy transcripts.
         let mut writer = index.writer_with_num_threads(WRITER_THREADS, WRITER_MEMORY_BYTES)?;
@@ -2131,18 +2253,15 @@ fn update_index(
         let mut commit = writer.prepare_commit()?;
         commit.set_payload(&serde_json::to_string(&manifest)?);
         commit.commit()?;
-        // Dropping a writer prevents its merges from publishing but does not stop
-        // their work. Finish them so later updates do not repeat discarded merges.
-        writer.wait_merging_threads()?;
+        Ok(PublishedImport {
+            writer,
+            report,
+            _index: index,
+            _searcher: searcher,
+            _spool: spool,
+            _update_lock: update_lock,
+        })
     }
-    Ok(ImportReport {
-        outcome: if failed {
-            Outcome::CompletedWithSourceFailures
-        } else {
-            Outcome::Completed
-        },
-        sources: reports,
-    })
 }
 
 #[cfg(test)]
