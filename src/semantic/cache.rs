@@ -24,7 +24,7 @@
 use super::{Cache, DocumentCache, DocumentPlan, EmbeddingDocument};
 use crate::config::{Config, lock};
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::{collections::HashMap, fs, path::Path, time::Duration};
 
 const DATABASE: &str = "cache.sqlite3";
@@ -36,6 +36,24 @@ const MAX_AGE: i64 = 30 * 24 * 60 * 60;
 struct Database {
     connection: Connection,
     budget: i64,
+}
+
+// A successful commit does not imply that its WAL could be checkpointed.
+// Keep that outcome separate from errors before commit, while returning the
+// original checkpoint error to callers that require the whole write to finish.
+#[must_use]
+enum CommitOutcome {
+    Checkpointed,
+    CommittedButNotCheckpointed(anyhow::Error),
+}
+
+impl CommitOutcome {
+    fn into_result(self) -> Result<()> {
+        match self {
+            Self::Checkpointed => Ok(()),
+            Self::CommittedButNotCheckpointed(error) => Err(error),
+        }
+    }
 }
 
 enum Mapping {
@@ -102,13 +120,10 @@ impl Database {
              PRAGMA journal_size_limit=0;",
         )?;
         connection.pragma_update(None, "max_page_count", pages)?;
-        let db = Self { connection, budget };
+        let mut db = Self { connection, budget };
         // No spilling: a transaction writes each dirty page once, bounding its
         // WAL to max_page_count frames (page bytes plus 24 bytes per frame).
-        // Do not append another transaction behind a pinned WAL. With trwl's
-        // short, serialized snapshots this only fails for an external reader.
-        db.checkpoint()?;
-        let schema = db.connection.unchecked_transaction()?;
+        let schema = db.begin_write()?;
         schema.execute_batch(
             "CREATE TABLE IF NOT EXISTS selections (
                  selection TEXT PRIMARY KEY, version TEXT NOT NULL,
@@ -137,8 +152,15 @@ impl Database {
                  FOREIGN KEY(selection,event) REFERENCES documents ON DELETE CASCADE);",
         )?;
         schema.commit()?;
-        db.checkpoint()?;
+        db.checkpoint_committed().into_result()?;
         Ok(db)
+    }
+
+    fn begin_write(&mut self) -> Result<Transaction<'_>> {
+        // Do not append another transaction behind a pinned WAL. With trwl's
+        // short, serialized snapshots this only fails for an external reader.
+        self.checkpoint()?;
+        Ok(self.connection.transaction()?)
     }
 
     fn checkpoint(&self) -> Result<()> {
@@ -152,27 +174,34 @@ impl Database {
         Ok(())
     }
 
-    fn maintain(&mut self) -> Result<()> {
-        self.checkpoint()?;
-        let tx = self.connection.transaction()?;
+    fn checkpoint_committed(&self) -> CommitOutcome {
+        match self.checkpoint() {
+            Ok(()) => CommitOutcome::Checkpointed,
+            Err(error) => CommitOutcome::CommittedButNotCheckpointed(error),
+        }
+    }
+
+    fn maintain(&mut self) -> Result<CommitOutcome> {
+        let budget = self.budget;
+        let tx = self.begin_write()?;
         tx.execute(
             "DELETE FROM selections WHERE touched < unixepoch() - ?",
             [MAX_AGE],
         )?;
-        Self::trim(&tx, self.budget, None)?;
+        Self::trim(&tx, budget, None)?;
         tx.commit()?;
         // FULL auto-vacuum truncates freed tail pages at commit; checkpointing
         // transfers that truncation to the database and removes the WAL bytes.
-        self.checkpoint()
+        Ok(self.checkpoint_committed())
     }
 
-    fn touch(&self, selection: &str) -> Result<()> {
+    fn touch(&self, selection: &str) -> Result<CommitOutcome> {
         // Avoid a metadata write for every query.
         self.connection.execute(
             "UPDATE selections SET touched=unixepoch() WHERE selection=? AND touched < unixepoch()-86400",
             [selection],
         )?;
-        self.checkpoint()
+        Ok(self.checkpoint_committed())
     }
 
     fn trim(tx: &Connection, budget: i64, keep: Option<&str>) -> Result<()> {
@@ -271,7 +300,11 @@ impl Database {
         Ok(Some(documents))
     }
 
-    fn publish_snapshot(&mut self, plan: &DocumentPlan<'_>, vectors: &Cache) -> Result<()> {
+    fn publish_snapshot(
+        &mut self,
+        plan: &DocumentPlan<'_>,
+        vectors: &Cache,
+    ) -> Result<CommitOutcome> {
         let selection = &plan.selection.key;
         let mapping = Mapping::read(&self.connection, selection)?;
         self.publish(
@@ -288,9 +321,9 @@ impl Database {
         version: &str,
         documents: Option<&[EmbeddingDocument]>,
         vectors: &Cache,
-    ) -> Result<()> {
-        self.checkpoint()?;
-        let tx = self.connection.transaction()?;
+    ) -> Result<CommitOutcome> {
+        let budget = self.budget;
+        let tx = self.begin_write()?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO selections(selection,version,touched) VALUES (?,?,unixepoch())",
             params![selection, version],
@@ -393,9 +426,9 @@ impl Database {
             (SELECT coalesce(sum(length(input)+length(event)+length(chunks)+128),0) FROM prepared WHERE selection=?1) +
             (SELECT coalesce(sum(length(key)+length(vector)+128),0) FROM vectors WHERE selection=?1)
             WHERE selection=?1", [selection])?;
-        Self::trim(&tx, self.budget, Some(selection))?;
+        Self::trim(&tx, budget, Some(selection))?;
         tx.commit()?;
-        self.checkpoint()
+        Ok(self.checkpoint_committed())
     }
 }
 
@@ -465,17 +498,21 @@ fn with_database<T>(
     let path = directory.join(DATABASE);
     let result: Result<T> = (|| {
         let mut db = Database::open(&path, MAX_BYTES, MAX_PAGES)?;
-        db.maintain()?;
+        db.maintain()?.into_result()?;
         if let Some((vectors, documents)) = old {
             db.publish(
                 selection,
                 documents.as_ref().map_or("", |d| d.version.as_str()),
                 documents.as_ref().map(|d| d.documents.as_slice()),
                 &vectors,
-            )?;
+            )?
+            .into_result()?;
         }
+        // Metadata operations and touch share this access's preflight and final
+        // checkpoint, but retain their separate autocommits. An external reader
+        // can pin the WAL between them; the next access must pass preflight again.
         let value = operation(&mut db)?;
-        db.touch(selection)?;
+        db.touch(selection)?.into_result()?;
         Ok(value)
     })();
     if result.as_ref().err().is_some_and(|e| {
@@ -549,7 +586,8 @@ pub(super) fn publish_mapping(config: &Config, plan: &DocumentPlan<'_>) -> Resul
             &plan.version,
             Some(&plan.documents),
             &Cache::default(),
-        )
+        )?
+        .into_result()
     })
 }
 
@@ -601,7 +639,7 @@ pub(super) fn publish_batch(
     // A status check or another pinned reader may have replaced the map
     // during inference. Otherwise only write the newly completed batch.
     with_database(config, &plan.selection.key, |db| {
-        db.publish_snapshot(plan, vectors)
+        db.publish_snapshot(plan, vectors)?.into_result()
     })
 }
 
@@ -611,7 +649,7 @@ pub(super) fn repair_snapshot(
     vectors: &Cache,
 ) -> Result<()> {
     with_database(config, &plan.selection.key, |db| {
-        db.publish_snapshot(plan, vectors)
+        db.publish_snapshot(plan, vectors)?.into_result()
     })
 }
 
@@ -705,7 +743,8 @@ mod tests {
         vectors: &Cache,
     ) {
         with_database(config, selection, |db| {
-            db.publish(selection, version, Some(documents), vectors)
+            db.publish(selection, version, Some(documents), vectors)?
+                .into_result()
         })
         .unwrap();
     }
@@ -903,9 +942,11 @@ mod tests {
         let mut db = Database::open(&dir.path().join(DATABASE), MAX_BYTES, MAX_PAGES).unwrap();
         let (first, vectors) = fixture("first", 2);
         db.publish("model", "commit1", Some(&first), &vectors)
+            .and_then(CommitOutcome::into_result)
             .unwrap();
         let (next, vectors) = fixture("next", 2);
         db.publish("model", "commit2", Some(&next), &vectors)
+            .and_then(CommitOutcome::into_result)
             .unwrap();
         assert!(db.documents("model", "commit1").unwrap().is_none());
         assert_eq!(
@@ -926,6 +967,7 @@ mod tests {
         for n in 0..8 {
             let selection = format!("model{n}");
             db.publish(&selection, "commit", Some(&documents), &vectors)
+                .and_then(CommitOutcome::into_result)
                 .unwrap();
             let count: i64 = db
                 .connection
@@ -944,12 +986,13 @@ mod tests {
         db.connection
             .execute("UPDATE selections SET touched=0", [])
             .unwrap();
-        db.maintain().unwrap();
+        db.maintain().and_then(CommitOutcome::into_result).unwrap();
         assert!(db.vectors("model7").unwrap().vectors.is_empty());
         assert!(fs::metadata(&path).unwrap().len() < grown / 2);
         let (documents, vectors) = fixture("small", 2);
         for n in 0..8 {
             db.publish(&format!("model{n}"), "commit", Some(&documents), &vectors)
+                .and_then(CommitOutcome::into_result)
                 .unwrap();
         }
         let count: i64 = db
@@ -981,7 +1024,9 @@ mod tests {
         let path = dir.path().join(DATABASE);
         let mut db = Database::open(&path, 10_000, MAX_PAGES).unwrap();
         let (first, vectors) = fixture("first", 2);
-        db.publish("model", "old", Some(&first), &vectors).unwrap();
+        db.publish("model", "old", Some(&first), &vectors)
+            .and_then(CommitOutcome::into_result)
+            .unwrap();
         let (large, vectors) = fixture("large", 10_000);
         assert!(db.publish("model", "new", Some(&large), &vectors).is_err());
         assert!(db.documents("model", "old").unwrap().is_some());
@@ -996,7 +1041,18 @@ mod tests {
         let (next, vectors) = fixture("next", 2);
         // Publication is atomic even if an external snapshot prevents its final
         // checkpoint. The next writer must not append behind that snapshot.
-        assert!(db.publish("model", "new", Some(&next), &vectors).is_err());
+        let outcome = db.publish("model", "new", Some(&next), &vectors).unwrap();
+        assert!(matches!(
+            &outcome,
+            CommitOutcome::CommittedButNotCheckpointed(_)
+        ));
+        assert!(
+            outcome
+                .into_result()
+                .unwrap_err()
+                .to_string()
+                .contains("pinned reader")
+        );
         let version: String = reader
             .query_row("SELECT version FROM selections", [], |r| r.get(0))
             .unwrap();
@@ -1004,15 +1060,24 @@ mod tests {
         let wal = path.with_file_name(format!("{DATABASE}-wal"));
         let size = fs::metadata(&wal).unwrap().len();
         assert!(size > 0);
-        assert!(
-            db.publish("model", "newer", Some(&first), &Cache::default())
-                .is_err()
-        );
-        assert_eq!(fs::metadata(&wal).unwrap().len(), size);
+        for _ in 0..3 {
+            assert!(
+                db.publish("model", "newer", Some(&first), &Cache::default())
+                    .is_err()
+            );
+            assert_eq!(fs::metadata(&wal).unwrap().len(), size);
+        }
         reader.execute_batch("COMMIT").unwrap();
         db.checkpoint().unwrap();
         assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
         assert!(db.documents("model", "new").unwrap().is_some());
+        let (repaired, vectors) = fixture("repaired", 2);
+        db.publish("model", "repaired", Some(&repaired), &vectors)
+            .and_then(CommitOutcome::into_result)
+            .unwrap();
+        assert_eq!(db.vectors("model").unwrap().vectors, vectors.vectors);
+        assert!(db.documents("model", "repaired").unwrap().is_some());
+        assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
     }
 
     #[test]
@@ -1038,7 +1103,8 @@ mod tests {
                 .query_row("PRAGMA page_count", [], |r| r.get(0))?;
             db.connection.pragma_update(None, "max_page_count", pages)?;
             let (large, vectors) = fixture("huge", 100_000);
-            db.publish("model", "new", Some(&large), &vectors)
+            db.publish("model", "new", Some(&large), &vectors)?
+                .into_result()
         })
         .unwrap_err();
         assert!(format!("{error:#}").contains("cache cleared"), "{error:#}");
@@ -1109,7 +1175,8 @@ mod tests {
         let failed = with_database(&config, "model", |db| {
             db.budget = 1;
             let (documents, vectors) = fixture("replacement", 2);
-            db.publish("model", "replacement", Some(&documents), &vectors)
+            db.publish("model", "replacement", Some(&documents), &vectors)?
+                .into_result()
         })
         .unwrap_err();
         assert!(failed.to_string().contains("budget"), "{failed:#}");
@@ -1160,6 +1227,7 @@ mod tests {
         let (documents, vectors) = fixture("chunk", 2);
         for n in 0..4 {
             db.publish(&format!("model{n}"), "commit", Some(&documents), &vectors)
+                .and_then(CommitOutcome::into_result)
                 .unwrap();
             db.connection
                 .execute(
@@ -1168,8 +1236,11 @@ mod tests {
                 )
                 .unwrap();
         }
-        db.touch("model0").unwrap();
+        db.touch("model0")
+            .and_then(CommitOutcome::into_result)
+            .unwrap();
         db.publish("model4", "commit", Some(&documents), &vectors)
+            .and_then(CommitOutcome::into_result)
             .unwrap();
         assert!(db.documents("model1", "commit").unwrap().is_none());
         for model in ["model0", "model2", "model3", "model4"] {
