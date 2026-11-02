@@ -1867,9 +1867,7 @@ pub fn update(config: &Config, sources: &[Source], progress: bool) -> Result<Imp
     )
 }
 
-/// Reparse every input without its stored checkpoint. This catches edits that
-/// incremental imports miss, such as an OpenCode row rewritten in place with
-/// the same size and `time_updated`.
+/// Reparse every input without its stored checkpoint.
 pub fn update_full(config: &Config, sources: &[Source], progress: bool) -> Result<ImportReport> {
     update_with_parser(
         config,
@@ -3468,11 +3466,10 @@ pub(crate) mod tests {
         write(insert, "p1", "uno");
         update(&config, std::slice::from_ref(&source), false).unwrap();
         assert_eq!(texts(), ["two", "uno"]);
-        // An in-place update keeps every fingerprint component; only a full
-        // import reparses it.
+        // The in-place edit keeps the data size and timestamps.
         write("UPDATE part SET data = ?2 WHERE id = ?1", "p2", "dos");
         update(&config, std::slice::from_ref(&source), false).unwrap();
-        assert_eq!(texts(), ["two", "uno"]);
+        assert_eq!(texts(), ["dos", "uno"]);
         assert!(
             update_full(&config, std::slice::from_ref(&source), false)
                 .unwrap()

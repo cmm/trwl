@@ -565,6 +565,18 @@ def updates(case):
                 f"incremental {key} differs from full import",
             )
 
+    same_size = replacement.replace("revisedorchard", "changedorchard")
+    require(len(same_size) == len(replacement), "fixture edit changes size")
+    with closing(sqlite3.connect(fixture.path)) as db, db:
+        db.execute(
+            "UPDATE part SET data = replace(data, ?, ?) WHERE id = ?",
+            ("revisedorchard", "changedorchard", "part_msg_edit"),
+        )
+    matches_full_import()
+    _message(case, "changedorchard", same_size, "opencode", session)
+    require(not _events(case, "revisedorchard"), "same-size edit left old content")
+    case.check("same-size edit with unchanged timestamps matches full import")
+
     # A long unchanged beginning mixes one- and two-event parts with a rejected
     # row. Suffix updates must resume event sequences and rejection diagnostics,
     # not infer either from the number of native rows they skip.

@@ -3,9 +3,8 @@
 //! A parse returns a [`Checkpoint`] passed to the input's next parse, and
 //! which previously indexed records its output replaces.
 //!
-//! OpenCode: one read transaction per parse. Each session is fingerprinted
-//! from its row and aggregates over its parts and messages; only sessions
-//! whose fingerprint changed are read. Saved row prefixes let the parser keep
+//! OpenCode: one read transaction per parse. Saved row prefixes verify each
+//! session and let the parser keep
 //! an unchanged beginning and replace only the suffix, including sequence
 //! numbers after an insertion or deletion. Deleted sessions are removed.
 //!
@@ -106,7 +105,6 @@ pub enum Checkpoint {
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct SqliteSession {
-    fingerprint: String,
     records: usize,
     diagnostics: Diagnostics,
     #[serde(default)]
@@ -193,9 +191,8 @@ impl VerifiedSqlitePrefix {
         });
     }
 
-    fn capture(self, fingerprint: String) -> SqliteSession {
+    fn capture(self) -> SqliteSession {
         SqliteSession {
-            fingerprint,
             records: self.output.records.0,
             diagnostics: self.output.diagnostics,
             prefixes: self.prefixes,
@@ -270,7 +267,7 @@ pub fn parse(
 /// Invalidate cached parses when normalized content or supported formats change.
 pub fn parser_revision(provider: Provider) -> u32 {
     match provider {
-        Provider::Opencode => 5,
+        Provider::Opencode => 6,
         Provider::Pi | Provider::Claude => 4,
         Provider::CopilotCli => 3,
         Provider::Codex => 2,
@@ -596,55 +593,6 @@ fn file_paths(tool: &str, args: &Value) -> Vec<String> {
     paths
 }
 
-/// Fingerprint each OpenCode session from its own row and aggregates over its
-/// parts and messages. OpenCode sets `time_updated` on every insert and
-/// update; row counts and data sizes also reflect deletions. Rowids change
-/// when a writer replaces a row, except when it deletes and re-inserts the
-/// table's last row. A same-size `UPDATE` that keeps `time_updated` is not
-/// detected; a full import reparses it.
-fn opencode_fingerprints(
-    db: &Connection,
-    schema: OpencodeSchema,
-) -> Result<BTreeMap<String, String>> {
-    const AGGREGATE: &str = "count(*) || ':' || ifnull(max(time_updated), '') || ':' \
-        || total(time_updated) || ':' || total(octet_length(data)) || ':' || total(rowid)";
-    let sql = match schema {
-        OpencodeSchema::V1 => format!(
-            "SELECT s.id, s.directory, s.parent_id,
-           (SELECT {AGGREGATE} FROM part WHERE session_id = s.id),
-           (SELECT {AGGREGATE} FROM message WHERE session_id = s.id)
-         FROM session s"
-        ),
-        OpencodeSchema::V2 { has_parts } => {
-            let parts = if has_parts {
-                format!(
-                    "'v2:' || (SELECT {AGGREGATE} || ':' || total(ordinal)
-                     FROM session_part WHERE session_id = s.id)"
-                )
-            } else {
-                "'v2'".into()
-            };
-            format!(
-                "SELECT s.id, s.directory, s.parent_id,
-                   (SELECT {AGGREGATE} || ':' || total(seq) FROM session_message WHERE session_id = s.id),
-                   {parts}
-                 FROM session_v2 s"
-            )
-        }
-    };
-    let mut statement = db.prepare(&sql)?;
-    let mut rows = statement.query([])?;
-    let mut sessions = BTreeMap::new();
-    while let Some(row) = rows.next()? {
-        let columns = (1..5)
-            .map(|i| Ok(row.get::<_, Option<String>>(i)?.unwrap_or_default()))
-            .collect::<Result<Vec<_>>>()?;
-        let columns: Vec<_> = columns.iter().map(String::as_str).collect();
-        sessions.insert(row.get(0)?, digest(&columns));
-    }
-    Ok(sessions)
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpencodeSchema {
     V1,
@@ -692,14 +640,14 @@ impl OpencodeSchema {
     }
 }
 
-/// Read changed sessions, verifying their saved prefixes before emitting a suffix.
+/// Verify session prefixes before emitting changed suffixes.
 fn opencode(
     path: &Path,
     previous: Option<&BTreeMap<String, SqliteSession>>,
     emit: &mut impl FnMut(&Record) -> Result<()>,
 ) -> Result<Parsed> {
     // A read transaction includes committed WAL content without copying or
-    // modifying input; fingerprints and records come from the same snapshot.
+    // modifying input; verification and records come from the same snapshot.
     let mut db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     let tx = db.transaction()?;
@@ -720,12 +668,18 @@ fn opencode(
         });
     }
     ensure!(!schemas.is_empty(), "no supported OpenCode session tables");
-    let mut fingerprints = BTreeMap::new();
+    let mut session_schemas = BTreeMap::new();
     for &schema in &schemas {
-        for (id, fingerprint) in opencode_fingerprints(&tx, schema)? {
+        let sql = match schema {
+            OpencodeSchema::V1 => "SELECT id FROM session",
+            OpencodeSchema::V2 { .. } => "SELECT id FROM session_v2",
+        };
+        let mut statement = tx.prepare(sql)?;
+        let ids = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for id in ids {
             // OpenCode's v1 migration copies session IDs and keeps legacy rows.
             // Prefer the v2 copy so migrated transcripts are not indexed twice.
-            fingerprints.insert(id, (schema, fingerprint));
+            session_schemas.insert(id?, schema);
         }
     }
     // Sort row IDs rather than full JSON payloads, which can spill to temporary
@@ -735,91 +689,88 @@ fn opencode(
     for schema in schemas {
         let mut ordered = tx.prepare(schema.ordered_sql())?;
         let mut statement = tx.prepare(&schema.payload_sql())?;
-        for (id, (_, fingerprint)) in fingerprints.iter().filter(|(_, (s, _))| *s == schema) {
+        for (id, _) in session_schemas.iter().filter(|(_, s)| **s == schema) {
             let old = previous.and_then(|sessions| sessions.get(id));
-            let session = match old {
-                Some(old) if &old.fingerprint == fingerprint => old.clone(),
-                _ => {
-                    let mut rows = ordered.query([&id])?;
-                    let mut verified = VerifiedSqlitePrefix::default();
-                    if let Some(old) = old {
-                        for prefix in &old.prefixes {
-                            let mut position = verified.position.clone();
-                            while position.rows < prefix.rows {
-                                let Some(row) = rows.next()? else { break };
-                                let mut payload = statement.query([row.get::<_, i64>(0)?])?;
-                                let row = payload
-                                    .next()?
-                                    .context("OpenCode row missing from snapshot")?;
-                                hash_opencode_row(&mut position.hasher, row)?;
-                                position.rows += 1;
-                            }
-                            if position.rows != prefix.rows
-                                || hex::encode(position.hasher.clone().finalize()) != prefix.hash
-                            {
-                                // A growing session can also contain edits, removals
-                                // or parts inserted before the old end. Restart at
-                                // the last verified prefix, before staging records.
-                                break;
-                            }
-                            verified = verified.advance(prefix, position);
+            let session = {
+                let mut rows = ordered.query([&id])?;
+                let mut verified = VerifiedSqlitePrefix::default();
+                if let Some(old) = old {
+                    for prefix in &old.prefixes {
+                        let mut position = verified.position.clone();
+                        while position.rows < prefix.rows {
+                            let Some(row) = rows.next()? else { break };
+                            let mut payload = statement.query([row.get::<_, i64>(0)?])?;
+                            let row = payload
+                                .next()?
+                                .context("OpenCode row missing from snapshot")?;
+                            hash_opencode_row(&mut position.hasher, row)?;
+                            position.rows += 1;
+                        }
+                        if position.rows != prefix.rows
+                            || hex::encode(position.hasher.clone().finalize()) != prefix.hash
+                        {
+                            // A growing session can also contain edits, removals
+                            // or parts inserted before the old end. Restart at
+                            // the last verified prefix, before staging records.
+                            break;
+                        }
+                        verified = verified.advance(prefix, position);
+                    }
+                }
+                let SqliteResume {
+                    mut rows,
+                    mut verified,
+                    replacement,
+                } = if old.is_some_and(|old| verified.prefixes.len() != old.prefixes.len()) {
+                    drop(rows);
+                    verified.restart(&mut ordered, id)?
+                } else if old.is_some_and(|old| old.prefixes.is_empty()) {
+                    verified.replace(rows, id)
+                } else {
+                    SqliteResume {
+                        rows,
+                        verified,
+                        replacement: None,
+                    }
+                };
+                changed.extend(replacement);
+                // Keep checkpoints every 64 rows and at the end, rather than
+                // accumulating one checkpoint for every small append.
+                const PREFIX_ROWS: usize = 64;
+                if verified
+                    .prefixes
+                    .last()
+                    .is_some_and(|p| p.rows % PREFIX_ROWS != 0)
+                {
+                    verified.prefixes.pop();
+                }
+                while let Some(row) = rows.next()? {
+                    let mut payload = statement.query([row.get::<_, i64>(0)?])?;
+                    let row = payload
+                        .next()?
+                        .context("OpenCode row missing from snapshot")?;
+                    hash_opencode_row(&mut verified.position.hasher, row)?;
+                    verified.position.rows += 1;
+                    match schema {
+                        OpencodeSchema::V1 => {
+                            opencode_part(path, id, row, &mut verified.output, emit)?
+                        }
+                        OpencodeSchema::V2 { .. } => {
+                            opencode_v2_message(path, id, row, &mut verified.output, emit)?
                         }
                     }
-                    let SqliteResume {
-                        mut rows,
-                        mut verified,
-                        replacement,
-                    } = if old.is_some_and(|old| verified.prefixes.len() != old.prefixes.len()) {
-                        drop(rows);
-                        verified.restart(&mut ordered, id)?
-                    } else if old.is_some_and(|old| old.prefixes.is_empty()) {
-                        verified.replace(rows, id)
-                    } else {
-                        SqliteResume {
-                            rows,
-                            verified,
-                            replacement: None,
-                        }
-                    };
-                    changed.extend(replacement);
-                    // Keep checkpoints every 64 rows and at the end, rather than
-                    // accumulating one checkpoint for every small append.
-                    const PREFIX_ROWS: usize = 64;
-                    if verified
-                        .prefixes
-                        .last()
-                        .is_some_and(|p| p.rows % PREFIX_ROWS != 0)
-                    {
-                        verified.prefixes.pop();
-                    }
-                    while let Some(row) = rows.next()? {
-                        let mut payload = statement.query([row.get::<_, i64>(0)?])?;
-                        let row = payload
-                            .next()?
-                            .context("OpenCode row missing from snapshot")?;
-                        hash_opencode_row(&mut verified.position.hasher, row)?;
-                        verified.position.rows += 1;
-                        match schema {
-                            OpencodeSchema::V1 => {
-                                opencode_part(path, id, row, &mut verified.output, emit)?
-                            }
-                            OpencodeSchema::V2 { .. } => {
-                                opencode_v2_message(path, id, row, &mut verified.output, emit)?
-                            }
-                        }
-                        if verified.position.rows % PREFIX_ROWS == 0 {
-                            verified.save_prefix();
-                        }
-                    }
-                    if verified
-                        .prefixes
-                        .last()
-                        .is_none_or(|p| p.rows != verified.position.rows)
-                    {
+                    if verified.position.rows % PREFIX_ROWS == 0 {
                         verified.save_prefix();
                     }
-                    verified.capture(fingerprint.clone())
                 }
+                if verified
+                    .prefixes
+                    .last()
+                    .is_none_or(|p| p.rows != verified.position.rows)
+                {
+                    verified.save_prefix();
+                }
+                verified.capture()
             };
             sessions.insert(id.clone(), session);
         }
