@@ -25,7 +25,12 @@ use super::{Cache, DocumentCache, DocumentPlan, EmbeddingDocument};
 use crate::config::{Config, lock};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use std::{collections::HashMap, fs, path::Path, time::Duration};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 const DATABASE: &str = "cache.sqlite3";
 const MAX_BYTES: i64 = 128 * 1024 * 1024;
@@ -36,6 +41,21 @@ const MAX_AGE: i64 = 30 * 24 * 60 * 60;
 struct Database {
     connection: Connection,
     budget: i64,
+}
+
+enum Eviction<'a> {
+    AnySelection,
+    ProtectPublication(&'a str),
+}
+
+struct LegacyMigration {
+    vectors: Cache,
+    documents: Option<DocumentCache>,
+}
+
+struct LockedCache {
+    directory: PathBuf,
+    _lock: fs::File,
 }
 
 // A successful commit does not imply that its WAL could be checkpointed.
@@ -181,14 +201,14 @@ impl Database {
         }
     }
 
-    fn maintain(&mut self) -> Result<CommitOutcome> {
+    fn expire_and_evict(&mut self) -> Result<CommitOutcome> {
         let budget = self.budget;
         let tx = self.begin_write()?;
         tx.execute(
             "DELETE FROM selections WHERE touched < unixepoch() - ?",
             [MAX_AGE],
         )?;
-        Self::trim(&tx, budget, None)?;
+        Self::evict_to_limits(&tx, budget, Eviction::AnySelection)?;
         tx.commit()?;
         // FULL auto-vacuum truncates freed tail pages at commit; checkpointing
         // transfers that truncation to the database and removes the WAL bytes.
@@ -204,7 +224,11 @@ impl Database {
         Ok(self.checkpoint_committed())
     }
 
-    fn trim(tx: &Connection, budget: i64, keep: Option<&str>) -> Result<()> {
+    fn evict_to_limits(tx: &Connection, budget: i64, eviction: Eviction<'_>) -> Result<()> {
+        let keep = match eviction {
+            Eviction::AnySelection => None,
+            Eviction::ProtectPublication(selection) => Some(selection),
+        };
         loop {
             let (bytes, count): (i64, i64) = tx.query_row(
                 "SELECT coalesce(sum(bytes),0), count(*) FROM selections",
@@ -426,7 +450,7 @@ impl Database {
             (SELECT coalesce(sum(length(input)+length(event)+length(chunks)+128),0) FROM prepared WHERE selection=?1) +
             (SELECT coalesce(sum(length(key)+length(vector)+128),0) FROM vectors WHERE selection=?1)
             WHERE selection=?1", [selection])?;
-        Self::trim(&tx, budget, Some(selection))?;
+        Self::evict_to_limits(&tx, budget, Eviction::ProtectPublication(selection))?;
         tx.commit()?;
         Ok(self.checkpoint_committed())
     }
@@ -442,71 +466,85 @@ fn remove(path: &Path) -> Result<()> {
 // Import only the selected legacy cache. Drop other selections, old per-commit
 // maps and abandoned atomic-write files before any SQLite allocation. Useful
 // vectors stay in memory during migration, so cleanup needs no second full copy.
-fn legacy(directory: &Path, selection: &str) -> Result<Option<(Cache, Option<DocumentCache>)>> {
-    let vector_name = format!("{selection}.msgpack");
-    let document_name = format!("documents-{selection}.msgpack");
-    let mut vector_path = None;
-    let mut document_path = None;
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == vector_name {
-            vector_path = Some(entry.path());
-        } else if name == document_name {
-            document_path = Some(entry.path());
-        } else if name.ends_with(".msgpack") || name.contains(".tmp-") {
-            remove(&entry.path())?;
-        }
-    }
-    if vector_path.is_none() && document_path.is_none() {
-        return Ok(None);
-    }
-    let decoded = (|| {
-        let vectors = match &vector_path {
-            Some(path) => {
-                rmp_serde::from_slice(&fs::read(path)?).context("invalid semantic cache")?
+impl LegacyMigration {
+    fn read_and_remove(directory: &Path, selection: &str) -> Result<Option<Self>> {
+        let vector_name = format!("{selection}.msgpack");
+        let document_name = format!("documents-{selection}.msgpack");
+        let mut vector_path = None;
+        let mut document_path = None;
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
             }
-            None => Cache::default(),
-        };
-        let documents = document_path
-            .as_ref()
-            .map(|path| -> Result<DocumentCache> {
-                rmp_serde::from_slice(&fs::read(path)?).context("invalid semantic document cache")
-            })
-            .transpose()?;
-        Ok((vectors, documents))
-    })();
-    for path in [vector_path, document_path].into_iter().flatten() {
-        remove(&path)?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == vector_name {
+                vector_path = Some(entry.path());
+            } else if name == document_name {
+                document_path = Some(entry.path());
+            } else if name.ends_with(".msgpack") || name.contains(".tmp-") {
+                remove(&entry.path())?;
+            }
+        }
+        if vector_path.is_none() && document_path.is_none() {
+            return Ok(None);
+        }
+        let decoded = (|| {
+            let vectors = match &vector_path {
+                Some(path) => {
+                    rmp_serde::from_slice(&fs::read(path)?).context("invalid semantic cache")?
+                }
+                None => Cache::default(),
+            };
+            let documents = document_path
+                .as_ref()
+                .map(|path| -> Result<DocumentCache> {
+                    rmp_serde::from_slice(&fs::read(path)?)
+                        .context("invalid semantic document cache")
+                })
+                .transpose()?;
+            Ok(Self { vectors, documents })
+        })();
+        for path in [vector_path, document_path].into_iter().flatten() {
+            remove(&path)?;
+        }
+        decoded.map(Some)
     }
-    decoded.map(Some)
+
+    fn publish(self, db: &mut Database, selection: &str) -> Result<CommitOutcome> {
+        db.publish(
+            selection,
+            self.documents.as_ref().map_or("", |d| d.version.as_str()),
+            self.documents.as_ref().map(|d| d.documents.as_slice()),
+            &self.vectors,
+        )
+    }
 }
 
-fn with_database<T>(
-    config: &Config,
-    selection: &str,
-    operation: impl FnOnce(&mut Database) -> Result<T>,
-) -> Result<T> {
-    let _lock = lock(&config.directories.cache, "semantic-cache.lock")?;
-    let directory = config.directories.cache.join("semantic");
-    fs::create_dir_all(&directory)?;
-    let old = legacy(&directory, selection)?;
-    let path = directory.join(DATABASE);
-    let result: Result<T> = (|| {
-        let mut db = Database::open(&path, MAX_BYTES, MAX_PAGES)?;
-        db.maintain()?.into_result()?;
-        if let Some((vectors, documents)) = old {
-            db.publish(
-                selection,
-                documents.as_ref().map_or("", |d| d.version.as_str()),
-                documents.as_ref().map(|d| d.documents.as_slice()),
-                &vectors,
-            )?
-            .into_result()?;
+impl LockedCache {
+    fn acquire(config: &Config) -> Result<Self> {
+        let lock = lock(&config.directories.cache, "semantic-cache.lock")?;
+        let directory = config.directories.cache.join("semantic");
+        fs::create_dir_all(&directory)?;
+        Ok(Self {
+            directory,
+            _lock: lock,
+        })
+    }
+
+    // Own the operation connection here so every return closes it before the
+    // caller classifies failures or removes files under the same cache lock.
+    fn run_connected<T>(
+        &self,
+        selection: &str,
+        migration: Option<LegacyMigration>,
+        operation: impl FnOnce(&mut Database) -> Result<T>,
+    ) -> Result<T> {
+        let mut db = Database::open(&self.directory.join(DATABASE), MAX_BYTES, MAX_PAGES)?;
+        db.expire_and_evict()?.into_result()?;
+        if let Some(migration) = migration {
+            migration.publish(&mut db, selection)?.into_result()?;
         }
         // Metadata operations and touch share this access's preflight and final
         // checkpoint, but retain their separate autocommits. An external reader
@@ -514,28 +552,42 @@ fn with_database<T>(
         let value = operation(&mut db)?;
         db.touch(selection)?.into_result()?;
         Ok(value)
-    })();
-    if result.as_ref().err().is_some_and(|e| {
-        e.chain().any(|e| {
-            matches!(
-                e.downcast_ref::<rusqlite::Error>(),
-                Some(rusqlite::Error::SqliteFailure(code, _))
-                    if code.code == rusqlite::ErrorCode::DiskFull
-            )
-        })
-    }) {
-        // The connection has closed and semantic-cache.lock excludes all trwl readers.
-        // Unlinking needs no new database/WAL pages, even on a full filesystem.
-        for name in [
-            DATABASE.to_owned(),
-            format!("{DATABASE}-wal"),
-            format!("{DATABASE}-shm"),
-        ] {
-            remove(&directory.join(name))?;
-        }
-        return result.context("semantic cache exhausted disk space or its page limit; cache cleared, history unchanged; retry --refresh wait");
     }
-    result
+
+    fn reset_if_disk_full<T>(&self, result: Result<T>) -> Result<T> {
+        if result.as_ref().err().is_some_and(|e| {
+            e.chain().any(|e| {
+                matches!(
+                    e.downcast_ref::<rusqlite::Error>(),
+                    Some(rusqlite::Error::SqliteFailure(code, _))
+                        if code.code == rusqlite::ErrorCode::DiskFull
+                )
+            })
+        }) {
+            // The connection has closed and semantic-cache.lock excludes all trwl readers.
+            // Unlinking needs no new database/WAL pages, even on a full filesystem.
+            for name in [
+                DATABASE.to_owned(),
+                format!("{DATABASE}-wal"),
+                format!("{DATABASE}-shm"),
+            ] {
+                remove(&self.directory.join(name))?;
+            }
+            return result.context("semantic cache exhausted disk space or its page limit; cache cleared, history unchanged; retry --refresh wait");
+        }
+        result
+    }
+}
+
+fn with_database<T>(
+    config: &Config,
+    selection: &str,
+    operation: impl FnOnce(&mut Database) -> Result<T>,
+) -> Result<T> {
+    let cache = LockedCache::acquire(config)?;
+    let migration = LegacyMigration::read_and_remove(&cache.directory, selection)?;
+    let result = cache.run_connected(selection, migration, operation);
+    cache.reset_if_disk_full(result)
 }
 
 pub(super) fn load(config: &Config, selection: &str) -> Result<Cache> {
@@ -986,7 +1038,9 @@ mod tests {
         db.connection
             .execute("UPDATE selections SET touched=0", [])
             .unwrap();
-        db.maintain().and_then(CommitOutcome::into_result).unwrap();
+        db.expire_and_evict()
+            .and_then(CommitOutcome::into_result)
+            .unwrap();
         assert!(db.vectors("model7").unwrap().vectors.is_empty());
         assert!(fs::metadata(&path).unwrap().len() < grown / 2);
         let (documents, vectors) = fixture("small", 2);
@@ -1097,6 +1151,21 @@ mod tests {
         let event = index.all().unwrap().remove(0);
         let (documents, vectors) = fixture("first", 2);
         seed(&config, "model", "old", &documents, &vectors);
+        seed(&config, "other", "old", &documents, &vectors);
+        with_database(&config, "other", |db| {
+            db.connection
+                .execute("UPDATE builds SET complete=1 WHERE selection='other'", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            build_history(&config, "model").unwrap(),
+            BuildHistory::Unfinished
+        ));
+        assert!(matches!(
+            build_history(&config, "other").unwrap(),
+            BuildHistory::Completed
+        ));
         let error = with_database(&config, "model", |db| {
             let pages: i64 = db
                 .connection
@@ -1115,13 +1184,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stored.text, event.text);
-        assert!(
-            !config
-                .directories
-                .cache
-                .join("semantic/cache.sqlite3")
-                .exists()
-        );
+        for name in [
+            DATABASE.to_owned(),
+            format!("{DATABASE}-wal"),
+            format!("{DATABASE}-shm"),
+        ] {
+            assert!(
+                !config
+                    .directories
+                    .cache
+                    .join("semantic")
+                    .join(name)
+                    .exists()
+            );
+        }
+        for selection in ["model", "other"] {
+            assert!(matches!(
+                build_history(&config, selection).unwrap(),
+                BuildHistory::Absent
+            ));
+            assert!(load(&config, selection).unwrap().vectors.is_empty());
+        }
         assert!(load(&config, "model").unwrap().vectors.is_empty());
         seed(&config, "model", "recovered", &documents, &vectors);
         assert_eq!(load(&config, "model").unwrap().vectors["first"], [1.0, 1.0]);
@@ -1218,6 +1301,78 @@ mod tests {
         repair_snapshot(&config, &plan, &cached).unwrap();
         mark_build_complete(&config, &plan).unwrap();
         assert!(!build_history(&config, "model").unwrap().needs_full_build());
+    }
+
+    #[test]
+    fn document_only_legacy_cache_migrates_with_missing_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
+        let directory = config.directories.cache.join("semantic");
+        fs::create_dir_all(&directory).unwrap();
+        let (mapped, _) = fixture("missing", 2);
+        let path = directory.join("documents-model.msgpack");
+        fs::write(
+            &path,
+            rmp_serde::to_vec_named(&DocumentCache {
+                version: "commit".into(),
+                documents: mapped,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(load(&config, "model").unwrap().vectors.is_empty());
+        assert_eq!(
+            documents(&config, "model", "commit").unwrap().unwrap()[0].keys,
+            ["missing"]
+        );
+        assert!(!path.exists());
+        assert!(build_history(&config, "model").unwrap().needs_full_build());
+    }
+
+    #[test]
+    fn invalid_legacy_data_is_removed_before_returning_the_decode_error() {
+        for corrupt in ["model.msgpack", "documents-model.msgpack"] {
+            let dir = tempfile::tempdir().unwrap();
+            let config =
+                Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
+            let directory = config.directories.cache.join("semantic");
+            fs::create_dir_all(&directory).unwrap();
+            let (documents, vectors) = fixture("useful", 2);
+            fs::write(
+                directory.join("model.msgpack"),
+                rmp_serde::to_vec(&vectors).unwrap(),
+            )
+            .unwrap();
+            fs::write(
+                directory.join("documents-model.msgpack"),
+                rmp_serde::to_vec_named(&DocumentCache {
+                    version: "commit".into(),
+                    documents,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(directory.join(corrupt), [0xc1]).unwrap();
+            fs::write(directory.join("other.msgpack"), b"unrelated").unwrap();
+            fs::write(directory.join("model.tmp-123"), b"abandoned").unwrap();
+            let error = load(&config, "model").err().unwrap();
+            let expected = if corrupt == "model.msgpack" {
+                "invalid semantic cache"
+            } else {
+                "invalid semantic document cache"
+            };
+            assert!(error.to_string().contains(expected), "{error:#}");
+            for name in [
+                "model.msgpack",
+                "documents-model.msgpack",
+                "other.msgpack",
+                "model.tmp-123",
+                DATABASE,
+            ] {
+                assert!(!directory.join(name).exists(), "{name}");
+            }
+            assert!(load(&config, "model").unwrap().vectors.is_empty());
+        }
     }
 
     #[test]
