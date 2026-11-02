@@ -198,7 +198,7 @@ pub(crate) fn search_index(
                 SnippetSource::Lexical => lexical
                     .as_ref()
                     .context("lexical snippets missing")?
-                    .snippet(index, &r.event_id)?,
+                    .snippet(&r.event_id)?,
                 SnippetSource::Semantic => r
                     .text
                     .chars()

@@ -354,18 +354,19 @@ pub enum LexicalMode {
     All,
 }
 
-pub struct LexicalResults {
+pub struct LexicalResults<'index> {
     pub rows: Vec<(f32, Record)>,
+    index: &'index ReadIndex,
     addresses: HashMap<String, (DocAddress, Option<SourceSpans>)>,
     generators: Vec<SnippetGenerator>,
 }
 
-impl LexicalResults {
-    pub fn snippet(&self, index: &ReadIndex, id: &str) -> Result<String> {
+impl LexicalResults<'_> {
+    pub fn snippet(&self, id: &str) -> Result<String> {
         let (address, source) = self.addresses.get(id).context("lexical result missing")?;
-        let doc: TantivyDocument = index.searcher.doc(*address)?;
+        let doc: TantivyDocument = self.index.searcher.doc(*address)?;
         let text = doc
-            .get_first(index.fields.text)
+            .get_first(self.index.fields.text)
             .and_then(|v| v.as_str())
             .unwrap_or("");
         // Older v6 documents store selected text in `text`; their summary's
@@ -1212,10 +1213,11 @@ impl ReadIndex {
         terms: &[String],
         mode: LexicalMode,
         selection: &dyn Query,
-    ) -> Result<LexicalResults> {
+    ) -> Result<LexicalResults<'_>> {
         if matches!(mode, LexicalMode::Events(0)) {
             return Ok(LexicalResults {
                 rows: Vec::new(),
+                index: self,
                 addresses: HashMap::new(),
                 generators: Vec::new(),
             });
@@ -1280,6 +1282,7 @@ impl ReadIndex {
             .collect::<Result<_>>()?;
         Ok(LexicalResults {
             rows,
+            index: self,
             addresses,
             generators,
         })
@@ -2477,7 +2480,7 @@ pub(crate) mod tests {
             .lexical(&["needle".into()], LexicalMode::Events(1), &*selection)
             .unwrap();
         assert_eq!(hits.rows.len(), 1);
-        let snippet = hits.snippet(&index, &hits.rows[0].1.event_id).unwrap();
+        let snippet = hits.snippet(&hits.rows[0].1.event_id).unwrap();
         assert!(snippet.contains("needle"));
         assert!(snippet.chars().count() <= crate::record::SEARCH_SNIPPET_CHARS);
         assert_eq!(index.record_decodes.get(), 0);
@@ -2520,7 +2523,7 @@ pub(crate) mod tests {
             .lexical(&["ordinary".into()], LexicalMode::Events(1), &*selection)
             .unwrap();
         assert_eq!(hits.rows.len(), 1);
-        let snippet = hits.snippet(&index, &hits.rows[0].1.event_id).unwrap();
+        let snippet = hits.snippet(&hits.rows[0].1.event_id).unwrap();
         assert_eq!(snippet, "ordinary prefix\nordinary suffix");
         assert_eq!(index.record_decodes.get(), 0);
         let full = index
@@ -2638,7 +2641,7 @@ pub(crate) mod tests {
         assert_eq!(hits.rows.len(), 1);
         assert_eq!(index.record_decodes.get(), 0);
         assert_eq!(
-            hits.snippet(&index, &record.event_id).unwrap(),
+            hits.snippet(&record.event_id).unwrap(),
             format!("{before}\n{after}")
         );
         let shown = index
