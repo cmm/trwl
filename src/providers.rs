@@ -1071,73 +1071,244 @@ fn opencode_v2_message(
     Ok(())
 }
 
+#[derive(Default)]
+enum JsonlSession {
+    #[default]
+    AwaitingMetadata,
+    Ready(String),
+}
+
+impl From<String> for JsonlSession {
+    fn from(session: String) -> Self {
+        if session.is_empty() {
+            Self::AwaitingMetadata
+        } else {
+            Self::Ready(session)
+        }
+    }
+}
+
+impl JsonlSession {
+    fn set(&mut self, session: &str) {
+        *self = session.to_owned().into();
+    }
+
+    fn ready(&self) -> Option<&str> {
+        match self {
+            Self::AwaitingMetadata => None,
+            Self::Ready(session) => Some(session),
+        }
+    }
+}
+
+#[derive(Default)]
+struct JsonlContext {
+    session: JsonlSession,
+    workspace: String,
+    parent: Option<String>,
+}
+
+#[derive(Default)]
+struct InputOccurrences(HashMap<String, usize>);
+
+impl InputOccurrences {
+    fn allocate(&mut self, value: &Value) -> String {
+        // For records without native IDs, distinguish identical content by its
+        // occurrence count. Unrelated insertions and deletions do not change IDs.
+        let fallback = digest(&[&value.to_string()]);
+        let count = self.0.entry(fallback.clone()).or_default();
+        let fallback = format!("{fallback}:{count}");
+        *count += 1;
+        fallback
+    }
+}
+
+#[derive(Default)]
+struct EmittedRecords(usize);
+
+impl EmittedRecords {
+    fn emit(
+        &mut self,
+        mut record: Record,
+        sink: &mut impl FnMut(&Record) -> Result<()>,
+    ) -> Result<()> {
+        record.sequence = self.0 as u64;
+        sink(&record)?;
+        self.0 += 1;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct JsonlState {
+    offset: u64,
+    line: usize,
+    hasher: Sha256,
+    context: JsonlContext,
+    input_occurrences: InputOccurrences,
+    emitted_records: EmittedRecords,
+    diagnostics: Diagnostics,
+}
+
+impl JsonlState {
+    fn restore(checkpoint: &JsonlCheckpoint, hasher: Sha256) -> Self {
+        let JsonlCheckpoint {
+            offset,
+            prefix_hash: _,
+            line,
+            session,
+            workspace,
+            parent,
+            fallback_counts,
+            records,
+            diagnostics,
+        } = checkpoint.clone();
+        Self {
+            offset,
+            line,
+            hasher,
+            context: JsonlContext {
+                session: session.into(),
+                workspace,
+                parent,
+            },
+            input_occurrences: InputOccurrences(fallback_counts),
+            emitted_records: EmittedRecords(records),
+            diagnostics,
+        }
+    }
+
+    fn capture(self) -> JsonlCheckpoint {
+        let Self {
+            offset,
+            line,
+            hasher,
+            context,
+            input_occurrences: InputOccurrences(fallback_counts),
+            emitted_records: EmittedRecords(records),
+            diagnostics,
+        } = self;
+        let JsonlContext {
+            session,
+            workspace,
+            parent,
+        } = context;
+        JsonlCheckpoint {
+            offset,
+            prefix_hash: hex::encode(hasher.finalize()),
+            line,
+            session: match session {
+                JsonlSession::AwaitingMetadata => String::new(),
+                JsonlSession::Ready(session) => session,
+            },
+            workspace,
+            parent,
+            fallback_counts,
+            records,
+            diagnostics,
+        }
+    }
+}
+
+enum JsonlStart {
+    VerifiedResume(JsonlReader),
+    Replay(JsonlReader),
+}
+
+impl JsonlStart {
+    fn open(path: &Path, previous: Option<&JsonlCheckpoint>) -> Result<Self> {
+        let mut input = BufReader::new(File::open(path)?);
+        if let Some(previous) = previous {
+            let mut hasher = Sha256::new();
+            // Growth does not rule out edits to earlier records. Verify every byte
+            // that contributed to the saved parser state before resuming it.
+            let mut prefix = input.by_ref().take(previous.offset);
+            let mut block = [0; 65_536];
+            loop {
+                let read = prefix.read(&mut block)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&block[..read]);
+            }
+            if prefix.limit() == 0 && hex::encode(hasher.clone().finalize()) == previous.prefix_hash
+            {
+                return Ok(Self::VerifiedResume(JsonlReader {
+                    input,
+                    state: JsonlState::restore(previous, hasher),
+                }));
+            }
+        }
+        input.rewind()?;
+        Ok(Self::Replay(JsonlReader {
+            input,
+            state: JsonlState::default(),
+        }))
+    }
+}
+
+struct JsonlReader {
+    input: BufReader<File>,
+    state: JsonlState,
+}
+
+enum JsonlLine<'a> {
+    Committed { number: usize, bytes: &'a [u8] },
+    DeferredTail { number: usize },
+    End,
+}
+
+impl JsonlReader {
+    fn next_line<'a>(&mut self, buffer: &'a mut Vec<u8>) -> Result<JsonlLine<'a>> {
+        buffer.clear();
+        if self.input.read_until(b'\n', buffer)? == 0 {
+            return Ok(JsonlLine::End);
+        }
+        let number = self.state.line + 1;
+        // Providers append records. Do not interpret an unfinished trailing record.
+        if !buffer.ends_with(b"\n") {
+            return Ok(JsonlLine::DeferredTail { number });
+        }
+        self.state.line = number;
+        self.state.offset += buffer.len() as u64;
+        self.state.hasher.update(&*buffer);
+        Ok(JsonlLine::Committed {
+            number,
+            bytes: buffer,
+        })
+    }
+}
+
 fn jsonl(
     provider: Provider,
     path: &Path,
     previous: Option<&JsonlCheckpoint>,
     sink: &mut impl FnMut(&Record) -> Result<()>,
 ) -> Result<Parsed> {
-    let mut input = BufReader::new(File::open(path)?);
-    let mut hasher = Sha256::new();
-    let mut append = false;
-    if let Some(previous) = previous {
-        // Growth does not rule out edits to earlier records. Verify every byte
-        // that contributed to the saved parser state before resuming it.
-        let mut prefix = input.by_ref().take(previous.offset);
-        let mut block = [0; 65_536];
-        loop {
-            let read = prefix.read(&mut block)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&block[..read]);
-        }
-        append =
-            prefix.limit() == 0 && hex::encode(hasher.clone().finalize()) == previous.prefix_hash;
-    }
-    let mut state = if append {
-        previous.unwrap().clone()
-    } else {
-        input.rewind()?;
-        hasher = Sha256::new();
-        JsonlCheckpoint::default()
+    let (mut reader, replace) = match JsonlStart::open(path, previous)? {
+        JsonlStart::VerifiedResume(reader) => (reader, Replace::Append),
+        JsonlStart::Replay(reader) => (reader, Replace::All),
     };
     let mut buffer = Vec::new();
-    let mut parsed = Parsed {
-        records: state.records,
-        diagnostics: std::mem::take(&mut state.diagnostics),
-        replace: if append {
-            Replace::Append
-        } else {
-            Replace::All
-        },
-        checkpoint: Checkpoint::Jsonl(JsonlCheckpoint::default()),
-    };
-    let mut incomplete = None;
-    loop {
-        buffer.clear();
-        if input.read_until(b'\n', &mut buffer)? == 0 {
-            break;
-        }
-        let line = state.line + 1;
-        // Providers append records. Do not interpret an unfinished trailing record.
-        if !buffer.ends_with(b"\n") {
-            incomplete = Some(Diagnostic::new(
-                path,
-                format!("line {line}: incomplete trailing record"),
-            ));
-            break;
-        }
-        state.line = line;
-        state.offset += buffer.len() as u64;
-        hasher.update(&buffer);
-        if buffer.iter().all(u8::is_ascii_whitespace) {
+    let incomplete = loop {
+        let (line, bytes) = match reader.next_line(&mut buffer)? {
+            JsonlLine::Committed { number, bytes } => (number, bytes),
+            JsonlLine::DeferredTail { number } => {
+                break Some(Diagnostic::new(
+                    path,
+                    format!("line {number}: incomplete trailing record"),
+                ));
+            }
+            JsonlLine::End => break None,
+        };
+        let state = &mut reader.state;
+        if bytes.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let value: Value = match serde_json::from_slice(&buffer) {
+        let value: Value = match serde_json::from_slice(bytes) {
             Ok(value) => value,
             Err(error) => {
-                parsed
+                state
                     .diagnostics
                     .push(Diagnostic::new(path, format!("line {line}: {error}")));
                 continue;
@@ -1146,31 +1317,33 @@ fn jsonl(
         let kind = value["type"].as_str().unwrap_or("");
         match (provider, kind) {
             (Provider::Codex, "session_meta") => {
-                state.session = value["payload"]["id"]
-                    .as_str()
-                    .context("session_meta has no id")?
-                    .into();
-                state.workspace = value["payload"]["cwd"].as_str().unwrap_or("").into();
-                state.parent = value
+                state.context.session.set(
+                    value["payload"]["id"]
+                        .as_str()
+                        .context("session_meta has no id")?,
+                );
+                state.context.workspace = value["payload"]["cwd"].as_str().unwrap_or("").into();
+                state.context.parent = value
                     .pointer("/payload/source/subagent/thread_spawn/parent_thread_id")
                     .and_then(Value::as_str)
                     .map(|p| session_id(provider, p));
                 continue;
             }
             (Provider::Pi, "session") => {
-                state.session = value["id"]
-                    .as_str()
-                    .context("session header has no id")?
-                    .into();
-                state.workspace = value["cwd"].as_str().unwrap_or("").into();
+                state
+                    .context
+                    .session
+                    .set(value["id"].as_str().context("session header has no id")?);
+                state.context.workspace = value["cwd"].as_str().unwrap_or("").into();
                 continue;
             }
             (Provider::CopilotCli, "session.start") => {
-                state.session = value["data"]["sessionId"]
-                    .as_str()
-                    .context("session.start has no sessionId")?
-                    .into();
-                state.workspace = value["data"]["context"]["cwd"]
+                state.context.session.set(
+                    value["data"]["sessionId"]
+                        .as_str()
+                        .context("session.start has no sessionId")?,
+                );
+                state.context.workspace = value["data"]["context"]["cwd"]
                     .as_str()
                     .unwrap_or("")
                     .into();
@@ -1178,10 +1351,10 @@ fn jsonl(
             }
             (Provider::Claude, _) => {
                 if let Some(id) = value["sessionId"].as_str() {
-                    state.session = id.into();
+                    state.context.session.set(id);
                 }
                 if let Some(cwd) = value["cwd"].as_str() {
-                    state.workspace = cwd.into();
+                    state.context.workspace = cwd.into();
                 }
             }
             _ => {}
@@ -1215,28 +1388,24 @@ fn jsonl(
                 _ => continue,
             }
         };
-        if state.session.is_empty() {
-            parsed.diagnostics.push(Diagnostic::new(
+        let Some(session) = state.context.session.ready() else {
+            state.diagnostics.push(Diagnostic::new(
                 path,
                 format!("line {line}: no session metadata"),
             ));
             continue;
-        }
+        };
         let native = value["uuid"]
             .as_str()
             .or(value["id"].as_str())
             .or(message["id"].as_str());
-        // For records without native IDs, distinguish identical content by its
-        // occurrence count. Unrelated insertions and deletions do not change IDs.
-        let fallback = digest(&[&value.to_string()]);
-        let count = state.fallback_counts.entry(fallback.clone()).or_default();
-        let fallback = format!("{fallback}:{count}");
-        *count += 1;
+        // Native-ID rows and timestamp rejections still consume an occurrence.
+        let fallback = state.input_occurrences.allocate(&value);
         let native = native.unwrap_or(&fallback);
         let time = match value["timestamp"].as_str().map(timestamp).transpose() {
             Ok(time) => time.unwrap_or_default(),
             Err(error) => {
-                parsed
+                state
                     .diagnostics
                     .push(Diagnostic::new(path, format!("line {line}: {error}")));
                 continue;
@@ -1257,16 +1426,16 @@ fn jsonl(
          -> Result<()> {
             let mut record = Record::new(
                 provider,
-                &state.session,
+                session,
                 &format!("{native}:{selector}"),
                 event_type,
                 path,
             );
             record.provider_event_id = native.into();
-            record.parent_session_id = state.parent.clone();
+            record.parent_session_id = state.context.parent.clone();
             record.is_subagent =
-                state.parent.is_some() || value["isSidechain"].as_bool().unwrap_or(false);
-            record.workspace = state.workspace.clone();
+                state.context.parent.is_some() || value["isSidechain"].as_bool().unwrap_or(false);
+            record.workspace = state.context.workspace.clone();
             record.role = if compaction {
                 (provider == Provider::Claude).then_some(Role::System)
             } else {
@@ -1284,10 +1453,7 @@ fn jsonl(
             }
             compose_message(&mut record)?;
             record.files = files;
-            record.sequence = parsed.records as u64;
-            sink(&record)?;
-            parsed.records += 1;
-            Ok(())
+            state.emitted_records.emit(record, sink)
         };
         let message_kind = message["type"].as_str().unwrap_or("");
         if compaction {
@@ -1451,20 +1617,23 @@ fn jsonl(
                 }
             }
         }
-    }
-    if state.session.is_empty() {
+    };
+    if reader.state.context.session.ready().is_none() {
         bail!("no valid session metadata in {}", path.display());
     }
-    state.prefix_hash = hex::encode(hasher.finalize());
-    state.records = parsed.records;
-    state.diagnostics = parsed.diagnostics.clone();
+    let checkpoint = reader.state.capture();
+    let mut diagnostics = checkpoint.diagnostics.clone();
     // The unfinished line has not affected counters or metadata. Read it again
     // on the next change, and replace its transient diagnostic rather than save it.
     if let Some(incomplete) = incomplete {
-        parsed.diagnostics.push(incomplete);
+        diagnostics.push(incomplete);
     }
-    parsed.checkpoint = Checkpoint::Jsonl(state);
-    Ok(parsed)
+    Ok(Parsed {
+        records: checkpoint.records,
+        diagnostics,
+        replace,
+        checkpoint: Checkpoint::Jsonl(checkpoint),
+    })
 }
 
 #[cfg(test)]
