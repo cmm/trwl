@@ -1044,6 +1044,30 @@ enum FillMode {
     Update,
 }
 
+enum FillBackend {
+    Gpu(worker::Client),
+    Cpu,
+}
+
+enum FillProgress<'a> {
+    Gpu(worker::Pending<&'a [(String, ChunkInput)]>),
+    Cpu(worker::Batch<&'a [(String, ChunkInput)]>),
+    Finished(FillBackend),
+}
+
+impl FillBackend {
+    fn submit(self, inputs: &[(String, ChunkInput)]) -> FillProgress<'_> {
+        let batch = worker::Batch {
+            texts: inputs.iter().map(|(_, input)| input.text.clone()).collect(),
+            association: inputs,
+        };
+        match self {
+            Self::Gpu(client) => FillProgress::Gpu(client.submit(batch)),
+            Self::Cpu => FillProgress::Cpu(batch),
+        }
+    }
+}
+
 fn fill_locked(
     config: &Config,
     selection: &Selection,
@@ -1075,7 +1099,7 @@ fn fill_locked(
         .filter(|(key, _)| !cache.vectors.contains_key(key))
         .collect();
     let missing = ordered_inputs(missing);
-    let mut worker = if mode == FillMode::Update
+    let worker = if mode == FillMode::Update
         && selection.directory.is_some()
         && (cache::full_build(config, &selection.key)? || heavy_incremental(&missing))
         && std::env::var_os("TRWL_SEMANTIC_CPU_ONLY").is_none_or(|v| v != "1")
@@ -1084,30 +1108,48 @@ fn fill_locked(
     } else {
         None
     };
-    let mut batches = missing.chunks(BATCH_SIZE).peekable();
-    let mut prefetched = None;
-    while let Some(batch) = batches.next() {
-        let texts: Vec<_> = prefetched
-            .take()
-            .unwrap_or_else(|| batch.iter().map(|(_, input)| input.text.clone()).collect());
-        let accelerated = match worker.as_mut() {
-            Some(worker) => worker.embed(&texts)?,
-            None => None,
+    let backend = match worker {
+        Some(client) => FillBackend::Gpu(client),
+        None => FillBackend::Cpu,
+    };
+    let mut batches = missing.chunks(BATCH_SIZE);
+    let mut progress = match batches.next() {
+        Some(batch) => backend.submit(batch),
+        None => FillProgress::Finished(backend),
+    };
+    // Keep the ready worker through final publication and completion marking.
+    let _backend = loop {
+        let (backend, batch, accelerated) = match progress {
+            FillProgress::Gpu(operation) => match operation.receive()? {
+                worker::BatchOutcome::Completed {
+                    client,
+                    batch,
+                    vectors,
+                } => (FillBackend::Gpu(client), batch, Some(vectors)),
+                worker::BatchOutcome::CpuRecovery(batch) => {
+                    // Recovery has reaped the GPU process. This transition is
+                    // irreversible for this fill, including after partial progress.
+                    (FillBackend::Cpu, batch, None)
+                }
+            },
+            FillProgress::Cpu(batch) => (FillBackend::Cpu, batch, None),
+            FillProgress::Finished(backend) => break backend,
         };
         let vectors = match accelerated {
             Some(vectors) => vectors,
             None => {
-                // Reap the GPU process before CPU recovery. Never retry GPU
-                // inference within this fill, including after partial progress.
-                worker.take();
                 if executor.is_none() {
                     *executor = Some(Executor::shared(config, selection)?);
                 }
-                executor.as_mut().unwrap().embed(&texts, DOCUMENT_PREFIX)?
+                executor
+                    .as_mut()
+                    .unwrap()
+                    .embed(&batch.texts, DOCUMENT_PREFIX)?
             }
         };
         let completed = Cache {
             vectors: batch
+                .association
                 .iter()
                 .map(|(key, _)| key.clone())
                 .zip(vectors)
@@ -1115,11 +1157,10 @@ fn fill_locked(
         };
         // Let the GPU compute the next batch while this one commits. No cache
         // transaction is held while submitting or waiting for inference.
-        if let (Some(worker), Some(next)) = (worker.as_mut(), batches.peek()) {
-            let texts: Vec<_> = next.iter().map(|(_, input)| input.text.clone()).collect();
-            worker.prefetch(&texts);
-            prefetched = Some(texts);
-        }
+        progress = match batches.next() {
+            Some(batch) => backend.submit(batch),
+            None => FillProgress::Finished(backend),
+        };
         cache::publish_batch(
             config,
             &selection.key,
@@ -1128,7 +1169,7 @@ fn fill_locked(
             &completed,
         )?;
         cache.vectors.extend(completed.vectors);
-    }
+    };
     // Readers of other commits can replace mappings and evict earlier batches
     // during inference. Publish the full pinned snapshot before marking it done.
     cache::publish_batch(config, &selection.key, &index.version(), documents, &cache)?;

@@ -57,19 +57,54 @@ fn receive<T: DeserializeOwned>(stream: &mut BufReader<UnixStream>) -> Result<T>
     serde_json::from_str(&line).context("invalid embedding worker response")
 }
 
-pub(super) struct Client {
+struct Process {
     child: Child,
     stream: BufReader<UnixStream>,
-    pending: Option<Result<()>>,
 }
 
-impl Drop for Client {
+impl Drop for Process {
     fn drop(&mut self) {
         // Killing and reaping precedes CPU recovery and releasing the fill lock.
         // The child owns the GPU lock until it actually exits.
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// Only a ready worker can submit; submitting transfers its ownership to Pending.
+pub(super) struct Client {
+    process: Process,
+}
+
+pub(super) struct Batch<T> {
+    pub(super) texts: Vec<String>,
+    pub(super) association: T,
+}
+
+enum Submission {
+    Submitted,
+    DeferredFailure(anyhow::Error),
+}
+
+pub(super) struct Pending<T> {
+    process: Process,
+    batch: Batch<T>,
+    submission: Submission,
+}
+
+pub(super) enum BatchOutcome<T> {
+    Completed {
+        client: Client,
+        batch: Batch<T>,
+        vectors: Vec<Vec<f32>>,
+    },
+    CpuRecovery(Batch<T>),
+}
+
+enum Recovery {
+    Cpu,
+    Cancelled(anyhow::Error),
+    Fatal(anyhow::Error),
 }
 
 impl Client {
@@ -114,25 +149,24 @@ impl Client {
         // Command retains its configured stdin after spawning. Close our copy
         // of the child's socket so an initialization crash delivers EOF.
         drop(process);
-        let mut client = Self {
+        let mut process = Process {
             child,
             stream: BufReader::new(stream),
-            pending: None,
         };
         let reply =
-            send(client.stream.get_mut(), selection).and_then(|()| receive(&mut client.stream));
+            send(process.stream.get_mut(), selection).and_then(|()| receive(&mut process.stream));
         match reply {
             Ok(Initialization::Ready(device)) => {
                 eprintln!("trwl: embedding update using {}", device.as_str());
-                client
+                process
                     .stream
                     .get_ref()
                     .set_read_timeout(Some(batch_timeout))?;
-                client
+                process
                     .stream
                     .get_ref()
                     .set_write_timeout(Some(batch_timeout))?;
-                Ok(Some(client))
+                Ok(Some(Self { process }))
             }
             Ok(Initialization::Busy) => {
                 eprintln!("trwl: another embedding build holds the GPU lock; using CPU");
@@ -143,58 +177,83 @@ impl Client {
                 Ok(None)
             }
             Ok(Initialization::Failed(message)) => bail!("embedding initialization: {message}"),
-            Err(error) => {
-                client.recover(error)?;
-                Ok(None)
-            }
+            Err(error) => match process.recover(error) {
+                Recovery::Cpu => Ok(None),
+                Recovery::Cancelled(error) | Recovery::Fatal(error) => Err(error),
+            },
         }
     }
 
-    fn recover(&mut self, error: anyhow::Error) -> Result<()> {
-        let _ = self.child.kill();
-        let status = self.child.wait()?;
-        ensure!(
-            !matches!(
-                status.signal(),
-                Some(libc::SIGINT | libc::SIGTERM | libc::SIGHUP)
-            ),
-            "embedding worker cancelled: {status}"
-        );
-        eprintln!("trwl: GPU embedding worker failed ({status}): {error:#}; finishing on CPU");
-        Ok(())
+    pub(super) fn submit<T>(mut self, batch: Batch<T>) -> Pending<T> {
+        // Defer a submission error until the pending operation is received, so
+        // the caller still commits the successful batch it has already received.
+        let submission = match send(self.process.stream.get_mut(), &batch.texts) {
+            Ok(()) => Submission::Submitted,
+            Err(error) => Submission::DeferredFailure(error),
+        };
+        Pending {
+            process: self.process,
+            batch,
+            submission,
+        }
     }
+}
 
-    /// None means the worker was reaped; the caller finishes this fill on CPU.
-    pub(super) fn embed(&mut self, texts: &[String]) -> Result<Option<Vec<Vec<f32>>>> {
-        let sent = self
-            .pending
-            .take()
-            .unwrap_or_else(|| send(self.stream.get_mut(), &texts));
-        let reply = sent.and_then(|()| receive(&mut self.stream));
-        match reply {
+impl Process {
+    fn recover(mut self, error: anyhow::Error) -> Recovery {
+        let _ = self.child.kill();
+        let outcome = match self.child.wait() {
+            Ok(status)
+                if matches!(
+                    status.signal(),
+                    Some(libc::SIGINT | libc::SIGTERM | libc::SIGHUP)
+                ) =>
+            {
+                Recovery::Cancelled(anyhow::anyhow!("embedding worker cancelled: {status}"))
+            }
+            Ok(status) => {
+                eprintln!(
+                    "trwl: GPU embedding worker failed ({status}): {error:#}; finishing on CPU"
+                );
+                Recovery::Cpu
+            }
+            Err(error) => Recovery::Fatal(error.into()),
+        };
+        drop(self);
+        outcome
+    }
+}
+
+impl<T> Pending<T> {
+    pub(super) fn receive(self) -> Result<BatchOutcome<T>> {
+        let Self {
+            mut process,
+            batch,
+            submission,
+        } = self;
+        let reply = match submission {
+            Submission::Submitted => receive(&mut process.stream),
+            Submission::DeferredFailure(error) => Err(error),
+        };
+        let error = match reply {
             Ok(Reply::Vectors(vectors)) => {
                 ensure!(
-                    vectors.len() == texts.len(),
+                    vectors.len() == batch.texts.len(),
                     "embedding worker returned the wrong batch size"
                 );
-                Ok(Some(vectors))
+                return Ok(BatchOutcome::Completed {
+                    client: Client { process },
+                    batch,
+                    vectors,
+                });
             }
-            Ok(Reply::Failed(message)) => {
-                self.recover(anyhow::anyhow!(message))?;
-                Ok(None)
-            }
-            Err(error) => {
-                self.recover(error)?;
-                Ok(None)
-            }
+            Ok(Reply::Failed(message)) => anyhow::anyhow!(message),
+            Err(error) => error,
+        };
+        match process.recover(error) {
+            Recovery::Cpu => Ok(BatchOutcome::CpuRecovery(batch)),
+            Recovery::Cancelled(error) | Recovery::Fatal(error) => Err(error),
         }
-    }
-
-    pub(super) fn prefetch(&mut self, texts: &[String]) {
-        assert!(self.pending.is_none(), "only one batch may be in flight");
-        // Defer a submission error until the next embed call, so the caller
-        // still commits the successful batch it has already received.
-        self.pending = Some(send(self.stream.get_mut(), &texts));
     }
 }
 
@@ -314,6 +373,13 @@ mod tests {
         )
     }
 
+    fn batch(texts: &[&str]) -> Batch<()> {
+        Batch {
+            texts: texts.iter().map(|text| (*text).to_owned()).collect(),
+            association: (),
+        }
+    }
+
     // The server runs in a subprocess with only model initialization and
     // inference replaced, so lock ownership and teardown follow production.
     #[test]
@@ -370,18 +436,23 @@ mod tests {
         // A contending worker must skip initialization, even if it would fail.
         assert!(start("init-error", dir.path()).unwrap().is_none());
         for _ in 0..2 {
-            assert_eq!(
-                first.embed(&["text".into()]).unwrap().unwrap(),
-                [vec![4.0, 1.0]]
-            );
+            let BatchOutcome::Completed {
+                client, vectors, ..
+            } = first.submit(batch(&["text"])).receive().unwrap()
+            else {
+                panic!("successful worker requested CPU recovery");
+            };
+            assert_eq!(vectors, [vec![4.0, 1.0]]);
+            first = client;
         }
-        let next = ["one".into(), "two".into()];
-        first.prefetch(&next);
-        assert_eq!(
-            first.embed(&next).unwrap().unwrap(),
-            [vec![3.0, 1.0], vec![3.0, 1.0]]
-        );
-        drop(first);
+        let BatchOutcome::Completed {
+            client, vectors, ..
+        } = first.submit(batch(&["one", "two"])).receive().unwrap()
+        else {
+            panic!("successful worker requested CPU recovery");
+        };
+        assert_eq!(vectors, [vec![3.0, 1.0], vec![3.0, 1.0]]);
+        drop(client);
         assert!(!is_locked(dir.path(), "gpu.lock").unwrap());
         assert!(start("success", dir.path()).unwrap().is_some());
     }
@@ -390,8 +461,13 @@ mod tests {
     fn gpu_failure_crash_and_timeout_release_lock_before_cpu_recovery() {
         let dir = tempfile::tempdir().unwrap();
         for mode in ["gpu-error", "crash", "hang"] {
-            let mut client = start(mode, dir.path()).unwrap().unwrap();
-            assert!(client.embed(&["text".into()]).unwrap().is_none(), "{mode}");
+            let client = start(mode, dir.path()).unwrap().unwrap();
+            let BatchOutcome::CpuRecovery(batch) =
+                client.submit(batch(&["text"])).receive().unwrap()
+            else {
+                panic!("{mode} did not request CPU recovery");
+            };
+            assert_eq!(batch.texts, ["text"], "{mode}");
             assert!(!is_locked(dir.path(), "gpu.lock").unwrap(), "{mode}");
         }
     }
@@ -419,13 +495,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut client = start("success", dir.path()).unwrap().unwrap();
         unsafe {
-            libc::kill(client.child.id() as i32, libc::SIGTERM);
+            libc::kill(client.process.child.id() as i32, libc::SIGTERM);
         }
-        client.child.wait().unwrap();
+        client.process.child.wait().unwrap();
         assert!(
             client
-                .embed(&["text".into()])
-                .unwrap_err()
+                .submit(batch(&["text"]))
+                .receive()
+                .err()
+                .unwrap()
                 .to_string()
                 .contains("cancelled")
         );
@@ -434,13 +512,26 @@ mod tests {
     #[test]
     fn prefetch_to_an_exited_worker_requests_cpu_recovery() {
         let dir = tempfile::tempdir().unwrap();
-        let mut client = start("success", dir.path()).unwrap().unwrap();
-        let texts = ["text".into()];
-        assert!(client.embed(&texts).unwrap().is_some());
-        client.child.kill().unwrap();
-        client.child.wait().unwrap();
-        client.prefetch(&texts);
-        assert!(client.embed(&texts).unwrap().is_none());
+        let client = start("success", dir.path()).unwrap().unwrap();
+        let BatchOutcome::Completed {
+            mut client,
+            batch: completed,
+            vectors,
+        } = client.submit(batch(&["text"])).receive().unwrap()
+        else {
+            panic!("successful worker requested CPU recovery");
+        };
+        client.process.child.kill().unwrap();
+        client.process.child.wait().unwrap();
+        let pending = client.submit(batch(&["next"]));
+        assert!(matches!(pending.submission, Submission::DeferredFailure(_)));
+        // Submission failure leaves the preceding result available to commit.
+        assert_eq!(completed.texts, ["text"]);
+        assert_eq!(vectors, [vec![4.0, 1.0]]);
+        let BatchOutcome::CpuRecovery(batch) = pending.receive().unwrap() else {
+            panic!("exited worker did not request CPU recovery");
+        };
+        assert_eq!(batch.texts, ["next"]);
         assert!(!is_locked(dir.path(), "gpu.lock").unwrap());
     }
 
