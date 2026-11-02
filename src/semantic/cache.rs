@@ -21,8 +21,9 @@
 //! MessagePack migration reads the selected vectors and document mapping into
 //! memory, then removes file caches and abandoned temporary files before SQLite
 //! publication. Cleanup does not need space for another complete cache file.
-use super::{Cache, DocumentCache, DocumentPlan, EmbeddingDocument};
+use super::{Cache, DocumentCache, DocumentPlan, EmbeddingDocument, SelectionIdentity};
 use crate::config::{Config, lock};
+use crate::store::ConversationRevision;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::{
@@ -45,7 +46,7 @@ struct Database {
 
 enum Eviction<'a> {
     AnySelection,
-    ProtectPublication(&'a str),
+    ProtectPublication(&'a SelectionIdentity),
 }
 
 struct LegacyMigration {
@@ -79,29 +80,29 @@ impl CommitOutcome {
 enum Mapping {
     Absent,
     VectorOnly,
-    Snapshot(String),
+    Snapshot(ConversationRevision),
 }
 
 impl Mapping {
-    fn read(connection: &Connection, selection: &str) -> Result<Self> {
+    fn read(connection: &Connection, selection: &SelectionIdentity) -> Result<Self> {
         let version: Option<String> = connection
             .query_row(
                 "SELECT version FROM selections WHERE selection=?",
-                [selection],
+                [selection.as_str()],
                 |r| r.get(0),
             )
             .optional()?;
         Ok(match version {
             None => Self::Absent,
             Some(version) if version.is_empty() => Self::VectorOnly,
-            Some(version) => Self::Snapshot(version),
+            Some(version) => Self::Snapshot(ConversationRevision::from_storage(version)),
         })
     }
 
-    fn matches(&self, version: &str) -> bool {
+    fn matches(&self, version: &ConversationRevision) -> bool {
         match self {
             Self::Absent => false,
-            Self::VectorOnly => version.is_empty(),
+            Self::VectorOnly => version.as_str().is_empty(),
             Self::Snapshot(stored) => stored == version,
         }
     }
@@ -215,11 +216,11 @@ impl Database {
         Ok(self.checkpoint_committed())
     }
 
-    fn touch(&self, selection: &str) -> Result<CommitOutcome> {
+    fn touch(&self, selection: &SelectionIdentity) -> Result<CommitOutcome> {
         // Avoid a metadata write for every query.
         self.connection.execute(
             "UPDATE selections SET touched=unixepoch() WHERE selection=? AND touched < unixepoch()-86400",
-            [selection],
+            [selection.as_str()],
         )?;
         Ok(self.checkpoint_committed())
     }
@@ -227,7 +228,7 @@ impl Database {
     fn evict_to_limits(tx: &Connection, budget: i64, eviction: Eviction<'_>) -> Result<()> {
         let keep = match eviction {
             Eviction::AnySelection => None,
-            Eviction::ProtectPublication(selection) => Some(selection),
+            Eviction::ProtectPublication(selection) => Some(selection.as_str()),
         };
         loop {
             let (bytes, count): (i64, i64) = tx.query_row(
@@ -254,12 +255,12 @@ impl Database {
         Ok(())
     }
 
-    fn vectors(&mut self, selection: &str) -> Result<Cache> {
+    fn vectors(&mut self, selection: &SelectionIdentity) -> Result<Cache> {
         let tx = self.connection.transaction()?;
         let mut vectors = HashMap::new();
         {
             let mut query = tx.prepare("SELECT key,vector FROM vectors WHERE selection=?")?;
-            let mut rows = query.query([selection])?;
+            let mut rows = query.query([selection.as_str()])?;
             while let Some(row) = rows.next()? {
                 let bytes: Vec<u8> = row.get(1)?;
                 ensure!(
@@ -281,13 +282,14 @@ impl Database {
 
     fn documents(
         &mut self,
-        selection: &str,
-        version: &str,
+        selection: &SelectionIdentity,
+        version: &ConversationRevision,
     ) -> Result<Option<Vec<EmbeddingDocument>>> {
         let tx = self.connection.transaction()?;
         if !Mapping::read(&tx, selection)?.matches(version) {
             return Ok(None);
         }
+        let selection = selection.as_str();
         let mut documents = Vec::new();
         {
             let mut query =
@@ -341,13 +343,16 @@ impl Database {
 
     fn publish(
         &mut self,
-        selection: &str,
-        version: &str,
+        selection: &SelectionIdentity,
+        version: &ConversationRevision,
         documents: Option<&[EmbeddingDocument]>,
         vectors: &Cache,
     ) -> Result<CommitOutcome> {
         let budget = self.budget;
         let tx = self.begin_write()?;
+        let eviction = Eviction::ProtectPublication(selection);
+        let selection = selection.as_str();
+        let version = version.as_str();
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO selections(selection,version,touched) VALUES (?,?,unixepoch())",
             params![selection, version],
@@ -450,7 +455,7 @@ impl Database {
             (SELECT coalesce(sum(length(input)+length(event)+length(chunks)+128),0) FROM prepared WHERE selection=?1) +
             (SELECT coalesce(sum(length(key)+length(vector)+128),0) FROM vectors WHERE selection=?1)
             WHERE selection=?1", [selection])?;
-        Self::evict_to_limits(&tx, budget, Eviction::ProtectPublication(selection))?;
+        Self::evict_to_limits(&tx, budget, eviction)?;
         tx.commit()?;
         Ok(self.checkpoint_committed())
     }
@@ -467,7 +472,8 @@ fn remove(path: &Path) -> Result<()> {
 // maps and abandoned atomic-write files before any SQLite allocation. Useful
 // vectors stay in memory during migration, so cleanup needs no second full copy.
 impl LegacyMigration {
-    fn read_and_remove(directory: &Path, selection: &str) -> Result<Option<Self>> {
+    fn read_and_remove(directory: &Path, selection: &SelectionIdentity) -> Result<Option<Self>> {
+        let selection = selection.as_str();
         let vector_name = format!("{selection}.msgpack");
         let document_name = format!("documents-{selection}.msgpack");
         let mut vector_path = None;
@@ -512,10 +518,11 @@ impl LegacyMigration {
         decoded.map(Some)
     }
 
-    fn publish(self, db: &mut Database, selection: &str) -> Result<CommitOutcome> {
+    fn publish(self, db: &mut Database, selection: &SelectionIdentity) -> Result<CommitOutcome> {
+        let vector_only = ConversationRevision::from_storage(String::new());
         db.publish(
             selection,
-            self.documents.as_ref().map_or("", |d| d.version.as_str()),
+            self.documents.as_ref().map_or(&vector_only, |d| &d.version),
             self.documents.as_ref().map(|d| d.documents.as_slice()),
             &self.vectors,
         )
@@ -537,7 +544,7 @@ impl LockedCache {
     // caller classifies failures or removes files under the same cache lock.
     fn run_connected<T>(
         &self,
-        selection: &str,
+        selection: &SelectionIdentity,
         migration: Option<LegacyMigration>,
         operation: impl FnOnce(&mut Database) -> Result<T>,
     ) -> Result<T> {
@@ -581,7 +588,7 @@ impl LockedCache {
 
 fn with_database<T>(
     config: &Config,
-    selection: &str,
+    selection: &SelectionIdentity,
     operation: impl FnOnce(&mut Database) -> Result<T>,
 ) -> Result<T> {
     let cache = LockedCache::acquire(config)?;
@@ -590,27 +597,27 @@ fn with_database<T>(
     cache.reset_if_disk_full(result)
 }
 
-pub(super) fn load(config: &Config, selection: &str) -> Result<Cache> {
+pub(super) fn load(config: &Config, selection: &SelectionIdentity) -> Result<Cache> {
     with_database(config, selection, |db| db.vectors(selection))
 }
 
 pub(super) fn documents(
     config: &Config,
-    selection: &str,
-    version: &str,
+    selection: &SelectionIdentity,
+    version: &ConversationRevision,
 ) -> Result<Option<Vec<EmbeddingDocument>>> {
     with_database(config, selection, |db| db.documents(selection, version))
 }
 
 pub(super) fn prepared(
     config: &Config,
-    selection: &str,
+    selection: &SelectionIdentity,
 ) -> Result<HashMap<String, super::PreparedDocument>> {
     with_database(config, selection, |db| {
         let mut query = db
             .connection
             .prepare("SELECT input,chunks FROM prepared WHERE selection=?")?;
-        let mut rows = query.query([selection])?;
+        let mut rows = query.query([selection.as_str()])?;
         let mut prepared = HashMap::new();
         while let Some(row) = rows.next()? {
             let input: String = row.get(0)?;
@@ -643,14 +650,17 @@ pub(super) fn publish_mapping(config: &Config, plan: &DocumentPlan<'_>) -> Resul
     })
 }
 
-pub(super) fn build_history(config: &Config, selection: &str) -> Result<BuildHistory> {
+pub(super) fn build_history(
+    config: &Config,
+    selection: &SelectionIdentity,
+) -> Result<BuildHistory> {
     with_database(config, selection, |db| {
         let complete: Option<Option<bool>> = db
             .connection
             .query_row(
                 "SELECT builds.complete FROM selections
                  LEFT JOIN builds USING(selection) WHERE selection=?",
-                [selection],
+                [selection.as_str()],
                 |r| r.get(0),
             )
             .optional()?;
@@ -669,16 +679,18 @@ pub(super) fn mark_build_complete(config: &Config, plan: &DocumentPlan<'_>) -> R
         // Completion records build history, not current mapping/vector coverage.
         db.connection.execute(
             "UPDATE builds SET complete=1 WHERE selection=? AND complete=0",
-            [selection],
+            [selection.as_str()],
         )?;
         Ok(())
     })
 }
 
-pub(super) fn reset(config: &Config, selection: &str) -> Result<()> {
+pub(super) fn reset(config: &Config, selection: &SelectionIdentity) -> Result<()> {
     with_database(config, selection, |db| {
-        db.connection
-            .execute("DELETE FROM selections WHERE selection=?", [selection])?;
+        db.connection.execute(
+            "DELETE FROM selections WHERE selection=?",
+            [selection.as_str()],
+        )?;
         Ok(())
     })
 }
@@ -710,6 +722,14 @@ mod tests {
     use super::super::VectorCoverage;
     use super::*;
     use crate::record::{EventType, Provider, Record};
+
+    fn selection(value: &str) -> SelectionIdentity {
+        SelectionIdentity(value.to_owned())
+    }
+
+    fn revision(value: &str) -> ConversationRevision {
+        ConversationRevision::from_storage(value.to_owned())
+    }
 
     #[test]
     fn opening_an_initialized_cache_does_not_write_it() {
@@ -767,7 +787,7 @@ mod tests {
             .unwrap();
             Self {
                 selection: super::super::Selection {
-                    key: "model".into(),
+                    key: SelectionIdentity("model".into()),
                     executor: "http".into(),
                     model: "test".into(),
                     directory: None,
@@ -794,8 +814,10 @@ mod tests {
         documents: &[EmbeddingDocument],
         vectors: &Cache,
     ) {
-        with_database(config, selection, |db| {
-            db.publish(selection, version, Some(documents), vectors)?
+        let selection = SelectionIdentity(selection.to_owned());
+        let version = ConversationRevision::from_storage(version.to_owned());
+        with_database(config, &selection, |db| {
+            db.publish(&selection, &version, Some(documents), vectors)?
                 .into_result()
         })
         .unwrap();
@@ -820,7 +842,7 @@ mod tests {
             .unwrap();
         mark_build_complete(&config, &plan).unwrap();
         assert!(matches!(
-            build_history(&config, "model").unwrap(),
+            build_history(&config, &selection("model")).unwrap(),
             BuildHistory::Completed
         ));
     }
@@ -842,7 +864,10 @@ mod tests {
             )
             .unwrap();
         publish_batch(&config, &plan, &vectors).unwrap();
-        assert_eq!(load(&config, "model").unwrap().vectors, vectors.vectors);
+        assert_eq!(
+            load(&config, &selection("model")).unwrap().vectors,
+            vectors.vectors
+        );
     }
 
     #[test]
@@ -867,9 +892,9 @@ mod tests {
         let second_plan = second_snapshot.plan(second_documents);
         publish_batch(&config, &first_plan, &first).unwrap();
         publish_batch(&config, &second_plan, &second).unwrap();
-        assert!(prepared(&config, "model").unwrap().is_empty());
+        assert!(prepared(&config, &selection("model")).unwrap().is_empty());
         assert!(
-            !load(&config, "model")
+            !load(&config, &selection("model"))
                 .unwrap()
                 .vectors
                 .contains_key("first")
@@ -878,12 +903,19 @@ mod tests {
         // build complete, even when its vectors happen to cover that map.
         publish_batch(&config, &first_plan, &first).unwrap();
         assert!(
-            documents(&config, "model", &first_plan.version)
+            documents(&config, &selection("model"), &first_plan.version)
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(load(&config, "model").unwrap().vectors, first.vectors);
-        assert!(build_history(&config, "model").unwrap().needs_full_build());
+        assert_eq!(
+            load(&config, &selection("model")).unwrap().vectors,
+            first.vectors
+        );
+        assert!(
+            build_history(&config, &selection("model"))
+                .unwrap()
+                .needs_full_build()
+        );
         publish_batch(&config, &second_plan, &second).unwrap();
         let observer =
             Connection::open(config.directories.cache.join("semantic").join(DATABASE)).unwrap();
@@ -897,34 +929,40 @@ mod tests {
             .unwrap();
         repair_snapshot(&config, &first_plan, &first).unwrap();
         mark_build_complete(&config, &first_plan).unwrap();
-        assert_eq!(load(&config, "model").unwrap().vectors, first.vectors);
         assert_eq!(
-            documents(&config, "model", &first_plan.version)
+            load(&config, &selection("model")).unwrap().vectors,
+            first.vectors
+        );
+        assert_eq!(
+            documents(&config, &selection("model"), &first_plan.version)
                 .unwrap()
                 .unwrap()[0]
                 .keys,
             ["first"]
         );
         assert!(
-            documents(&config, "model", &second_plan.version)
+            documents(&config, &selection("model"), &second_plan.version)
                 .unwrap()
                 .is_none()
         );
-        let restored = prepared(&config, "model").unwrap();
+        let restored = prepared(&config, &selection("model")).unwrap();
         assert_eq!(restored["first-input"].chunks[0].1.text, "first");
         assert!(matches!(
-            build_history(&config, "model").unwrap(),
+            build_history(&config, &selection("model")).unwrap(),
             BuildHistory::Completed
         ));
         // Completed history does not imply coverage, even for the same map.
         observer.execute("DELETE FROM vectors", []).unwrap();
         assert!(matches!(
-            first_plan.vector_coverage(&load(&config, "model").unwrap()),
+            first_plan.vector_coverage(&load(&config, &selection("model")).unwrap()),
             VectorCoverage::Missing
         ));
         repair_snapshot(&config, &first_plan, &first).unwrap();
         mark_build_complete(&config, &first_plan).unwrap();
-        assert_eq!(load(&config, "model").unwrap().vectors, first.vectors);
+        assert_eq!(
+            load(&config, &selection("model")).unwrap().vectors,
+            first.vectors
+        );
     }
 
     #[test]
@@ -937,33 +975,50 @@ mod tests {
         let snapshot = SnapshotFixture::new(&config, "first");
         let plan = snapshot.plan(documents);
         assert!(matches!(
-            build_history(&config, "model").unwrap(),
+            build_history(&config, &selection("model")).unwrap(),
             BuildHistory::Absent
         ));
         publish_mapping(&config, &plan).unwrap();
         publish_batch(&config, &plan, &first).unwrap();
         assert!(matches!(
-            build_history(&config, "model").unwrap(),
+            build_history(&config, &selection("model")).unwrap(),
             BuildHistory::Unfinished
         ));
-        assert_eq!(load(&config, "model").unwrap().vectors.len(), 1);
+        assert_eq!(load(&config, &selection("model")).unwrap().vectors.len(), 1);
         publish_batch(&config, &plan, &second).unwrap();
-        repair_snapshot(&config, &plan, &load(&config, "model").unwrap()).unwrap();
+        repair_snapshot(&config, &plan, &load(&config, &selection("model")).unwrap()).unwrap();
         mark_build_complete(&config, &plan).unwrap();
-        assert!(!build_history(&config, "model").unwrap().needs_full_build());
-        assert_eq!(load(&config, "model").unwrap().vectors.len(), 2);
         assert!(
-            build_history(&config, "changed-model")
+            !build_history(&config, &selection("model"))
+                .unwrap()
+                .needs_full_build()
+        );
+        assert_eq!(load(&config, &selection("model")).unwrap().vectors.len(), 2);
+        assert!(
+            build_history(&config, &selection("changed-model"))
                 .unwrap()
                 .needs_full_build()
         );
         // An ordinary index update does not make the selection a full build.
         let next = SnapshotFixture::new(&config, "next");
         publish_mapping(&config, &next.plan(plan.documents)).unwrap();
-        assert!(!build_history(&config, "model").unwrap().needs_full_build());
-        reset(&config, "model").unwrap();
-        assert!(build_history(&config, "model").unwrap().needs_full_build());
-        assert!(load(&config, "model").unwrap().vectors.is_empty());
+        assert!(
+            !build_history(&config, &selection("model"))
+                .unwrap()
+                .needs_full_build()
+        );
+        reset(&config, &selection("model")).unwrap();
+        assert!(
+            build_history(&config, &selection("model"))
+                .unwrap()
+                .needs_full_build()
+        );
+        assert!(
+            load(&config, &selection("model"))
+                .unwrap()
+                .vectors
+                .is_empty()
+        );
     }
 
     #[test]
@@ -974,18 +1029,22 @@ mod tests {
         let snapshot = SnapshotFixture::new(&config, "first");
         let plan = snapshot.plan(documents);
         publish_batch(&config, &plan, &vectors).unwrap();
-        with_database(&config, "model", |db| {
+        with_database(&config, &selection("model"), |db| {
             db.connection.execute("DELETE FROM builds", [])?;
             Ok(())
         })
         .unwrap();
         assert!(matches!(
-            build_history(&config, "model").unwrap(),
+            build_history(&config, &selection("model")).unwrap(),
             BuildHistory::LegacyCompleted
         ));
         let next = SnapshotFixture::new(&config, "next");
         publish_batch(&config, &next.plan(plan.documents), &vectors).unwrap();
-        assert!(!build_history(&config, "model").unwrap().needs_full_build());
+        assert!(
+            !build_history(&config, &selection("model"))
+                .unwrap()
+                .needs_full_build()
+        );
     }
 
     #[test]
@@ -993,19 +1052,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut db = Database::open(&dir.path().join(DATABASE), MAX_BYTES, MAX_PAGES).unwrap();
         let (first, vectors) = fixture("first", 2);
-        db.publish("model", "commit1", Some(&first), &vectors)
-            .and_then(CommitOutcome::into_result)
-            .unwrap();
+        db.publish(
+            &selection("model"),
+            &revision("commit1"),
+            Some(&first),
+            &vectors,
+        )
+        .and_then(CommitOutcome::into_result)
+        .unwrap();
         let (next, vectors) = fixture("next", 2);
-        db.publish("model", "commit2", Some(&next), &vectors)
-            .and_then(CommitOutcome::into_result)
-            .unwrap();
-        assert!(db.documents("model", "commit1").unwrap().is_none());
+        db.publish(
+            &selection("model"),
+            &revision("commit2"),
+            Some(&next),
+            &vectors,
+        )
+        .and_then(CommitOutcome::into_result)
+        .unwrap();
+        assert!(
+            db.documents(&selection("model"), &revision("commit1"))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
-            db.documents("model", "commit2").unwrap().unwrap()[0].keys,
+            db.documents(&selection("model"), &revision("commit2"))
+                .unwrap()
+                .unwrap()[0]
+                .keys,
             ["next"]
         );
-        let vectors = db.vectors("model").unwrap().vectors;
+        let vectors = db.vectors(&selection("model")).unwrap().vectors;
         assert_eq!(vectors.len(), 1);
         assert!(vectors.contains_key("next"));
     }
@@ -1018,9 +1094,14 @@ mod tests {
         let (documents, vectors) = fixture("large", 32_000);
         for n in 0..8 {
             let selection = format!("model{n}");
-            db.publish(&selection, "commit", Some(&documents), &vectors)
-                .and_then(CommitOutcome::into_result)
-                .unwrap();
+            db.publish(
+                &SelectionIdentity(selection),
+                &revision("commit"),
+                Some(&documents),
+                &vectors,
+            )
+            .and_then(CommitOutcome::into_result)
+            .unwrap();
             let count: i64 = db
                 .connection
                 .query_row("SELECT count(*) FROM selections", [], |r| r.get(0))
@@ -1041,13 +1122,18 @@ mod tests {
         db.expire_and_evict()
             .and_then(CommitOutcome::into_result)
             .unwrap();
-        assert!(db.vectors("model7").unwrap().vectors.is_empty());
+        assert!(db.vectors(&selection("model7")).unwrap().vectors.is_empty());
         assert!(fs::metadata(&path).unwrap().len() < grown / 2);
         let (documents, vectors) = fixture("small", 2);
         for n in 0..8 {
-            db.publish(&format!("model{n}"), "commit", Some(&documents), &vectors)
-                .and_then(CommitOutcome::into_result)
-                .unwrap();
+            db.publish(
+                &selection(&format!("model{n}")),
+                &revision("commit"),
+                Some(&documents),
+                &vectors,
+            )
+            .and_then(CommitOutcome::into_result)
+            .unwrap();
         }
         let count: i64 = db
             .connection
@@ -1067,8 +1153,13 @@ mod tests {
             )],
         });
         assert!(
-            db.publish("oversized", "commit", Some(&documents), &vectors)
-                .is_err()
+            db.publish(
+                &selection("oversized"),
+                &revision("commit"),
+                Some(&documents),
+                &vectors
+            )
+            .is_err()
         );
     }
 
@@ -1078,14 +1169,35 @@ mod tests {
         let path = dir.path().join(DATABASE);
         let mut db = Database::open(&path, 10_000, MAX_PAGES).unwrap();
         let (first, vectors) = fixture("first", 2);
-        db.publish("model", "old", Some(&first), &vectors)
-            .and_then(CommitOutcome::into_result)
-            .unwrap();
+        db.publish(
+            &selection("model"),
+            &revision("old"),
+            Some(&first),
+            &vectors,
+        )
+        .and_then(CommitOutcome::into_result)
+        .unwrap();
         let (large, vectors) = fixture("large", 10_000);
-        assert!(db.publish("model", "new", Some(&large), &vectors).is_err());
-        assert!(db.documents("model", "old").unwrap().is_some());
-        assert!(db.documents("model", "new").unwrap().is_none());
-        assert_eq!(db.vectors("model").unwrap().vectors.len(), 1);
+        assert!(
+            db.publish(
+                &selection("model"),
+                &revision("new"),
+                Some(&large),
+                &vectors
+            )
+            .is_err()
+        );
+        assert!(
+            db.documents(&selection("model"), &revision("old"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.documents(&selection("model"), &revision("new"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(db.vectors(&selection("model")).unwrap().vectors.len(), 1);
 
         let reader = Connection::open(&path).unwrap();
         reader
@@ -1095,7 +1207,9 @@ mod tests {
         let (next, vectors) = fixture("next", 2);
         // Publication is atomic even if an external snapshot prevents its final
         // checkpoint. The next writer must not append behind that snapshot.
-        let outcome = db.publish("model", "new", Some(&next), &vectors).unwrap();
+        let outcome = db
+            .publish(&selection("model"), &revision("new"), Some(&next), &vectors)
+            .unwrap();
         assert!(matches!(
             &outcome,
             CommitOutcome::CommittedButNotCheckpointed(_)
@@ -1116,21 +1230,42 @@ mod tests {
         assert!(size > 0);
         for _ in 0..3 {
             assert!(
-                db.publish("model", "newer", Some(&first), &Cache::default())
-                    .is_err()
+                db.publish(
+                    &selection("model"),
+                    &revision("newer"),
+                    Some(&first),
+                    &Cache::default()
+                )
+                .is_err()
             );
             assert_eq!(fs::metadata(&wal).unwrap().len(), size);
         }
         reader.execute_batch("COMMIT").unwrap();
         db.checkpoint().unwrap();
         assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
-        assert!(db.documents("model", "new").unwrap().is_some());
+        assert!(
+            db.documents(&selection("model"), &revision("new"))
+                .unwrap()
+                .is_some()
+        );
         let (repaired, vectors) = fixture("repaired", 2);
-        db.publish("model", "repaired", Some(&repaired), &vectors)
-            .and_then(CommitOutcome::into_result)
-            .unwrap();
-        assert_eq!(db.vectors("model").unwrap().vectors, vectors.vectors);
-        assert!(db.documents("model", "repaired").unwrap().is_some());
+        db.publish(
+            &selection("model"),
+            &revision("repaired"),
+            Some(&repaired),
+            &vectors,
+        )
+        .and_then(CommitOutcome::into_result)
+        .unwrap();
+        assert_eq!(
+            db.vectors(&selection("model")).unwrap().vectors,
+            vectors.vectors
+        );
+        assert!(
+            db.documents(&selection("model"), &revision("repaired"))
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
     }
 
@@ -1152,28 +1287,33 @@ mod tests {
         let (documents, vectors) = fixture("first", 2);
         seed(&config, "model", "old", &documents, &vectors);
         seed(&config, "other", "old", &documents, &vectors);
-        with_database(&config, "other", |db| {
+        with_database(&config, &selection("other"), |db| {
             db.connection
                 .execute("UPDATE builds SET complete=1 WHERE selection='other'", [])?;
             Ok(())
         })
         .unwrap();
         assert!(matches!(
-            build_history(&config, "model").unwrap(),
+            build_history(&config, &selection("model")).unwrap(),
             BuildHistory::Unfinished
         ));
         assert!(matches!(
-            build_history(&config, "other").unwrap(),
+            build_history(&config, &selection("other")).unwrap(),
             BuildHistory::Completed
         ));
-        let error = with_database(&config, "model", |db| {
+        let error = with_database(&config, &selection("model"), |db| {
             let pages: i64 = db
                 .connection
                 .query_row("PRAGMA page_count", [], |r| r.get(0))?;
             db.connection.pragma_update(None, "max_page_count", pages)?;
             let (large, vectors) = fixture("huge", 100_000);
-            db.publish("model", "new", Some(&large), &vectors)?
-                .into_result()
+            db.publish(
+                &selection("model"),
+                &revision("new"),
+                Some(&large),
+                &vectors,
+            )?
+            .into_result()
         })
         .unwrap_err();
         assert!(format!("{error:#}").contains("cache cleared"), "{error:#}");
@@ -1200,14 +1340,27 @@ mod tests {
         }
         for selection in ["model", "other"] {
             assert!(matches!(
-                build_history(&config, selection).unwrap(),
+                build_history(&config, &SelectionIdentity(selection.to_owned())).unwrap(),
                 BuildHistory::Absent
             ));
-            assert!(load(&config, selection).unwrap().vectors.is_empty());
+            assert!(
+                load(&config, &SelectionIdentity(selection.to_owned()))
+                    .unwrap()
+                    .vectors
+                    .is_empty()
+            );
         }
-        assert!(load(&config, "model").unwrap().vectors.is_empty());
+        assert!(
+            load(&config, &selection("model"))
+                .unwrap()
+                .vectors
+                .is_empty()
+        );
         seed(&config, "model", "recovered", &documents, &vectors);
-        assert_eq!(load(&config, "model").unwrap().vectors["first"], [1.0, 1.0]);
+        assert_eq!(
+            load(&config, &selection("model")).unwrap().vectors["first"],
+            [1.0, 1.0]
+        );
     }
 
     #[test]
@@ -1226,7 +1379,7 @@ mod tests {
         fs::write(
             directory.join("documents-model.msgpack"),
             rmp_serde::to_vec_named(&DocumentCache {
-                version: "commit".into(),
+                version: revision("commit"),
                 documents,
             })
             .unwrap(),
@@ -1239,11 +1392,11 @@ mod tests {
         ] {
             fs::write(directory.join(name), b"obsolete").unwrap();
         }
-        let cached = load(&config, "model").unwrap();
+        let cached = load(&config, &selection("model")).unwrap();
         assert_eq!(cached.vectors.len(), 1);
         assert_eq!(cached.vectors["useful"], [1.0, 1.0]);
         assert_eq!(
-            super::documents(&config, "model", "commit")
+            super::documents(&config, &selection("model"), &revision("commit"))
                 .unwrap()
                 .unwrap()[0]
                 .keys,
@@ -1255,18 +1408,23 @@ mod tests {
 
         fs::write(directory.join("other.msgpack"), b"obsolete").unwrap();
         fs::write(directory.join("model.tmp-123"), b"abandoned").unwrap();
-        let failed = with_database(&config, "model", |db| {
+        let failed = with_database(&config, &selection("model"), |db| {
             db.budget = 1;
             let (documents, vectors) = fixture("replacement", 2);
-            db.publish("model", "replacement", Some(&documents), &vectors)?
-                .into_result()
+            db.publish(
+                &selection("model"),
+                &revision("replacement"),
+                Some(&documents),
+                &vectors,
+            )?
+            .into_result()
         })
         .unwrap_err();
         assert!(failed.to_string().contains("budget"), "{failed:#}");
         assert!(!directory.join("other.msgpack").exists());
         assert!(!directory.join("model.tmp-123").exists());
         assert_eq!(
-            load(&config, "model").unwrap().vectors["useful"],
+            load(&config, &selection("model")).unwrap().vectors["useful"],
             [1.0, 1.0]
         );
     }
@@ -1284,23 +1442,38 @@ mod tests {
             rmp_serde::to_vec_named(&vectors).unwrap(),
         )
         .unwrap();
-        assert_eq!(load(&config, "model").unwrap().vectors, vectors.vectors);
+        assert_eq!(
+            load(&config, &selection("model")).unwrap().vectors,
+            vectors.vectors
+        );
         let snapshot = SnapshotFixture::new(&config, "first");
         let plan = snapshot.plan(mapped);
         assert!(
-            documents(&config, "model", &plan.version)
+            documents(&config, &selection("model"), &plan.version)
                 .unwrap()
                 .is_none()
         );
-        assert!(build_history(&config, "model").unwrap().needs_full_build());
+        assert!(
+            build_history(&config, &selection("model"))
+                .unwrap()
+                .needs_full_build()
+        );
         publish_mapping(&config, &plan).unwrap();
-        let cached = load(&config, "model").unwrap();
+        let cached = load(&config, &selection("model")).unwrap();
         assert_eq!(cached.vectors.len(), 1);
         assert_eq!(cached.vectors["useful"], [1.0, 1.0]);
-        assert!(build_history(&config, "model").unwrap().needs_full_build());
+        assert!(
+            build_history(&config, &selection("model"))
+                .unwrap()
+                .needs_full_build()
+        );
         repair_snapshot(&config, &plan, &cached).unwrap();
         mark_build_complete(&config, &plan).unwrap();
-        assert!(!build_history(&config, "model").unwrap().needs_full_build());
+        assert!(
+            !build_history(&config, &selection("model"))
+                .unwrap()
+                .needs_full_build()
+        );
     }
 
     #[test]
@@ -1314,19 +1487,31 @@ mod tests {
         fs::write(
             &path,
             rmp_serde::to_vec_named(&DocumentCache {
-                version: "commit".into(),
+                version: revision("commit"),
                 documents: mapped,
             })
             .unwrap(),
         )
         .unwrap();
-        assert!(load(&config, "model").unwrap().vectors.is_empty());
+        assert!(
+            load(&config, &selection("model"))
+                .unwrap()
+                .vectors
+                .is_empty()
+        );
         assert_eq!(
-            documents(&config, "model", "commit").unwrap().unwrap()[0].keys,
+            documents(&config, &selection("model"), &revision("commit"))
+                .unwrap()
+                .unwrap()[0]
+                .keys,
             ["missing"]
         );
         assert!(!path.exists());
-        assert!(build_history(&config, "model").unwrap().needs_full_build());
+        assert!(
+            build_history(&config, &selection("model"))
+                .unwrap()
+                .needs_full_build()
+        );
     }
 
     #[test]
@@ -1346,7 +1531,7 @@ mod tests {
             fs::write(
                 directory.join("documents-model.msgpack"),
                 rmp_serde::to_vec_named(&DocumentCache {
-                    version: "commit".into(),
+                    version: revision("commit"),
                     documents,
                 })
                 .unwrap(),
@@ -1355,7 +1540,7 @@ mod tests {
             fs::write(directory.join(corrupt), [0xc1]).unwrap();
             fs::write(directory.join("other.msgpack"), b"unrelated").unwrap();
             fs::write(directory.join("model.tmp-123"), b"abandoned").unwrap();
-            let error = load(&config, "model").err().unwrap();
+            let error = load(&config, &selection("model")).err().unwrap();
             let expected = if corrupt == "model.msgpack" {
                 "invalid semantic cache"
             } else {
@@ -1371,7 +1556,12 @@ mod tests {
             ] {
                 assert!(!directory.join(name).exists(), "{name}");
             }
-            assert!(load(&config, "model").unwrap().vectors.is_empty());
+            assert!(
+                load(&config, &selection("model"))
+                    .unwrap()
+                    .vectors
+                    .is_empty()
+            );
         }
     }
 
@@ -1381,9 +1571,14 @@ mod tests {
         let mut db = Database::open(&dir.path().join(DATABASE), MAX_BYTES, MAX_PAGES).unwrap();
         let (documents, vectors) = fixture("chunk", 2);
         for n in 0..4 {
-            db.publish(&format!("model{n}"), "commit", Some(&documents), &vectors)
-                .and_then(CommitOutcome::into_result)
-                .unwrap();
+            db.publish(
+                &selection(&format!("model{n}")),
+                &revision("commit"),
+                Some(&documents),
+                &vectors,
+            )
+            .and_then(CommitOutcome::into_result)
+            .unwrap();
             db.connection
                 .execute(
                     "UPDATE selections SET touched=unixepoch()-172800+? WHERE selection=?",
@@ -1391,16 +1586,27 @@ mod tests {
                 )
                 .unwrap();
         }
-        db.touch("model0")
+        db.touch(&selection("model0"))
             .and_then(CommitOutcome::into_result)
             .unwrap();
-        db.publish("model4", "commit", Some(&documents), &vectors)
-            .and_then(CommitOutcome::into_result)
-            .unwrap();
-        assert!(db.documents("model1", "commit").unwrap().is_none());
+        db.publish(
+            &selection("model4"),
+            &revision("commit"),
+            Some(&documents),
+            &vectors,
+        )
+        .and_then(CommitOutcome::into_result)
+        .unwrap();
+        assert!(
+            db.documents(&selection("model1"), &revision("commit"))
+                .unwrap()
+                .is_none()
+        );
         for model in ["model0", "model2", "model3", "model4"] {
             assert!(
-                db.documents(model, "commit").unwrap().is_some(),
+                db.documents(&selection(model), &revision("commit"))
+                    .unwrap()
+                    .is_some(),
                 "evicted {model}"
             );
         }

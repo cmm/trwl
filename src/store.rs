@@ -173,6 +173,39 @@ pub(crate) fn incompatible(error: &anyhow::Error) -> bool {
             )
     })
 }
+#[derive(Debug, PartialEq, Eq)]
+struct SegmentGeneration(String);
+
+// The manifest stores the history-dependent seed; semantic consumers use the
+// record-version-qualified revision. Keeping both typed prevents double hashing.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+struct StoredConversationRevision(String);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ConversationRevision(String);
+
+impl ConversationRevision {
+    pub(crate) fn from_storage(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl StoredConversationRevision {
+    fn legacy(generation: SegmentGeneration) -> Self {
+        Self(generation.0)
+    }
+
+    fn qualified(&self) -> ConversationRevision {
+        ConversationRevision(digest(&[&RECORD_VERSION.to_string(), &self.0]))
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Manifest {
     #[serde(default)]
@@ -181,7 +214,7 @@ struct Manifest {
     #[serde(default)]
     workspace_roots: workspace::Roots,
     #[serde(default)]
-    semantic_version: Option<String>,
+    semantic_version: Option<StoredConversationRevision>,
 }
 impl Default for Manifest {
     fn default() -> Self {
@@ -189,8 +222,46 @@ impl Default for Manifest {
             record_version: RECORD_VERSION,
             inputs: BTreeMap::new(),
             workspace_roots: workspace::Roots::default(),
-            semantic_version: Some(digest(&["empty conversation"])),
+            semantic_version: Some(StoredConversationRevision(digest(&["empty conversation"]))),
         }
+    }
+}
+
+impl Manifest {
+    fn conversation_revision(
+        &self,
+        generation: impl FnOnce() -> SegmentGeneration,
+    ) -> StoredConversationRevision {
+        self.semantic_version
+            .clone()
+            .unwrap_or_else(|| StoredConversationRevision::legacy(generation()))
+    }
+
+    fn commit_conversation_changes(
+        mut self,
+        writer: &mut tantivy::IndexWriter,
+        previous: StoredConversationRevision,
+        mut removed_messages: Vec<String>,
+        mut added_messages: Vec<String>,
+    ) -> Result<()> {
+        // Compare the actual pairing inputs, including result metadata. Sorting
+        // makes suffix replay and segment order irrelevant while retaining duplicates.
+        removed_messages.sort();
+        added_messages.sort();
+        self.semantic_version = Some(if removed_messages == added_messages {
+            previous
+        } else {
+            StoredConversationRevision(digest(&[
+                &previous.0,
+                &serde_json::to_string(&(removed_messages, added_messages))?,
+            ]))
+        });
+        // Checkpoints and records become visible together; an interrupted writer
+        // cannot mark input as processed without publishing its records.
+        let mut commit = writer.prepare_commit()?;
+        commit.set_payload(&serde_json::to_string(&self)?);
+        commit.commit()?;
+        Ok(())
     }
 }
 
@@ -262,7 +333,7 @@ pub struct ReadIndex {
     index: Index,
     searcher: Searcher,
     fields: Fields,
-    semantic_version: String,
+    semantic_version: StoredConversationRevision,
     #[cfg(test)]
     pub(crate) record_decodes: std::rc::Rc<std::cell::Cell<usize>>,
     #[cfg(test)]
@@ -622,8 +693,8 @@ impl SegmentWinners {
 
 impl ReadIndex {
     /// Identify this reader's conversation inputs and result metadata.
-    pub fn version(&self) -> String {
-        conversation_version(&self.semantic_version)
+    pub fn version(&self) -> ConversationRevision {
+        self.semantic_version.qualified()
     }
 
     pub fn open(root: &Path) -> Result<Option<Self>> {
@@ -664,7 +735,7 @@ impl ReadIndex {
                 index,
                 searcher,
                 fields,
-                semantic_version: manifest.semantic_version.unwrap_or(version),
+                semantic_version: manifest.conversation_revision(|| version),
                 #[cfg(test)]
                 record_decodes: RECORD_DECODES.with(Clone::clone),
                 #[cfg(test)]
@@ -1365,18 +1436,20 @@ pub fn records(root: &Path) -> Result<Vec<Record>> {
     ReadIndex::open(root)?.map_or_else(|| Ok(Vec::new()), |index| index.all())
 }
 
-fn segment_version(segments: impl IntoIterator<Item = (String, u32)>) -> String {
+fn segment_version(segments: impl IntoIterator<Item = (String, u32)>) -> SegmentGeneration {
     let mut segments: Vec<_> = segments
         .into_iter()
         .map(|(id, deleted)| format!("{id}:{deleted}"))
         .collect();
     segments.sort();
-    digest(&segments.iter().map(String::as_str).collect::<Vec<_>>())
+    SegmentGeneration(digest(
+        &segments.iter().map(String::as_str).collect::<Vec<_>>(),
+    ))
 }
 
 /// Changes to lexical-only content, parser state and segment layout do not
 /// invalidate conversation planning. `None` without an index.
-pub fn semantic_version(root: &Path) -> Result<Option<String>> {
+pub fn semantic_version(root: &Path) -> Result<Option<ConversationRevision>> {
     let path = root.join("index");
     if !path.join("meta.json").try_exists()? {
         return Ok(None);
@@ -1384,21 +1457,17 @@ pub fn semantic_version(root: &Path) -> Result<Option<String>> {
     let index = Index::open_in_dir(&path)?;
     check_schema(&index, &schema().0, &path)?;
     let meta = index.load_metas()?;
-    Ok(Some(conversation_version(
-        &decode_manifest(meta.payload.as_deref())?
-            .semantic_version
-            .unwrap_or_else(|| {
+    Ok(Some(
+        decode_manifest(meta.payload.as_deref())?
+            .conversation_revision(|| {
                 segment_version(
                     meta.segments
                         .iter()
                         .map(|s| (s.id().uuid_string(), s.num_deleted_docs())),
                 )
-            }),
-    )))
-}
-
-fn conversation_version(version: &str) -> String {
-    digest(&[&RECORD_VERSION.to_string(), version])
+            })
+            .qualified(),
+    ))
 }
 
 fn read_record(searcher: &Searcher, fields: Fields, address: DocAddress) -> Result<Record> {
@@ -2037,7 +2106,7 @@ struct CompletedImport {
     searcher: Searcher,
     fields: Fields,
     manifest: Manifest,
-    previous_version: String,
+    previous_version: StoredConversationRevision,
     changes: BTreeMap<String, Change>,
     spool: Option<File>,
     report: ImportReport,
@@ -2084,7 +2153,7 @@ fn stage_index(
     check_schema(&index, &schema, path)?;
     let meta = index.load_metas()?;
     let mut manifest = decode_manifest(meta.payload.as_deref())?;
-    let previous_version = manifest.semantic_version.clone().unwrap_or_else(|| {
+    let previous_version = manifest.conversation_revision(|| {
         segment_version(
             meta.segments
                 .iter()
@@ -2326,23 +2395,12 @@ impl CompletedImport {
                 writer.add_document(document)?;
             }
         }
-        // Compare the actual pairing inputs, including result metadata. Sorting
-        // makes suffix replay and segment order irrelevant while retaining duplicates.
-        removed_messages.sort();
-        added_messages.sort();
-        manifest.semantic_version = Some(if removed_messages == added_messages {
-            previous_version
-        } else {
-            digest(&[
-                &previous_version,
-                &serde_json::to_string(&(removed_messages, added_messages))?,
-            ])
-        });
-        // Checkpoints and records become visible together; an interrupted writer
-        // cannot mark input as processed without publishing its records.
-        let mut commit = writer.prepare_commit()?;
-        commit.set_payload(&serde_json::to_string(&manifest)?);
-        commit.commit()?;
+        manifest.commit_conversation_changes(
+            &mut writer,
+            previous_version,
+            removed_messages,
+            added_messages,
+        )?;
         Ok(PublishedImport {
             writer,
             report,

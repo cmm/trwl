@@ -220,7 +220,7 @@ struct PreparedDocument {
 
 #[derive(Serialize, Deserialize)]
 struct DocumentCache {
-    version: String,
+    version: crate::store::ConversationRevision,
     documents: Vec<EmbeddingDocument>,
 }
 
@@ -247,7 +247,7 @@ fn chunk_tokenizer(selection: &Selection) -> Result<Option<Tokenizer>> {
 enum PlanningTokenizer {
     Owned(PlanningState),
     Shared {
-        selection: String,
+        selection: SelectionIdentity,
         client: server::Client,
     },
 }
@@ -257,11 +257,11 @@ enum PlanningState {
     #[default]
     Uninitialized,
     Local {
-        selection: String,
+        selection: SelectionIdentity,
         tokenizer: Box<Tokenizer>,
     },
     Remote {
-        selection: String,
+        selection: SelectionIdentity,
     },
 }
 
@@ -269,7 +269,7 @@ impl PlanningState {
     fn prepare(&mut self, selection: &Selection, texts: &[String]) -> Result<Vec<Vec<ChunkInput>>> {
         let key = match self {
             Self::Uninitialized => None,
-            Self::Local { selection, .. } | Self::Remote { selection } => Some(selection.as_str()),
+            Self::Local { selection, .. } | Self::Remote { selection } => Some(&*selection),
         };
         if key != Some(&selection.key) {
             // Drop the old vocabulary before initialization so failure is retryable.
@@ -463,7 +463,7 @@ enum VectorCoverage {
 struct DocumentPlan<'a> {
     selection: &'a Selection,
     index: &'a ReadIndex,
-    version: String,
+    version: crate::store::ConversationRevision,
     documents: Vec<EmbeddingDocument>,
     materialization: Materialization,
 }
@@ -525,9 +525,19 @@ fn document_plan<'a>(
     Ok(plan)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct SelectionIdentity(String);
+
+impl SelectionIdentity {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct Selection {
-    key: String,
+    key: SelectionIdentity,
     executor: String,
     model: String,
     directory: Option<PathBuf>,
@@ -561,7 +571,7 @@ impl Selection {
             None
         };
         Ok(Self {
-            key: digest(&[INPUT_VERSION, &executor, &model, &files_hash]),
+            key: SelectionIdentity(digest(&[INPUT_VERSION, &executor, &model, &files_hash])),
             executor,
             model,
             directory,
@@ -1277,7 +1287,7 @@ pub struct Planner {
 }
 
 impl Planner {
-    pub fn selection_key(config: &Config) -> Result<String> {
+    pub fn selection_key(config: &Config) -> Result<SelectionIdentity> {
         Ok(Selection::from_config(config)?.key)
     }
 
@@ -1505,7 +1515,7 @@ pub(crate) mod tests {
     pub fn write_cache(config: &Config, bytes: &[u8]) {
         let path = config.directories.cache.join("semantic").join(format!(
             "{}.msgpack",
-            Selection::from_config(config).unwrap().key
+            Selection::from_config(config).unwrap().key.as_str()
         ));
         atomic_write(&path, bytes).unwrap();
     }
@@ -1729,7 +1739,7 @@ pub(crate) mod tests {
         let tokenizer_path = dir.path().join("tokenizer.json");
         tokenizer.save(&tokenizer_path, false).unwrap();
         let selection = Selection {
-            key: "test".into(),
+            key: SelectionIdentity("test".into()),
             executor: "builtin".into(),
             model: "test".into(),
             directory: Some(dir.path().into()),
@@ -1809,7 +1819,7 @@ pub(crate) mod tests {
         // Neither a previous selection's plans nor its loaded vocabulary may
         // satisfy a different model/tokenizer identity.
         let changed = Selection {
-            key: "changed-tokenizer".into(),
+            key: SelectionIdentity("changed-tokenizer".into()),
             ..selection.clone()
         };
         assert!(document_plan(&config, &changed, &next, &mut vocabulary).is_err());
@@ -1923,7 +1933,7 @@ pub(crate) mod tests {
             .directories
             .cache
             .join("semantic")
-            .join(format!("documents-{}-old.msgpack", selection.key));
+            .join(format!("documents-{}-old.msgpack", selection.key.as_str()));
         fs::write(&legacy, b"obsolete mapping").unwrap();
         let (cached, inputs) = plan(&irrelevant);
         assert!(matches!(inputs, Materialization::Deferred));

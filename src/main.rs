@@ -232,7 +232,7 @@ fn daemon_stopping(directories: &Directories) -> Result<bool> {
         || !Config::load(directories)?.automatic())
 }
 
-fn update_iteration(config: &Config) -> Result<Option<String>> {
+fn update_iteration(config: &Config) -> Result<Option<store::ConversationRevision>> {
     let report = store::update(config, &config.sources()?, false)?;
     if !report.completed() {
         eprintln!("{}", serde_json::to_string(&report)?);
@@ -330,7 +330,11 @@ impl EmbeddingUpdater {
         });
     }
 
-    fn scheduling_decision(&mut self, config: &Config, semantic_version: &str) -> ScheduleDecision {
+    fn scheduling_decision(
+        &mut self,
+        config: &Config,
+        semantic_version: &store::ConversationRevision,
+    ) -> ScheduleDecision {
         if matches!(self.work, EmbeddingWork::Running(_)) {
             return ScheduleDecision::AlreadyRunning;
         }
@@ -347,7 +351,11 @@ impl EmbeddingUpdater {
                 return ScheduleDecision::SelectionFailed;
             }
         };
-        let state = record::digest(&[semantic_version, &configuration, &selection]);
+        let state = record::digest(&[
+            semantic_version.as_str(),
+            &configuration,
+            selection.as_str(),
+        ]);
         if self.completed.as_ref() == Some(&state) {
             return ScheduleDecision::AlreadyCurrent;
         }
@@ -357,7 +365,7 @@ impl EmbeddingUpdater {
         })
     }
 
-    fn schedule(mut self, config: &Config, semantic_version: &str) -> Self {
+    fn schedule(mut self, config: &Config, semantic_version: &store::ConversationRevision) -> Self {
         let launch = match self.scheduling_decision(config, semantic_version) {
             ScheduleDecision::Start(launch) => launch,
             ScheduleDecision::AlreadyRunning
@@ -655,39 +663,60 @@ mod updater_tests {
     fn selection_failure_backoff_tracks_the_complete_configuration() {
         let (_directory, mut config) = configuration();
         config.document["semantic"]["executor"] = value("invalid");
-        let mut updater = EmbeddingUpdater::default().schedule(&config, "input-1");
+        let mut updater = EmbeddingUpdater::default().schedule(
+            &config,
+            &crate::store::ConversationRevision::from_storage("input-1".into()),
+        );
         assert!(matches!(updater.work, EmbeddingWork::Idle(_)));
         let failure = updater.failure.as_ref().unwrap();
         assert_eq!(failure.count, 1);
         let retry_at = failure.retry_at;
         let failed_configuration = failure.configuration.clone();
 
-        updater = updater.schedule(&config, "input-2");
+        updater = updater.schedule(
+            &config,
+            &crate::store::ConversationRevision::from_storage("input-2".into()),
+        );
         assert_eq!(updater.failure.as_ref().unwrap().retry_at, retry_at);
         assert!(matches!(
-            updater.scheduling_decision(&config, "input-2"),
+            updater.scheduling_decision(
+                &config,
+                &crate::store::ConversationRevision::from_storage("input-2".into())
+            ),
             ScheduleDecision::WaitingForRetry
         ));
         updater.failure.as_mut().unwrap().retry_at = Instant::now();
-        updater = updater.schedule(&config, "input-2");
+        updater = updater.schedule(
+            &config,
+            &crate::store::ConversationRevision::from_storage("input-2".into()),
+        );
         assert_eq!(updater.failure.as_ref().unwrap().count, 2);
 
         let mut valid = config.clone();
         valid.document["semantic"]["executor"] = value("http://127.0.0.1:1");
         assert!(matches!(
-            updater.scheduling_decision(&valid, "input-2"),
+            updater.scheduling_decision(
+                &valid,
+                &crate::store::ConversationRevision::from_storage("input-2".into())
+            ),
             ScheduleDecision::Start(_)
         ));
         assert_eq!(updater.failure.as_ref().unwrap().count, 2);
         assert!(matches!(
-            updater.scheduling_decision(&config, "input-2"),
+            updater.scheduling_decision(
+                &config,
+                &crate::store::ConversationRevision::from_storage("input-2".into())
+            ),
             ScheduleDecision::WaitingForRetry
         ));
 
         config.document = format!("{}\n# configuration edit\n", config.document)
             .parse()
             .unwrap();
-        updater = updater.schedule(&config, "input-2");
+        updater = updater.schedule(
+            &config,
+            &crate::store::ConversationRevision::from_storage("input-2".into()),
+        );
         let failure = updater.failure.as_ref().unwrap();
         assert_ne!(failure.configuration, failed_configuration);
         assert_eq!(failure.count, 1);
@@ -700,7 +729,10 @@ mod updater_tests {
         let lock = config::lock(&config.directories.cache, "semantic.lock").unwrap();
         let mut updater = EmbeddingUpdater::default();
         updater.record_failure("previous configuration".into(), "previous failure");
-        updater = updater.schedule(&config, "launch-input");
+        updater = updater.schedule(
+            &config,
+            &crate::store::ConversationRevision::from_storage("launch-input".into()),
+        );
         let EmbeddingWork::Running(job) = &updater.work else {
             panic!("expected a running job");
         };
@@ -710,33 +742,51 @@ mod updater_tests {
 
         updater = updater.collect();
         assert!(matches!(
-            updater.scheduling_decision(&changed, "new-input"),
+            updater.scheduling_decision(
+                &changed,
+                &crate::store::ConversationRevision::from_storage("new-input".into())
+            ),
             ScheduleDecision::AlreadyRunning
         ));
         assert_eq!(updater.failure.as_ref().unwrap().count, 1);
         drop(lock);
         wait_for_job(&updater);
         assert!(matches!(
-            updater.scheduling_decision(&changed, "new-input"),
+            updater.scheduling_decision(
+                &changed,
+                &crate::store::ConversationRevision::from_storage("new-input".into())
+            ),
             ScheduleDecision::AlreadyRunning
         ));
         updater = updater.collect();
         assert_eq!(updater.completed.as_ref(), Some(&launch_state));
         assert!(updater.failure.is_none());
         assert!(matches!(
-            updater.scheduling_decision(&config, "launch-input"),
+            updater.scheduling_decision(
+                &config,
+                &crate::store::ConversationRevision::from_storage("launch-input".into())
+            ),
             ScheduleDecision::AlreadyCurrent
         ));
         assert!(matches!(
-            updater.scheduling_decision(&config, "new-input"),
+            updater.scheduling_decision(
+                &config,
+                &crate::store::ConversationRevision::from_storage("new-input".into())
+            ),
             ScheduleDecision::Start(_)
         ));
         assert!(matches!(
-            updater.scheduling_decision(&changed, "new-input"),
+            updater.scheduling_decision(
+                &changed,
+                &crate::store::ConversationRevision::from_storage("new-input".into())
+            ),
             ScheduleDecision::SelectionFailed
         ));
         assert!(matches!(
-            updater.scheduling_decision(&config, "launch-input"),
+            updater.scheduling_decision(
+                &config,
+                &crate::store::ConversationRevision::from_storage("launch-input".into())
+            ),
             ScheduleDecision::AlreadyCurrent
         ));
         assert!(updater.failure.is_some());
@@ -773,12 +823,18 @@ mod updater_tests {
             assert_eq!(failure.count, 1);
             assert!(failure.retry_at >= collected_at + Duration::from_secs(2));
             assert!(matches!(
-                updater.scheduling_decision(&config, "retry-input"),
+                updater.scheduling_decision(
+                    &config,
+                    &crate::store::ConversationRevision::from_storage("retry-input".into())
+                ),
                 ScheduleDecision::WaitingForRetry
             ));
             let mut changed = config.clone();
             changed.document["semantic"]["model"] = value("other-model");
-            updater = updater.schedule(&changed, "retry-input");
+            updater = updater.schedule(
+                &changed,
+                &crate::store::ConversationRevision::from_storage("retry-input".into()),
+            );
             assert_eq!(updater.completed.as_deref(), Some("prior success"));
             assert_eq!(
                 updater.failure.as_ref().unwrap().configuration,
@@ -788,7 +844,10 @@ mod updater_tests {
             updater = updater.collect();
             assert!(updater.failure.is_none());
             assert!(matches!(
-                updater.scheduling_decision(&changed, "retry-input"),
+                updater.scheduling_decision(
+                    &changed,
+                    &crate::store::ConversationRevision::from_storage("retry-input".into())
+                ),
                 ScheduleDecision::AlreadyCurrent
             ));
         }

@@ -360,7 +360,7 @@ mod tests {
             .env("TRWL_TEST_WORKER", mode)
             .env("TRWL_GPU_LOCK_DIR", directory);
         let selection = Selection {
-            key: "test".into(),
+            key: super::super::SelectionIdentity("test".into()),
             executor: "builtin".into(),
             model: "test".into(),
             directory: Some(directory.into()),
