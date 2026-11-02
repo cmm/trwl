@@ -134,17 +134,100 @@ struct ModelHash {
     hash: String,
 }
 
+impl ModelHash {
+    fn read_stable(mut file: File, stamp: ModelStamp) -> Result<Self> {
+        let mut hash = Sha256::new();
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+            #[cfg(test)]
+            HASHED_BYTES.with(|bytes| bytes.set(bytes.get() + count));
+        }
+        ensure!(
+            ModelStamp::from(&file.metadata()?) == stamp,
+            "model file changed while hashing; retry"
+        );
+        Ok(Self {
+            stamp,
+            hash: hex::encode(hash.finalize()),
+        })
+    }
+}
+
+struct ModelHashMemo {
+    path: PathBuf,
+    entries: BTreeMap<PathBuf, ModelHash>,
+    selected: HashSet<PathBuf>,
+    changed: bool,
+    hashes: Vec<String>,
+}
+
+impl ModelHashMemo {
+    fn load(path: PathBuf) -> Result<Self> {
+        let entries = match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).context("invalid model hash cache")?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Self {
+            path,
+            entries,
+            selected: HashSet::new(),
+            changed: false,
+            hashes: Vec::new(),
+        })
+    }
+
+    fn select(&mut self, directory: &Path, name: &str) -> Result<()> {
+        let file_path = directory
+            .join(name)
+            .canonicalize()
+            .with_context(|| format!("opening model file {}", directory.join(name).display()))?;
+        let file = File::open(&file_path)?;
+        let stamp = ModelStamp::from(&file.metadata()?);
+        if !self
+            .entries
+            .get(&file_path)
+            .is_some_and(|entry| entry.stamp == stamp)
+        {
+            let entry = ModelHash::read_stable(file, stamp)?;
+            self.entries.insert(file_path.clone(), entry);
+            self.changed = true;
+        }
+        self.hashes
+            .push(format!("{name}:{}", self.entries[&file_path].hash));
+        self.selected.insert(file_path);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<String> {
+        let previous = self.entries.len();
+        self.entries.retain(|path, _| self.selected.contains(path));
+        self.changed |= self.entries.len() != previous;
+        if self.changed {
+            // Hash memoization must not prevent the database from reclaiming space
+            // on a full filesystem. The computed hash remains usable without it.
+            if atomic_write(&self.path, &serde_json::to_vec(&self.entries)?).is_err() {
+                let _ = fs::remove_file(
+                    self.path
+                        .with_extension(format!("tmp-{}", std::process::id())),
+                );
+            }
+        }
+        Ok(digest(
+            &self.hashes.iter().map(String::as_str).collect::<Vec<_>>(),
+        ))
+    }
+}
+
 fn model_hash(config: &Config, directory: &Path) -> Result<String> {
     let _lock = lock(&config.directories.cache, "semantic-cache.lock")?;
-    let path = config.directories.cache.join("semantic/model-hashes.json");
-    let mut cached: BTreeMap<PathBuf, ModelHash> = match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).context("invalid model hash cache")?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-        Err(e) => return Err(e.into()),
-    };
-    let mut changed = false;
-    let mut hashes = Vec::new();
-    let mut paths = HashSet::new();
+    let mut memo =
+        ModelHashMemo::load(config.directories.cache.join("semantic/model-hashes.json"))?;
     for name in [
         "onnx/model.onnx",
         "tokenizer.json",
@@ -152,56 +235,9 @@ fn model_hash(config: &Config, directory: &Path) -> Result<String> {
         "special_tokens_map.json",
         "tokenizer_config.json",
     ] {
-        let file_path = directory
-            .join(name)
-            .canonicalize()
-            .with_context(|| format!("opening model file {}", directory.join(name).display()))?;
-        let mut file = File::open(&file_path)?;
-        let stamp = ModelStamp::from(&file.metadata()?);
-        if !cached
-            .get(&file_path)
-            .is_some_and(|entry| entry.stamp == stamp)
-        {
-            let mut hash = Sha256::new();
-            let mut buffer = vec![0u8; 1024 * 1024];
-            loop {
-                let count = file.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                hash.update(&buffer[..count]);
-                #[cfg(test)]
-                HASHED_BYTES.with(|bytes| bytes.set(bytes.get() + count));
-            }
-            ensure!(
-                ModelStamp::from(&file.metadata()?) == stamp,
-                "model file changed while hashing; retry"
-            );
-            cached.insert(
-                file_path.clone(),
-                ModelHash {
-                    stamp,
-                    hash: hex::encode(hash.finalize()),
-                },
-            );
-            changed = true;
-        }
-        hashes.push(format!("{name}:{}", cached[&file_path].hash));
-        paths.insert(file_path);
+        memo.select(directory, name)?;
     }
-    let previous = cached.len();
-    cached.retain(|path, _| paths.contains(path));
-    changed |= cached.len() != previous;
-    if changed {
-        // Hash memoization must not prevent the database from reclaiming space
-        // on a full filesystem. The computed hash remains usable without it.
-        if atomic_write(&path, &serde_json::to_vec(&cached)?).is_err() {
-            let _ = fs::remove_file(path.with_extension(format!("tmp-{}", std::process::id())));
-        }
-    }
-    Ok(digest(
-        &hashes.iter().map(String::as_str).collect::<Vec<_>>(),
-    ))
+    memo.finish()
 }
 
 #[derive(Serialize, Deserialize)]
