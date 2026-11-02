@@ -132,9 +132,11 @@ fn run_daemon(directories: &Directories, interval: u64) -> Result<()> {
     // keeps completed batches and the next updater resumes it.
     while !daemon_stopping(directories)? {
         let config = Config::load(directories)?;
-        embedding.collect();
-        if let Err(error) = update_iteration(&config, &mut embedding) {
-            eprintln!("background update: {error:#}");
+        embedding = embedding.collect();
+        match update_iteration(&config) {
+            Ok(Some(version)) => embedding = embedding.schedule(&config, &version),
+            Ok(None) => {}
+            Err(error) => eprintln!("background update: {error:#}"),
         }
         let deadline = Instant::now() + Duration::from_secs(interval.max(1));
         while Instant::now() < deadline {
@@ -152,17 +154,15 @@ fn daemon_stopping(directories: &Directories) -> Result<bool> {
         || !Config::load(directories)?.automatic())
 }
 
-fn update_iteration(config: &Config, embedding: &mut EmbeddingUpdater) -> Result<()> {
+fn update_iteration(config: &Config) -> Result<Option<String>> {
     let report = store::update(config, &config.sources()?, false)?;
     if !report.completed() {
         eprintln!("{}", serde_json::to_string(&report)?);
     }
-    if config.semantic()
-        && let Some(version) = store::semantic_version(&config.directories.data)?
-    {
-        embedding.schedule(config, &version);
+    if config.semantic() {
+        return store::semantic_version(&config.directories.data);
     }
-    Ok(())
+    Ok(None)
 }
 
 /// One background embedding fill at a time. A fill runs when conversation inputs
@@ -170,16 +170,38 @@ fn update_iteration(config: &Config, embedding: &mut EmbeddingUpdater) -> Result
 /// unchanged configuration waits for a backoff delay before the next attempt.
 #[derive(Default)]
 struct EmbeddingUpdater {
-    job: Option<EmbeddingJob>,
-    planner: semantic::Planner,
+    work: EmbeddingWork,
     completed: Option<String>,
     failure: Option<Failure>,
 }
 
-struct EmbeddingJob {
+enum EmbeddingWork {
+    Idle(semantic::Planner),
+    Running(EmbeddingJob),
+}
+
+impl Default for EmbeddingWork {
+    fn default() -> Self {
+        Self::Idle(semantic::Planner::default())
+    }
+}
+
+struct Launch {
     state: String,
     configuration: String,
+}
+
+struct EmbeddingJob {
+    launch: Launch,
     thread: thread::JoinHandle<(semantic::Planner, Result<()>)>,
+}
+
+enum ScheduleDecision {
+    AlreadyRunning,
+    WaitingForRetry,
+    AlreadyCurrent,
+    SelectionFailed,
+    Start(Launch),
 }
 
 struct Failure {
@@ -189,33 +211,31 @@ struct Failure {
 }
 
 impl EmbeddingUpdater {
-    fn collect(&mut self) {
-        if !self
-            .job
-            .as_ref()
-            .is_some_and(|job| job.thread.is_finished())
-        {
-            return;
-        }
-        let EmbeddingJob {
-            state,
-            configuration,
-            thread,
-        } = self.job.take().unwrap();
-        let result = thread.join().map(|(planner, result)| {
-            self.planner = planner;
-            result
-        });
-        let error = match result {
-            Ok(Ok(())) => {
-                self.completed = Some(state);
-                self.failure = None;
-                return;
-            }
-            Ok(Err(error)) => format!("{error:#}"),
-            Err(_) => "worker panicked".into(),
+    fn collect(mut self) -> Self {
+        let job = match self.work {
+            EmbeddingWork::Running(job) if job.thread.is_finished() => job,
+            _ => return self,
         };
-        self.record_failure(configuration, &error);
+        let EmbeddingJob { launch, thread } = job;
+        let (planner, result) = match thread.join() {
+            Ok(returned) => returned,
+            // A panic loses the planner owned by the thread. Normal errors keep it.
+            Err(_) => (
+                semantic::Planner::default(),
+                Err(anyhow::anyhow!("worker panicked")),
+            ),
+        };
+        self.work = EmbeddingWork::Idle(planner);
+        let error = match result {
+            Ok(()) => {
+                self.completed = Some(launch.state);
+                self.failure = None;
+                return self;
+            }
+            Err(error) => format!("{error:#}"),
+        };
+        self.record_failure(launch.configuration, &error);
+        self
     }
 
     fn record_failure(&mut self, configuration: String, error: &str) {
@@ -232,39 +252,56 @@ impl EmbeddingUpdater {
         });
     }
 
-    fn schedule(&mut self, config: &Config, semantic_version: &str) {
-        if self.job.is_some() {
-            return;
+    fn scheduling_decision(&mut self, config: &Config, semantic_version: &str) -> ScheduleDecision {
+        if matches!(self.work, EmbeddingWork::Running(_)) {
+            return ScheduleDecision::AlreadyRunning;
         }
         let configuration = record::digest(&[&config.document.to_string()]);
         if self.failure.as_ref().is_some_and(|failure| {
             failure.configuration == configuration && Instant::now() < failure.retry_at
         }) {
-            return;
+            return ScheduleDecision::WaitingForRetry;
         }
         let selection = match semantic::Planner::selection_key(config) {
             Ok(selection) => selection,
             Err(error) => {
                 self.record_failure(configuration, &format!("{error:#}"));
-                return;
+                return ScheduleDecision::SelectionFailed;
             }
         };
         let state = record::digest(&[semantic_version, &configuration, &selection]);
         if self.completed.as_ref() == Some(&state) {
-            return;
+            return ScheduleDecision::AlreadyCurrent;
         }
+        ScheduleDecision::Start(Launch {
+            state,
+            configuration,
+        })
+    }
+
+    fn schedule(mut self, config: &Config, semantic_version: &str) -> Self {
+        let launch = match self.scheduling_decision(config, semantic_version) {
+            ScheduleDecision::Start(launch) => launch,
+            ScheduleDecision::AlreadyRunning
+            | ScheduleDecision::WaitingForRetry
+            | ScheduleDecision::AlreadyCurrent
+            | ScheduleDecision::SelectionFailed => return self,
+        };
+        let EmbeddingWork::Idle(mut planner) = self.work else {
+            unreachable!("a running job cannot schedule another fill");
+        };
         let worker_config = config.clone();
         // Remember the state this worker started with. A conversation change or
         // configuration edit schedules another fill after it finishes.
-        let mut planner = std::mem::take(&mut self.planner);
-        self.job = Some(EmbeddingJob {
-            state,
-            configuration,
+        // Refresh resolves its own reader and selection later, under semantic.lock.
+        self.work = EmbeddingWork::Running(EmbeddingJob {
+            launch,
             thread: thread::spawn(move || {
                 let result = planner.refresh(&worker_config);
                 (planner, result)
             }),
         });
+        self
     }
 }
 
@@ -508,5 +545,174 @@ fn main() {
             eprintln!("trwl: {error:#}");
         }
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod updater_tests {
+    use super::*;
+
+    fn configuration() -> (tempfile::TempDir, Config) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config::load(&Directories::isolated(directory.path())).unwrap();
+        config.document =
+            "[search]\nsemantic = true\n[semantic]\nexecutor = 'http://127.0.0.1:1'\nmodel = 'test'\n"
+                .parse()
+                .unwrap();
+        (directory, config)
+    }
+
+    fn wait_for_job(updater: &EmbeddingUpdater) {
+        let EmbeddingWork::Running(job) = &updater.work else {
+            panic!("expected a running job");
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !job.thread.is_finished() {
+            assert!(Instant::now() < deadline, "embedding job did not finish");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn selection_failure_backoff_tracks_the_complete_configuration() {
+        let (_directory, mut config) = configuration();
+        config.document["semantic"]["executor"] = value("invalid");
+        let mut updater = EmbeddingUpdater::default().schedule(&config, "input-1");
+        assert!(matches!(updater.work, EmbeddingWork::Idle(_)));
+        let failure = updater.failure.as_ref().unwrap();
+        assert_eq!(failure.count, 1);
+        let retry_at = failure.retry_at;
+        let failed_configuration = failure.configuration.clone();
+
+        updater = updater.schedule(&config, "input-2");
+        assert_eq!(updater.failure.as_ref().unwrap().retry_at, retry_at);
+        assert!(matches!(
+            updater.scheduling_decision(&config, "input-2"),
+            ScheduleDecision::WaitingForRetry
+        ));
+        updater.failure.as_mut().unwrap().retry_at = Instant::now();
+        updater = updater.schedule(&config, "input-2");
+        assert_eq!(updater.failure.as_ref().unwrap().count, 2);
+
+        let mut valid = config.clone();
+        valid.document["semantic"]["executor"] = value("http://127.0.0.1:1");
+        assert!(matches!(
+            updater.scheduling_decision(&valid, "input-2"),
+            ScheduleDecision::Start(_)
+        ));
+        assert_eq!(updater.failure.as_ref().unwrap().count, 2);
+        assert!(matches!(
+            updater.scheduling_decision(&config, "input-2"),
+            ScheduleDecision::WaitingForRetry
+        ));
+
+        config.document = format!("{}\n# configuration edit\n", config.document)
+            .parse()
+            .unwrap();
+        updater = updater.schedule(&config, "input-2");
+        let failure = updater.failure.as_ref().unwrap();
+        assert_ne!(failure.configuration, failed_configuration);
+        assert_eq!(failure.count, 1);
+        assert!(matches!(updater.work, EmbeddingWork::Idle(_)));
+    }
+
+    #[test]
+    fn completion_uses_launch_identity_after_configuration_changes() {
+        let (_directory, config) = configuration();
+        let lock = config::lock(&config.directories.cache, "semantic.lock").unwrap();
+        let mut updater = EmbeddingUpdater::default();
+        updater.record_failure("previous configuration".into(), "previous failure");
+        updater = updater.schedule(&config, "launch-input");
+        let EmbeddingWork::Running(job) = &updater.work else {
+            panic!("expected a running job");
+        };
+        let launch_state = job.launch.state.clone();
+        let mut changed = config.clone();
+        changed.document["semantic"]["executor"] = value("invalid");
+
+        updater = updater.collect();
+        assert!(matches!(
+            updater.scheduling_decision(&changed, "new-input"),
+            ScheduleDecision::AlreadyRunning
+        ));
+        assert_eq!(updater.failure.as_ref().unwrap().count, 1);
+        drop(lock);
+        wait_for_job(&updater);
+        assert!(matches!(
+            updater.scheduling_decision(&changed, "new-input"),
+            ScheduleDecision::AlreadyRunning
+        ));
+        updater = updater.collect();
+        assert_eq!(updater.completed.as_ref(), Some(&launch_state));
+        assert!(updater.failure.is_none());
+        assert!(matches!(
+            updater.scheduling_decision(&config, "launch-input"),
+            ScheduleDecision::AlreadyCurrent
+        ));
+        assert!(matches!(
+            updater.scheduling_decision(&config, "new-input"),
+            ScheduleDecision::Start(_)
+        ));
+        assert!(matches!(
+            updater.scheduling_decision(&changed, "new-input"),
+            ScheduleDecision::SelectionFailed
+        ));
+        assert!(matches!(
+            updater.scheduling_decision(&config, "launch-input"),
+            ScheduleDecision::AlreadyCurrent
+        ));
+        assert!(updater.failure.is_some());
+    }
+
+    #[test]
+    fn failed_and_panicked_jobs_retry_the_saved_configuration() {
+        let (_directory, config) = configuration();
+        let configuration = record::digest(&[&config.document.to_string()]);
+        for panics in [false, true] {
+            let mut updater = EmbeddingUpdater {
+                work: EmbeddingWork::Running(EmbeddingJob {
+                    launch: Launch {
+                        state: "failed launch".into(),
+                        configuration: configuration.clone(),
+                    },
+                    thread: thread::spawn(move || {
+                        assert!(!panics, "injected embedding panic");
+                        (
+                            semantic::Planner::default(),
+                            Err(anyhow::anyhow!("injected failure")),
+                        )
+                    }),
+                }),
+                completed: Some("prior success".into()),
+                failure: None,
+            };
+            wait_for_job(&updater);
+            let collected_at = Instant::now();
+            updater = updater.collect();
+            assert_eq!(updater.completed.as_deref(), Some("prior success"));
+            let failure = updater.failure.as_ref().unwrap();
+            assert_eq!(failure.configuration, configuration);
+            assert_eq!(failure.count, 1);
+            assert!(failure.retry_at >= collected_at + Duration::from_secs(2));
+            assert!(matches!(
+                updater.scheduling_decision(&config, "retry-input"),
+                ScheduleDecision::WaitingForRetry
+            ));
+            let mut changed = config.clone();
+            changed.document["semantic"]["model"] = value("other-model");
+            updater = updater.schedule(&changed, "retry-input");
+            assert_eq!(updater.completed.as_deref(), Some("prior success"));
+            assert_eq!(
+                updater.failure.as_ref().unwrap().configuration,
+                configuration
+            );
+            wait_for_job(&updater);
+            updater = updater.collect();
+            assert!(updater.failure.is_none());
+            assert!(matches!(
+                updater.scheduling_decision(&changed, "retry-input"),
+                ScheduleDecision::AlreadyCurrent
+            ));
+        }
     }
 }
