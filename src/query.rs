@@ -59,6 +59,21 @@ pub(crate) fn bound(value: &str, until: bool) -> Result<String> {
     }
 }
 
+pub(crate) fn date_bounds(filters: &Filters) -> Result<(Option<String>, Option<String>)> {
+    Ok((
+        filters
+            .since
+            .as_deref()
+            .map(|s| bound(s, false))
+            .transpose()?,
+        filters
+            .until
+            .as_deref()
+            .map(|s| bound(s, true))
+            .transpose()?,
+    ))
+}
+
 pub fn search(config: &Config, args: &Search) -> Result<SearchReport> {
     let index = ReadIndex::open(&config.directories.data)?;
     search_index(config, args, index.as_ref())
@@ -369,19 +384,21 @@ pub fn list(
         Some(cursor) => PageRequest::Continuation(cursor),
         None => PageRequest::Initial,
     };
-    let Page { records, state } = match ReadIndex::open(root)? {
-        Some(index) => {
-            let workspace =
-                workspace::Selection::resolve(&filters.workspace, || index.workspace_roots())?;
-            index.page(
-                filters,
-                matches!(kind, ListKind::Sessions),
-                limit,
-                request,
-                &workspace,
-            )?
-        }
+    let index = ReadIndex::open(root)?;
+    let workspace = workspace::Selection::resolve(&filters.workspace, || match &index {
+        Some(index) => index.workspace_roots(),
+        None => Ok(HashSet::new()),
+    })?;
+    let Page { records, state } = match index {
+        Some(index) => index.page(
+            filters,
+            matches!(kind, ListKind::Sessions),
+            limit,
+            request,
+            &workspace,
+        )?,
         None => {
+            date_bounds(filters)?;
             request.resolve::<()>(|_| Ok(None))?;
             Page {
                 records: Vec::new(),

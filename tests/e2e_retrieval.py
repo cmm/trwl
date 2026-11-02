@@ -1,9 +1,10 @@
 """Import and retrieve OpenCode SQLite messages, tools, and a child session."""
 
 import json
+import sqlite3
 
 from e2e_providers import write_jsonl
-from e2e_support import OpenCodeFixture, require
+from e2e_support import Case, OpenCodeFixture, require
 
 PARENT = "ses_fixture_parent"
 CHILD = "ses_fixture_child"
@@ -18,6 +19,7 @@ TOOL_OUTPUT = "outputbeacon Pool inspection finished.\nActive connections: 12; i
 
 
 def retrieval(case):
+    listing_validation(case)
     fixture = OpenCodeFixture(case.providers / "opencode.db", case.work)
     fixture.session(PARENT)
     fixture.session(CHILD, parent=PARENT, agent="explore")
@@ -259,6 +261,79 @@ def retrieval(case):
         "history verifier included selected content",
     )
     redacted_retrieval(case)
+
+
+def listing_validation(parent):
+    case = Case(parent.root / "listing-validation", parent.binary, parent.model_dir)
+    try:
+        nondirectory = case.root / "file"
+        nondirectory.write_text("not a directory")
+        missing = case.root / "missing"
+
+        def rejected(kind, args, detail):
+            result = case.command("list", kind, *args, expect_failure=True)
+            require(detail in result.stderr, result.stderr)
+
+        def check_state(state):
+            for kind in ("events", "sessions"):
+                rejected(
+                    kind,
+                    ("--workspace", nondirectory, "--since", "bad", "--cursor", "bad"),
+                    "workspace path is not a directory",
+                )
+                for flag in ("--since", "--until"):
+                    rejected(
+                        kind,
+                        ("--workspace", "**", flag, "bad", "--cursor", "bad"),
+                        "invalid timestamp",
+                    )
+                rejected(
+                    kind,
+                    ("--workspace", "**", "--cursor", "bad"),
+                    "cursor no longer matches this selection",
+                )
+                rejected(
+                    kind,
+                    ("--limit", "0", "--workspace", nondirectory),
+                    "list limit must be positive",
+                )
+                for workspace in (
+                    ("--workspace", missing),
+                    ("--workspace", nondirectory, "--workspace", "**"),
+                ):
+                    page = case.json_command("list", kind, *workspace)
+                    if state != "populated" or workspace[1] == missing:
+                        require(page[kind] == [] and page["next_cursor"] is None, page)
+                if state != "absent":
+                    rejected(
+                        kind,
+                        (
+                            "--workspace",
+                            "**",
+                            "--after-compaction",
+                            "missing-event",
+                            "--since",
+                            "bad",
+                            "--cursor",
+                            "bad",
+                        ),
+                        "compaction event not found",
+                    )
+
+        check_state("absent")
+        fixture = OpenCodeFixture(case.providers / "listing.db", case.work)
+        fixture.session("listing")
+        fixture.message("listing", "message", "listing validation")
+        case.command("import", "--provider", "opencode", "--path", fixture.path)
+        check_state("populated")
+        with sqlite3.connect(fixture.path) as db:
+            for table in ("part", "message", "session"):
+                db.execute(f"DELETE FROM {table}")
+        case.command("import", "--provider", "opencode", "--path", fixture.path)
+        check_state("empty")
+        parent.check("listing validation and error precedence across index states")
+    finally:
+        case.close()
 
 
 def redacted_retrieval(case):

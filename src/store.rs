@@ -945,18 +945,11 @@ impl ReadIndex {
         }
         if filters.since.is_some() || filters.until.is_some() {
             use std::ops::Bound;
-            let lower = filters
-                .since
-                .as_deref()
-                .map(|s| crate::query::bound(s, false))
-                .transpose()?
+            let (since, until) = crate::query::date_bounds(filters)?;
+            let lower = since
                 .map(|s| Bound::Included(Term::from_field_text(f.timestamp, &s)))
                 .unwrap_or(Bound::Unbounded);
-            let upper = filters
-                .until
-                .as_deref()
-                .map(|s| crate::query::bound(s, true))
-                .transpose()?
+            let upper = until
                 .map(|s| Bound::Excluded(Term::from_field_text(f.timestamp, &s)))
                 .unwrap_or(Bound::Unbounded);
             clauses.push((Occur::Must, Box::new(RangeQuery::new(lower, upper))));
