@@ -117,12 +117,9 @@ impl InputState {
     }
 }
 
-struct Change {
-    provider: Provider,
-    replace: providers::Replace,
-    range: Option<(u64, u64)>,
-    /// A checkpoint to store, replacing the previous one.
-    checkpoint: Option<providers::Checkpoint>,
+enum Change {
+    Remove,
+    Replace(staging::StagedReplacement),
 }
 
 /// The `id` of each input's checkpoint document. Event references are
@@ -1491,17 +1488,23 @@ fn load_checkpoint(
     ))
 }
 
-struct PlannedInput {
+struct InputSnapshot {
     key: String,
     provider: Provider,
     path: PathBuf,
     stamp: Stamp,
-    changed: bool,
 }
+
+enum PlannedInput {
+    Unchanged(InputSnapshot),
+    ParseWithCheckpoint(InputSnapshot),
+    FullReplay(InputSnapshot),
+    ConfirmedRemoval(String),
+    DiscoveryFailure(Diagnostic),
+}
+
 struct InputPlan {
     inputs: Vec<PlannedInput>,
-    removed: HashSet<String>,
-    errors: Vec<Diagnostic>,
     discovered: usize,
 }
 
@@ -1514,19 +1517,16 @@ fn source_listing(source: &Source) -> Result<(Provider, PathBuf, Vec<PathBuf>)> 
     ))
 }
 
-fn plan_inputs(sources: &[Source], manifest: &Manifest) -> InputPlan {
+fn plan_inputs(sources: &[Source], manifest: &Manifest, full: bool) -> InputPlan {
     let mut visited = HashSet::new();
-    let mut plan = InputPlan {
-        inputs: Vec::new(),
-        removed: HashSet::new(),
-        errors: Vec::new(),
-        discovered: 0,
-    };
+    let mut inputs = Vec::new();
+    let mut removed = HashSet::new();
+    let mut errors = Vec::new();
     for source in sources {
         let (provider, root, paths) = match source_listing(source) {
             Ok(listing) => listing,
             Err(error) => {
-                plan.errors.push(Diagnostic {
+                errors.push(Diagnostic {
                     path: source.root.clone(),
                     detail: format!("{error:#}"),
                 });
@@ -1542,7 +1542,7 @@ fn plan_inputs(sources: &[Source], manifest: &Manifest) -> InputPlan {
                     && input.path.starts_with(&root)
                     && !present.contains(&input.path)
                 {
-                    plan.removed.insert(key.clone());
+                    removed.insert(key.clone());
                 }
             }
         }
@@ -1553,68 +1553,134 @@ fn plan_inputs(sources: &[Source], manifest: &Manifest) -> InputPlan {
             }
             match stamp(&path, provider == Provider::Opencode) {
                 Ok(stamp) => {
-                    let changed = !manifest
-                        .inputs
-                        .get(&key)
-                        .is_some_and(|old| old.unchanged(&stamp));
-                    plan.inputs.push(PlannedInput {
+                    let old = manifest.inputs.get(&key);
+                    let input = InputSnapshot {
                         key,
                         provider,
                         path,
                         stamp,
-                        changed,
+                    };
+                    inputs.push(if full {
+                        PlannedInput::FullReplay(input)
+                    } else if old.is_some_and(|old| old.unchanged(&input.stamp)) {
+                        PlannedInput::Unchanged(input)
+                    } else if old.is_some_and(|old| {
+                        old.checkpointed
+                            && old.parser_revision == providers::parser_revision(provider)
+                    }) {
+                        PlannedInput::ParseWithCheckpoint(input)
+                    } else {
+                        PlannedInput::FullReplay(input)
                     });
                 }
-                Err(error) => plan.errors.push(Diagnostic {
+                Err(error) => errors.push(Diagnostic {
                     path,
                     detail: format!("{error:#}"),
                 }),
             }
         }
     }
-    plan.discovered = visited.len();
-    plan
+    InputPlan {
+        inputs: errors
+            .into_iter()
+            .map(PlannedInput::DiscoveryFailure)
+            .chain(inputs)
+            .chain(removed.into_iter().map(PlannedInput::ConfirmedRemoval))
+            .collect(),
+        discovered: visited.len(),
+    }
 }
 
-fn stage_input(
-    input: &PlannedInput,
-    previous: Option<providers::Checkpoint>,
-    spool: &mut Option<BufWriter<File>>,
-    directories: &crate::directories::Directories,
-    parse: &mut impl FnMut(
-        Provider,
-        &Path,
-        Option<&providers::Checkpoint>,
-        &mut dyn FnMut(&Record) -> Result<()>,
-    ) -> Result<providers::Parsed>,
-) -> Result<(providers::Parsed, (u64, u64), bool)> {
-    // Stage records on disk. Failed sources leave unused byte ranges;
-    // one unlinked file bounds memory and open descriptors.
-    if spool.is_none() {
-        fs::create_dir_all(&directories.cache)?;
-        *spool = Some(BufWriter::new(tempfile::tempfile_in(&directories.cache)?));
+mod staging {
+    use super::*;
+
+    pub(super) enum CheckpointIntent {
+        Keep,
+        /// A checkpoint to store, replacing the previous one.
+        Write(Box<providers::Checkpoint>),
     }
-    let spool = spool.as_mut().unwrap();
-    let start = spool.stream_position()?;
-    let parsed = parse(
-        input.provider,
-        &input.path,
-        previous.as_ref(),
-        &mut |record| {
-            serde_json::to_writer(&mut *spool, record)?;
-            spool.write_all(b"\n")?;
-            Ok(())
-        },
-    )?;
-    let length = spool.stream_position()? - start;
-    // SQLite parsing owns a read transaction. Keep its pre-read stamp so later
-    // commits cause another scan, not a rejection of the snapshot just read.
-    ensure!(
-        input.provider == Provider::Opencode || input.stamp == stamp(&input.path, false)?,
-        "input changed during parsing; retry import"
-    );
-    let unchanged = previous.as_ref() == Some(&parsed.checkpoint);
-    Ok((parsed, (start, length), unchanged))
+
+    pub(super) struct StagedReplacement {
+        pub(super) provider: Provider,
+        pub(super) replace: providers::Replace,
+        pub(super) range: CompletedRange,
+        pub(super) checkpoint: CheckpointIntent,
+    }
+
+    // Only a successful parse with a validated source snapshot can finish a range.
+    pub(super) struct CompletedRange {
+        start: u64,
+        length: u64,
+    }
+
+    impl CompletedRange {
+        pub(super) fn read<'a>(&self, spool: &'a mut File) -> Result<std::io::Take<&'a mut File>> {
+            spool.seek(SeekFrom::Start(self.start))?;
+            Ok(spool.take(self.length))
+        }
+    }
+
+    pub(super) fn stage_input(
+        input: &InputSnapshot,
+        previous: Option<providers::Checkpoint>,
+        spool: &mut Option<BufWriter<File>>,
+        directories: &crate::directories::Directories,
+        parse: &mut impl FnMut(
+            Provider,
+            &Path,
+            Option<&providers::Checkpoint>,
+            &mut dyn FnMut(&Record) -> Result<()>,
+        ) -> Result<providers::Parsed>,
+    ) -> Result<(StagedReplacement, ImportSource)> {
+        // Stage records on disk. Failed sources leave unused byte ranges;
+        // one unlinked file bounds memory and open descriptors.
+        if spool.is_none() {
+            fs::create_dir_all(&directories.cache)?;
+            *spool = Some(BufWriter::new(tempfile::tempfile_in(&directories.cache)?));
+        }
+        let spool = spool.as_mut().unwrap();
+        let start = spool.stream_position()?;
+        let parsed = parse(
+            input.provider,
+            &input.path,
+            previous.as_ref(),
+            &mut |record| {
+                serde_json::to_writer(&mut *spool, record)?;
+                spool.write_all(b"\n")?;
+                Ok(())
+            },
+        )?;
+        let length = spool.stream_position()? - start;
+        // SQLite parsing owns a read transaction. Keep its pre-read stamp so later
+        // commits cause another scan, not a rejection of the snapshot just read.
+        ensure!(
+            input.provider == Provider::Opencode || input.stamp == stamp(&input.path, false)?,
+            "input changed during parsing; retry import"
+        );
+        let unchanged = previous.as_ref() == Some(&parsed.checkpoint);
+        // An unchanged checkpoint is not rewritten, so a stamp-only
+        // change leaves the published records untouched. Replacing
+        // every record also deletes the old checkpoint.
+        let checkpoint = if unchanged && !matches!(parsed.replace, providers::Replace::All) {
+            CheckpointIntent::Keep
+        } else {
+            CheckpointIntent::Write(Box::new(parsed.checkpoint))
+        };
+        Ok((
+            StagedReplacement {
+                provider: input.provider,
+                replace: parsed.replace,
+                range: CompletedRange { start, length },
+                checkpoint,
+            },
+            ImportSource::Parsed {
+                path: input.path.clone(),
+                events: parsed.records,
+                rejected_records: parsed.diagnostics.count,
+                rejection_diagnostics: parsed.diagnostics.first,
+            },
+        ))
+    }
 }
 
 pub fn status(config: &Config) -> Result<LexicalStatus> {
@@ -1637,16 +1703,26 @@ pub fn status(config: &Config) -> Result<LexicalStatus> {
     } else {
         (Manifest::default(), 0)
     };
-    let plan = plan_inputs(&config.sources()?, &manifest);
-    let pending = plan.inputs.iter().filter(|input| input.changed).count();
+    let plan = plan_inputs(&config.sources()?, &manifest, false);
+    let mut pending = 0;
+    let mut removed = 0;
+    let mut errors = Vec::new();
+    for input in plan.inputs {
+        match input {
+            PlannedInput::Unchanged(_) => {}
+            PlannedInput::ParseWithCheckpoint(_) | PlannedInput::FullReplay(_) => pending += 1,
+            PlannedInput::ConfirmedRemoval(_) => removed += 1,
+            PlannedInput::DiscoveryFailure(error) => errors.push(error),
+        }
+    }
     let active = is_locked(&config.directories.data, "update.lock")?;
-    let state = if !plan.errors.is_empty() {
+    let state = if !errors.is_empty() {
         State::Blocked
     } else if active {
         State::CatchingUp
     } else if !initialized {
         State::Uninitialized
-    } else if pending > 0 || !plan.removed.is_empty() {
+    } else if pending > 0 || removed > 0 {
         State::Pending
     } else {
         State::Ready
@@ -1658,8 +1734,8 @@ pub fn status(config: &Config) -> Result<LexicalStatus> {
         indexed_inputs: manifest.inputs.len(),
         discovered_inputs: plan.discovered,
         pending_inputs: pending,
-        removed_inputs: plan.removed.len(),
-        errors: plan.errors,
+        removed_inputs: removed,
+        errors,
     })
 }
 
@@ -1847,59 +1923,54 @@ fn update_index(
     // The reader checks segment compatibility before any files are removed.
     // Also collect forgotten files when no source has changed and no writer is needed.
     remove_orphaned_files(&index, path)?;
-    let plan = plan_inputs(sources, &manifest);
-    let mut failed = !plan.errors.is_empty();
-    let mut reports: Vec<_> = plan.errors.into_iter().map(ImportSource::Failed).collect();
+    let plan = plan_inputs(sources, &manifest, full);
+    let mut failed = false;
+    let mut reports = Vec::new();
     let mut changes = BTreeMap::new();
     let mut spool: Option<BufWriter<File>> = None;
-    for input in plan.inputs {
-        let PlannedInput {
+    for planned in plan.inputs {
+        let (input, previous) = match planned {
+            PlannedInput::Unchanged(input) => {
+                reports.push(ImportSource::Unchanged {
+                    path: input.path,
+                    unchanged: true,
+                });
+                continue;
+            }
+            PlannedInput::ParseWithCheckpoint(input) => {
+                let previous = load_checkpoint(&searcher, fields, &input.key);
+                (input, previous)
+            }
+            PlannedInput::FullReplay(input) => (input, Ok(None)),
+            PlannedInput::ConfirmedRemoval(key) => {
+                // Remove missing files only after successfully listing their directory.
+                // An inaccessible root must not erase its indexed history.
+                manifest
+                    .inputs
+                    .remove(&key)
+                    .context("planned removal missing")?;
+                changes.insert(key, Change::Remove);
+                continue;
+            }
+            PlannedInput::DiscoveryFailure(error) => {
+                failed = true;
+                reports.push(ImportSource::Failed(error));
+                continue;
+            }
+        };
+        let InputSnapshot {
             key,
             provider,
             path,
             ..
         } = &input;
-        if !input.changed && !full {
-            reports.push(ImportSource::Unchanged {
-                path: path.clone(),
-                unchanged: true,
-            });
-            continue;
-        }
-        let previous = match manifest.inputs.get(key) {
-            Some(old)
-                if old.checkpointed
-                    && old.parser_revision == providers::parser_revision(*provider)
-                    && !full =>
-            {
-                load_checkpoint(&searcher, fields, key)
-            }
-            _ => Ok(None),
-        };
         let parsed = previous.and_then(|previous| {
-            stage_input(&input, previous, &mut spool, &config.directories, parse)
+            staging::stage_input(&input, previous, &mut spool, &config.directories, parse)
         });
         match parsed {
-            Ok((parsed, range, unchanged)) => {
-                reports.push(ImportSource::Parsed {
-                    path: path.clone(),
-                    events: parsed.records,
-                    rejected_records: parsed.diagnostics.count,
-                    rejection_diagnostics: parsed.diagnostics.first,
-                });
-                // An unchanged checkpoint is not rewritten, so a stamp-only
-                // change leaves the published records untouched. Replacing
-                // every record also deletes the old checkpoint.
-                let keep = unchanged && !matches!(parsed.replace, providers::Replace::All);
-                changes.insert(
-                    key.clone(),
-                    Change {
-                        provider: *provider,
-                        replace: parsed.replace,
-                        range: Some(range),
-                        checkpoint: (!keep).then_some(parsed.checkpoint),
-                    },
-                );
+            Ok((replacement, report)) => {
+                reports.push(report);
+                changes.insert(key.clone(), Change::Replace(replacement));
                 manifest.inputs.insert(
                     key.clone(),
                     InputState {
@@ -1920,23 +1991,6 @@ fn update_index(
             }
         }
     }
-    // Remove missing files only after successfully listing their directory.
-    // An inaccessible root must not erase its indexed history.
-    for key in plan.removed {
-        let input = manifest
-            .inputs
-            .remove(&key)
-            .context("planned removal missing")?;
-        changes.insert(
-            key,
-            Change {
-                provider: input.provider,
-                replace: providers::Replace::All,
-                range: None,
-                checkpoint: None,
-            },
-        );
-    }
     if !changes.is_empty() {
         let mut spool = spool
             .map(|writer| writer.into_inner().map_err(|error| error.into_error()))
@@ -1948,9 +2002,13 @@ fn update_index(
         let mut added_messages = Vec::new();
         for (key, change) in changes {
             let source = Term::from_field_text(fields.source, &key);
-            match &change.replace {
+            match &change {
                 // Also deletes the checkpoint document.
-                providers::Replace::All => {
+                Change::Remove
+                | Change::Replace(staging::StagedReplacement {
+                    replace: providers::Replace::All,
+                    ..
+                }) => {
                     removed_message_hashes(
                         &searcher,
                         fields,
@@ -1959,12 +2017,19 @@ fn update_index(
                     )?;
                     writer.delete_term(source.clone());
                 }
-                providers::Replace::Append => {}
-                providers::Replace::Sessions(sessions) => {
+                Change::Replace(staging::StagedReplacement {
+                    replace: providers::Replace::Append,
+                    ..
+                }) => {}
+                Change::Replace(staging::StagedReplacement {
+                    provider,
+                    replace: providers::Replace::Sessions(sessions),
+                    ..
+                }) => {
                     for suffix in sessions {
                         let session = Term::from_field_text(
                             fields.session,
-                            &crate::record::session_id(change.provider, &suffix.native_session),
+                            &crate::record::session_id(*provider, &suffix.native_session),
                         );
                         let query = BooleanQuery::new(vec![
                             (Occur::Must, term_query(source.clone())),
@@ -1985,7 +2050,10 @@ fn update_index(
                     }
                 }
             }
-            if let Some(checkpoint) = &change.checkpoint {
+            let Change::Replace(replacement) = change else {
+                continue;
+            };
+            if let staging::CheckpointIntent::Write(checkpoint) = &replacement.checkpoint {
                 writer.delete_query(checkpoint_query(fields, &key))?;
                 writer.add_document(doc!(
                     fields.source => key.clone(),
@@ -1994,13 +2062,11 @@ fn update_index(
                     fields.record => serde_json::to_vec(checkpoint)?
                 ))?;
             }
-            let Some((start, length)) = change.range else {
-                continue;
-            };
             let spool = spool.as_mut().context("parsed source spool missing")?;
-            spool.seek(SeekFrom::Start(start))?;
-            for record in serde_json::Deserializer::from_reader(BufReader::new(spool.take(length)))
-                .into_iter::<Record>()
+            for record in serde_json::Deserializer::from_reader(BufReader::new(
+                replacement.range.read(spool)?,
+            ))
+            .into_iter::<Record>()
             {
                 let mut record = record.context("reading parsed source spool")?;
                 record.workspace_root = manifest
@@ -2496,6 +2562,63 @@ pub(crate) mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn jsonl_snapshot_rejection_preserves_history_while_other_inputs_commit() {
+        let (dir, config, path) = crate::test_support::history_file("changing.jsonl");
+        input(&path, "original");
+        let changing = source(Provider::Codex, &path);
+        update(&config, std::slice::from_ref(&changing), false).unwrap();
+        input(&path, "staged");
+        let stable_path = dir.path().join("stable.jsonl");
+        input(&stable_path, "independent");
+        let sources = [changing, source(Provider::Codex, &stable_path)];
+        let mut emitted = 0;
+        let report = update_with_parser(
+            &config,
+            &sources,
+            false,
+            false,
+            |provider, current, previous, emit| {
+                let parsed = providers::parse(provider, current, previous, |record| {
+                    if current == path {
+                        emitted += 1;
+                    }
+                    emit(record)
+                })?;
+                if current == path {
+                    // Change the source after a successful parse has written spool bytes.
+                    input(&path, "retry after snapshot");
+                }
+                Ok(parsed)
+            },
+        )
+        .unwrap();
+        assert!(emitted > 0);
+        assert!(!report.completed());
+        assert!(matches!(
+            &report.sources[0],
+            ImportSource::Failed(error)
+                if error.path == path && error.detail.contains("input changed during parsing")
+        ));
+        let texts = || {
+            let mut texts: Vec<_> = ReadIndex::open(&config.directories.data)
+                .unwrap()
+                .unwrap()
+                .all()
+                .unwrap()
+                .into_iter()
+                .map(|record| record.text)
+                .collect();
+            texts.sort();
+            texts
+        };
+        assert_eq!(texts(), ["independent", "original"]);
+        let retry = update(&config, &sources, false).unwrap();
+        assert!(retry.completed());
+        assert_eq!(texts(), ["independent", "retry after snapshot"]);
+        assert!(matches!(retry.sources[1], ImportSource::Unchanged { .. }));
     }
 
     #[test]
