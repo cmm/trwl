@@ -981,30 +981,48 @@ fn documents(records: &[ConversationMessage]) -> Vec<(&Record, String)> {
         merged.push((record, text));
     }
     let mut result = Vec::new();
-    let mut session = "";
-    let mut assistant = None;
+    let mut turns = TurnAccumulator::default();
     // Walking backwards keeps the last nonempty reply before the next user.
     for (record, text) in merged.iter().rev() {
-        if record.session_id != session {
-            session = &record.session_id;
-            assistant = None;
-        }
-        let text = text.trim();
-        if let Some(request) = &record.request {
-            // These user-role records are harness notices, not requests.
-            if !text.is_empty() && !crate::providers::is_control_message(text) {
-                let mut document = format!("user:\n{text}");
-                if let Some(reply) = assistant {
-                    document.push_str(&format!("\n\nassistant:\n{reply}"));
-                }
-                result.push((request, document));
-            }
-            assistant = None;
-        } else if !text.is_empty() && assistant.is_none() {
-            assistant = Some(text);
+        if let Some(document) = turns.push(record, text) {
+            result.push(document);
         }
     }
     result
+}
+
+#[derive(Default)]
+struct TurnAccumulator<'record, 'text> {
+    session: &'record str,
+    reply: Option<&'text str>,
+}
+
+impl<'record, 'text> TurnAccumulator<'record, 'text> {
+    fn push(
+        &mut self,
+        record: &'record ConversationMessage,
+        text: &'text str,
+    ) -> Option<(&'record Record, String)> {
+        if record.session_id != self.session {
+            self.session = &record.session_id;
+            self.reply = None;
+        }
+        let text = text.trim();
+        if let Some(request) = &record.request {
+            let reply = self.reply.take();
+            // These user-role records are harness notices, not requests.
+            if !text.is_empty() && !crate::providers::is_control_message(text) {
+                let mut document = format!("user:\n{text}");
+                if let Some(reply) = reply {
+                    document.push_str(&format!("\n\nassistant:\n{reply}"));
+                }
+                return Some((request, document));
+            }
+        } else if !text.is_empty() && self.reply.is_none() {
+            self.reply = Some(text);
+        }
+        None
+    }
 }
 
 fn chunks(text: &str) -> Vec<&str> {
