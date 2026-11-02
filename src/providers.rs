@@ -107,7 +107,6 @@ pub enum Checkpoint {
 pub struct SqliteSession {
     records: usize,
     diagnostics: Diagnostics,
-    #[serde(default)]
     prefixes: Vec<SqlitePrefix>,
 }
 
@@ -724,8 +723,6 @@ fn opencode(
                 } = if old.is_some_and(|old| verified.prefixes.len() != old.prefixes.len()) {
                     drop(rows);
                     verified.restart(&mut ordered, id)?
-                } else if old.is_some_and(|old| old.prefixes.is_empty()) {
-                    verified.replace(rows, id)
                 } else {
                     SqliteResume {
                         rows,
