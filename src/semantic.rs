@@ -455,6 +455,11 @@ enum Materialization {
     Materialized(ChunkInputs),
 }
 
+enum VectorCoverage {
+    Complete,
+    Missing,
+}
+
 struct DocumentPlan<'a> {
     selection: &'a Selection,
     index: &'a ReadIndex,
@@ -464,6 +469,19 @@ struct DocumentPlan<'a> {
 }
 
 impl DocumentPlan<'_> {
+    fn vector_coverage(&self, cache: &Cache) -> VectorCoverage {
+        if self
+            .documents
+            .iter()
+            .flat_map(|document| &document.keys)
+            .all(|key| cache.vectors.contains_key(key))
+        {
+            VectorCoverage::Complete
+        } else {
+            VectorCoverage::Missing
+        }
+    }
+
     fn take_inputs(
         &mut self,
         config: &Config,
@@ -492,22 +510,19 @@ fn document_plan<'a>(
             (documents, Materialization::Deferred)
         } else {
             let (documents, inputs) = tokenizer.materialize(config, selection, index)?;
-            cache::publish(
-                config,
-                &selection.key,
-                &version,
-                &documents,
-                &Cache::default(),
-            )?;
             (documents, Materialization::Materialized(inputs))
         };
-    Ok(DocumentPlan {
+    let plan = DocumentPlan {
         selection,
         index,
         version,
         documents,
         materialization,
-    })
+    };
+    if matches!(plan.materialization, Materialization::Materialized(_)) {
+        cache::publish_mapping(config, &plan)?;
+    }
+    Ok(plan)
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -1165,13 +1180,8 @@ fn fill_locked(
 ) -> Result<Cache> {
     let selection = plan.selection;
     let mut cache = cache::load(config, &selection.key)?;
-    if plan
-        .documents
-        .iter()
-        .flat_map(|d| &d.keys)
-        .all(|key| cache.vectors.contains_key(key))
-    {
-        cache::finish_build(config, &selection.key)?;
+    if matches!(plan.vector_coverage(&cache), VectorCoverage::Complete) {
+        cache::mark_build_complete(config, plan)?;
         return Ok(cache);
     }
     let inputs = plan.take_inputs(config, tokenizer)?;
@@ -1182,7 +1192,8 @@ fn fill_locked(
     let missing = ordered_inputs(missing);
     let worker = if mode == FillMode::Update
         && selection.directory.is_some()
-        && (cache::full_build(config, &selection.key)? || heavy_incremental(&missing))
+        && (cache::build_history(config, &selection.key)?.needs_full_build()
+            || heavy_incremental(&missing))
         && std::env::var_os("TRWL_SEMANTIC_CPU_ONLY").is_none_or(|v| v != "1")
     {
         worker::Client::start(&config.directories, selection)?
@@ -1242,25 +1253,13 @@ fn fill_locked(
             Some(batch) => backend.submit(batch),
             None => FillProgress::Finished(backend),
         };
-        cache::publish_batch(
-            config,
-            &selection.key,
-            &plan.version,
-            &plan.documents,
-            &completed,
-        )?;
+        cache::publish_batch(config, plan, &completed)?;
         cache.vectors.extend(completed.vectors);
     };
     // Readers of other commits can replace mappings and evict earlier batches
     // during inference. Publish the full pinned snapshot before marking it done.
-    cache::publish_batch(
-        config,
-        &selection.key,
-        &plan.version,
-        &plan.documents,
-        &cache,
-    )?;
-    cache::finish_build(config, &selection.key)?;
+    cache::repair_snapshot(config, plan, &cache)?;
+    cache::mark_build_complete(config, plan)?;
     Ok(cache)
 }
 
@@ -1302,7 +1301,7 @@ fn refresh_inner(config: &Config, rebuild: bool, tokenizer: &mut PlanningTokeniz
     };
     let selection = Selection::from_config(config)?;
     // Repeating an interrupted rebuild resumes its committed batches.
-    if rebuild && !cache::full_build(config, &selection.key)? {
+    if rebuild && !cache::build_history(config, &selection.key)?.needs_full_build() {
         cache::reset(config, &selection.key)?;
     }
     // Chunking and batch ordering share a vocabulary, loaded only on a cache miss.
@@ -1753,14 +1752,7 @@ pub(crate) mod tests {
         let vectors = Cache {
             vectors: [(documents[0].keys[0].clone(), vec![1.0, 0.0])].into(),
         };
-        cache::publish_batch(
-            &config,
-            &selection.key,
-            &index.version(),
-            documents,
-            &vectors,
-        )
-        .unwrap();
+        cache::publish_batch(&config, &plan, &vectors).unwrap();
         let cached = fill(
             &config,
             &mut cached,
@@ -1772,7 +1764,19 @@ pub(crate) mod tests {
 
         // A different commit map forces planning, but unchanged composed input
         // is reusable even by a fresh planner with no tokenizer file available.
-        cache::publish(&config, &selection.key, "other-commit", documents, &vectors).unwrap();
+        let mut metadata = row.clone();
+        metadata["timestamp"] = json!("2026-01-01T00:00:00Z");
+        fs::write(&path, format!("{header}\n{metadata}\n")).unwrap();
+        let other_index = import(&config, Provider::Codex, &path);
+        assert_ne!(other_index.version(), index.version());
+        let other = document_plan(
+            &config,
+            &selection,
+            &other_index,
+            &mut PlanningTokenizer::default(),
+        )
+        .unwrap();
+        cache::publish_batch(&config, &other, &vectors).unwrap();
         let reused = document_plan(
             &config,
             &selection,

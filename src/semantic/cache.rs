@@ -21,7 +21,7 @@
 //! MessagePack migration reads the selected vectors and document mapping into
 //! memory, then removes file caches and abandoned temporary files before SQLite
 //! publication. Cleanup does not need space for another complete cache file.
-use super::{Cache, DocumentCache, EmbeddingDocument};
+use super::{Cache, DocumentCache, DocumentPlan, EmbeddingDocument};
 use crate::config::{Config, lock};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -36,6 +36,51 @@ const MAX_AGE: i64 = 30 * 24 * 60 * 60;
 struct Database {
     connection: Connection,
     budget: i64,
+}
+
+enum Mapping {
+    Absent,
+    VectorOnly,
+    Snapshot(String),
+}
+
+impl Mapping {
+    fn read(connection: &Connection, selection: &str) -> Result<Self> {
+        let version: Option<String> = connection
+            .query_row(
+                "SELECT version FROM selections WHERE selection=?",
+                [selection],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match version {
+            None => Self::Absent,
+            Some(version) if version.is_empty() => Self::VectorOnly,
+            Some(version) => Self::Snapshot(version),
+        })
+    }
+
+    fn matches(&self, version: &str) -> bool {
+        match self {
+            Self::Absent => false,
+            Self::VectorOnly => version.is_empty(),
+            Self::Snapshot(stored) => stored == version,
+        }
+    }
+}
+
+// Build history controls full-build scheduling, not current vector coverage.
+pub(super) enum BuildHistory {
+    Absent,
+    Unfinished,
+    Completed,
+    LegacyCompleted,
+}
+
+impl BuildHistory {
+    pub(super) fn needs_full_build(&self) -> bool {
+        matches!(self, Self::Absent | Self::Unfinished)
+    }
 }
 
 impl Database {
@@ -187,14 +232,7 @@ impl Database {
         version: &str,
     ) -> Result<Option<Vec<EmbeddingDocument>>> {
         let tx = self.connection.transaction()?;
-        let stored: Option<String> = tx
-            .query_row(
-                "SELECT version FROM selections WHERE selection=?",
-                [selection],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if stored.as_deref() != Some(version) {
+        if !Mapping::read(&tx, selection)?.matches(version) {
             return Ok(None);
         }
         let mut documents = Vec::new();
@@ -231,6 +269,17 @@ impl Database {
         }
         tx.commit()?;
         Ok(Some(documents))
+    }
+
+    fn publish_snapshot(&mut self, plan: &DocumentPlan<'_>, vectors: &Cache) -> Result<()> {
+        let selection = &plan.selection.key;
+        let mapping = Mapping::read(&self.connection, selection)?;
+        self.publish(
+            selection,
+            &plan.version,
+            (!mapping.matches(&plan.version)).then_some(plan.documents.as_slice()),
+            vectors,
+        )
     }
 
     fn publish(
@@ -492,35 +541,42 @@ pub(super) fn prepared(
     })
 }
 
-pub(super) fn publish(
-    config: &Config,
-    selection: &str,
-    version: &str,
-    documents: &[EmbeddingDocument],
-    vectors: &Cache,
-) -> Result<()> {
+pub(super) fn publish_mapping(config: &Config, plan: &DocumentPlan<'_>) -> Result<()> {
+    let selection = &plan.selection.key;
     with_database(config, selection, |db| {
-        db.publish(selection, version, Some(documents), vectors)
+        db.publish(
+            selection,
+            &plan.version,
+            Some(&plan.documents),
+            &Cache::default(),
+        )
     })
 }
 
-pub(super) fn full_build(config: &Config, selection: &str) -> Result<bool> {
+pub(super) fn build_history(config: &Config, selection: &str) -> Result<BuildHistory> {
     with_database(config, selection, |db| {
-        let complete: Option<bool> = db
+        let complete: Option<Option<bool>> = db
             .connection
             .query_row(
-                "SELECT coalesce(builds.complete,1) FROM selections
+                "SELECT builds.complete FROM selections
                  LEFT JOIN builds USING(selection) WHERE selection=?",
                 [selection],
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(!complete.unwrap_or(false))
+        Ok(match complete {
+            None => BuildHistory::Absent,
+            Some(None) => BuildHistory::LegacyCompleted,
+            Some(Some(false)) => BuildHistory::Unfinished,
+            Some(Some(true)) => BuildHistory::Completed,
+        })
     })
 }
 
-pub(super) fn finish_build(config: &Config, selection: &str) -> Result<()> {
+pub(super) fn mark_build_complete(config: &Config, plan: &DocumentPlan<'_>) -> Result<()> {
+    let selection = &plan.selection.key;
     with_database(config, selection, |db| {
+        // Completion records build history, not current mapping/vector coverage.
         db.connection.execute(
             "UPDATE builds SET complete=1 WHERE selection=? AND complete=0",
             [selection],
@@ -539,33 +595,29 @@ pub(super) fn reset(config: &Config, selection: &str) -> Result<()> {
 
 pub(super) fn publish_batch(
     config: &Config,
-    selection: &str,
-    version: &str,
-    documents: &[EmbeddingDocument],
+    plan: &DocumentPlan<'_>,
     vectors: &Cache,
 ) -> Result<()> {
-    with_database(config, selection, |db| {
-        let stored: Option<String> = db
-            .connection
-            .query_row(
-                "SELECT version FROM selections WHERE selection=?",
-                [selection],
-                |r| r.get(0),
-            )
-            .optional()?;
-        // A status check or another pinned reader may have replaced the map
-        // during inference. Otherwise only write the newly completed batch.
-        db.publish(
-            selection,
-            version,
-            (stored.as_deref() != Some(version)).then_some(documents),
-            vectors,
-        )
+    // A status check or another pinned reader may have replaced the map
+    // during inference. Otherwise only write the newly completed batch.
+    with_database(config, &plan.selection.key, |db| {
+        db.publish_snapshot(plan, vectors)
+    })
+}
+
+pub(super) fn repair_snapshot(
+    config: &Config,
+    plan: &DocumentPlan<'_>,
+    vectors: &Cache,
+) -> Result<()> {
+    with_database(config, &plan.selection.key, |db| {
+        db.publish_snapshot(plan, vectors)
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::VectorCoverage;
     use super::*;
     use crate::record::{EventType, Provider, Record};
 
@@ -606,13 +658,67 @@ mod tests {
         )
     }
 
+    struct SnapshotFixture {
+        selection: super::super::Selection,
+        index: crate::store::ReadIndex,
+    }
+
+    impl SnapshotFixture {
+        fn new(config: &Config, label: &str) -> Self {
+            let path = config.directories.cache.join("history.jsonl");
+            fs::create_dir_all(&config.directories.cache).unwrap();
+            let message = crate::test_support::codex_message("user", label);
+            fs::write(
+                &path,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"snapshot\"}}}}\n{message}\n"
+                ),
+            )
+            .unwrap();
+            Self {
+                selection: super::super::Selection {
+                    key: "model".into(),
+                    executor: "http".into(),
+                    model: "test".into(),
+                    directory: None,
+                },
+                index: crate::test_support::import(config, Provider::Codex, &path),
+            }
+        }
+
+        fn plan(&self, documents: Vec<EmbeddingDocument>) -> DocumentPlan<'_> {
+            DocumentPlan {
+                selection: &self.selection,
+                index: &self.index,
+                version: self.index.version(),
+                documents,
+                materialization: super::super::Materialization::Deferred,
+            }
+        }
+    }
+
+    fn seed(
+        config: &Config,
+        selection: &str,
+        version: &str,
+        documents: &[EmbeddingDocument],
+        vectors: &Cache,
+    ) {
+        with_database(config, selection, |db| {
+            db.publish(selection, version, Some(documents), vectors)
+        })
+        .unwrap();
+    }
+
     #[test]
     fn finishing_a_completed_build_does_not_update_it() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let (documents, vectors) = fixture("first", 2);
-        publish(&config, "model", "v1", &documents, &vectors).unwrap();
-        finish_build(&config, "model").unwrap();
+        let snapshot = SnapshotFixture::new(&config, "first");
+        let plan = snapshot.plan(documents);
+        publish_batch(&config, &plan, &vectors).unwrap();
+        mark_build_complete(&config, &plan).unwrap();
         let observer =
             Connection::open(config.directories.cache.join("semantic").join(DATABASE)).unwrap();
         observer
@@ -621,8 +727,11 @@ mod tests {
             WHEN old.complete=1 BEGIN SELECT RAISE(ABORT, 'updated a completed build'); END;",
             )
             .unwrap();
-        finish_build(&config, "model").unwrap();
-        assert!(!full_build(&config, "model").unwrap());
+        mark_build_complete(&config, &plan).unwrap();
+        assert!(matches!(
+            build_history(&config, "model").unwrap(),
+            BuildHistory::Completed
+        ));
     }
 
     #[test]
@@ -630,7 +739,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let (documents, vectors) = fixture("first", 2);
-        publish_batch(&config, "model", "v1", &documents, &vectors).unwrap();
+        let snapshot = SnapshotFixture::new(&config, "first");
+        let plan = snapshot.plan(documents);
+        publish_batch(&config, &plan, &vectors).unwrap();
         let observer =
             Connection::open(config.directories.cache.join("semantic").join(DATABASE)).unwrap();
         observer
@@ -639,7 +750,7 @@ mod tests {
             BEGIN SELECT RAISE(ABORT, 'rewrote a completed vector'); END;",
             )
             .unwrap();
-        publish_batch(&config, "model", "v1", &documents, &vectors).unwrap();
+        publish_batch(&config, &plan, &vectors).unwrap();
         assert_eq!(load(&config, "model").unwrap().vectors, vectors.vectors);
     }
 
@@ -659,8 +770,12 @@ mod tests {
             )],
         });
         let (second_documents, second) = fixture("second", 2);
-        publish_batch(&config, "model", "v1", &first_documents, &first).unwrap();
-        publish(&config, "model", "v2", &second_documents, &second).unwrap();
+        let first_snapshot = SnapshotFixture::new(&config, "first");
+        let first_plan = first_snapshot.plan(first_documents);
+        let second_snapshot = SnapshotFixture::new(&config, "second");
+        let second_plan = second_snapshot.plan(second_documents);
+        publish_batch(&config, &first_plan, &first).unwrap();
+        publish_batch(&config, &second_plan, &second).unwrap();
         assert!(prepared(&config, "model").unwrap().is_empty());
         assert!(
             !load(&config, "model")
@@ -668,15 +783,57 @@ mod tests {
                 .vectors
                 .contains_key("first")
         );
-        publish_batch(&config, "model", "v1", &first_documents, &first).unwrap();
+        // A batch restores its own map after inference, but does not mark the
+        // build complete, even when its vectors happen to cover that map.
+        publish_batch(&config, &first_plan, &first).unwrap();
+        assert!(
+            documents(&config, "model", &first_plan.version)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(load(&config, "model").unwrap().vectors, first.vectors);
+        assert!(build_history(&config, "model").unwrap().needs_full_build());
+        publish_batch(&config, &second_plan, &second).unwrap();
+        let observer =
+            Connection::open(config.directories.cache.join("semantic").join(DATABASE)).unwrap();
+        observer
+            .execute_batch(
+                "CREATE TRIGGER complete_only_after_repair BEFORE UPDATE OF complete ON builds
+                 WHEN new.complete=1 AND NOT EXISTS
+                 (SELECT 1 FROM vectors WHERE selection=new.selection AND key='first')
+                 BEGIN SELECT RAISE(ABORT, 'completed before pinned snapshot repair'); END;",
+            )
+            .unwrap();
+        repair_snapshot(&config, &first_plan, &first).unwrap();
+        mark_build_complete(&config, &first_plan).unwrap();
         assert_eq!(load(&config, "model").unwrap().vectors, first.vectors);
         assert_eq!(
-            documents(&config, "model", "v1").unwrap().unwrap()[0].keys,
+            documents(&config, "model", &first_plan.version)
+                .unwrap()
+                .unwrap()[0]
+                .keys,
             ["first"]
         );
-        assert!(documents(&config, "model", "v2").unwrap().is_none());
+        assert!(
+            documents(&config, "model", &second_plan.version)
+                .unwrap()
+                .is_none()
+        );
         let restored = prepared(&config, "model").unwrap();
         assert_eq!(restored["first-input"].chunks[0].1.text, "first");
+        assert!(matches!(
+            build_history(&config, "model").unwrap(),
+            BuildHistory::Completed
+        ));
+        // Completed history does not imply coverage, even for the same map.
+        observer.execute("DELETE FROM vectors", []).unwrap();
+        assert!(matches!(
+            first_plan.vector_coverage(&load(&config, "model").unwrap()),
+            VectorCoverage::Missing
+        ));
+        repair_snapshot(&config, &first_plan, &first).unwrap();
+        mark_build_complete(&config, &first_plan).unwrap();
+        assert_eq!(load(&config, "model").unwrap().vectors, first.vectors);
     }
 
     #[test]
@@ -686,21 +843,35 @@ mod tests {
         let (mut documents, first) = fixture("first", 2);
         let (second_documents, second) = fixture("second", 2);
         documents.extend(second_documents);
-        assert!(full_build(&config, "model").unwrap());
-        publish(&config, "model", "v1", &documents, &Cache::default()).unwrap();
-        publish_batch(&config, "model", "v1", &documents, &first).unwrap();
-        assert!(full_build(&config, "model").unwrap());
+        let snapshot = SnapshotFixture::new(&config, "first");
+        let plan = snapshot.plan(documents);
+        assert!(matches!(
+            build_history(&config, "model").unwrap(),
+            BuildHistory::Absent
+        ));
+        publish_mapping(&config, &plan).unwrap();
+        publish_batch(&config, &plan, &first).unwrap();
+        assert!(matches!(
+            build_history(&config, "model").unwrap(),
+            BuildHistory::Unfinished
+        ));
         assert_eq!(load(&config, "model").unwrap().vectors.len(), 1);
-        publish_batch(&config, "model", "v1", &documents, &second).unwrap();
-        finish_build(&config, "model").unwrap();
-        assert!(!full_build(&config, "model").unwrap());
+        publish_batch(&config, &plan, &second).unwrap();
+        repair_snapshot(&config, &plan, &load(&config, "model").unwrap()).unwrap();
+        mark_build_complete(&config, &plan).unwrap();
+        assert!(!build_history(&config, "model").unwrap().needs_full_build());
         assert_eq!(load(&config, "model").unwrap().vectors.len(), 2);
-        assert!(full_build(&config, "changed-model").unwrap());
+        assert!(
+            build_history(&config, "changed-model")
+                .unwrap()
+                .needs_full_build()
+        );
         // An ordinary index update does not make the selection a full build.
-        publish(&config, "model", "v2", &documents, &Cache::default()).unwrap();
-        assert!(!full_build(&config, "model").unwrap());
+        let next = SnapshotFixture::new(&config, "next");
+        publish_mapping(&config, &next.plan(plan.documents)).unwrap();
+        assert!(!build_history(&config, "model").unwrap().needs_full_build());
         reset(&config, "model").unwrap();
-        assert!(full_build(&config, "model").unwrap());
+        assert!(build_history(&config, "model").unwrap().needs_full_build());
         assert!(load(&config, "model").unwrap().vectors.is_empty());
     }
 
@@ -709,15 +880,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let (documents, vectors) = fixture("first", 2);
-        publish(&config, "model", "v1", &documents, &vectors).unwrap();
+        let snapshot = SnapshotFixture::new(&config, "first");
+        let plan = snapshot.plan(documents);
+        publish_batch(&config, &plan, &vectors).unwrap();
         with_database(&config, "model", |db| {
             db.connection.execute("DELETE FROM builds", [])?;
             Ok(())
         })
         .unwrap();
-        assert!(!full_build(&config, "model").unwrap());
-        publish_batch(&config, "model", "v2", &documents, &vectors).unwrap();
-        assert!(!full_build(&config, "model").unwrap());
+        assert!(matches!(
+            build_history(&config, "model").unwrap(),
+            BuildHistory::LegacyCompleted
+        ));
+        let next = SnapshotFixture::new(&config, "next");
+        publish_batch(&config, &next.plan(plan.documents), &vectors).unwrap();
+        assert!(!build_history(&config, "model").unwrap().needs_full_build());
     }
 
     #[test]
@@ -854,7 +1031,7 @@ mod tests {
         let index = crate::test_support::import(&config, Provider::Codex, &history);
         let event = index.all().unwrap().remove(0);
         let (documents, vectors) = fixture("first", 2);
-        publish(&config, "model", "old", &documents, &vectors).unwrap();
+        seed(&config, "model", "old", &documents, &vectors);
         let error = with_database(&config, "model", |db| {
             let pages: i64 = db
                 .connection
@@ -880,7 +1057,7 @@ mod tests {
                 .exists()
         );
         assert!(load(&config, "model").unwrap().vectors.is_empty());
-        publish(&config, "model", "recovered", &documents, &vectors).unwrap();
+        seed(&config, "model", "recovered", &documents, &vectors);
         assert_eq!(load(&config, "model").unwrap().vectors["first"], [1.0, 1.0]);
     }
 
@@ -942,6 +1119,38 @@ mod tests {
             load(&config, "model").unwrap().vectors["useful"],
             [1.0, 1.0]
         );
+    }
+
+    #[test]
+    fn vector_only_legacy_cache_keeps_vectors_until_mapping_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
+        let directory = config.directories.cache.join("semantic");
+        fs::create_dir_all(&directory).unwrap();
+        let (mapped, mut vectors) = fixture("useful", 2);
+        vectors.vectors.insert("obsolete".into(), vec![0.0, 1.0]);
+        fs::write(
+            directory.join("model.msgpack"),
+            rmp_serde::to_vec_named(&vectors).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(load(&config, "model").unwrap().vectors, vectors.vectors);
+        let snapshot = SnapshotFixture::new(&config, "first");
+        let plan = snapshot.plan(mapped);
+        assert!(
+            documents(&config, "model", &plan.version)
+                .unwrap()
+                .is_none()
+        );
+        assert!(build_history(&config, "model").unwrap().needs_full_build());
+        publish_mapping(&config, &plan).unwrap();
+        let cached = load(&config, "model").unwrap();
+        assert_eq!(cached.vectors.len(), 1);
+        assert_eq!(cached.vectors["useful"], [1.0, 1.0]);
+        assert!(build_history(&config, "model").unwrap().needs_full_build());
+        repair_snapshot(&config, &plan, &cached).unwrap();
+        mark_build_complete(&config, &plan).unwrap();
+        assert!(!build_history(&config, "model").unwrap().needs_full_build());
     }
 
     #[test]
