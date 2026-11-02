@@ -245,23 +245,67 @@ fn chunk_tokenizer(selection: &Selection) -> Result<Option<Tokenizer>> {
 }
 
 enum PlanningTokenizer {
-    Local {
-        selection: Option<String>,
-        loaded: Option<Box<Tokenizer>>,
+    Owned(PlanningState),
+    Shared {
+        selection: String,
+        client: server::Client,
     },
-    Shared(server::Client),
 }
 
-impl Default for PlanningTokenizer {
-    fn default() -> Self {
-        Self::Local {
-            selection: None,
-            loaded: None,
+#[derive(Default)]
+enum PlanningState {
+    #[default]
+    Uninitialized,
+    Local {
+        selection: String,
+        tokenizer: Box<Tokenizer>,
+    },
+    Remote {
+        selection: String,
+    },
+}
+
+impl PlanningState {
+    fn prepare(&mut self, selection: &Selection, texts: &[String]) -> Result<Vec<Vec<ChunkInput>>> {
+        let key = match self {
+            Self::Uninitialized => None,
+            Self::Local { selection, .. } | Self::Remote { selection } => Some(selection.as_str()),
+        };
+        if key != Some(&selection.key) {
+            // Drop the old vocabulary before initialization so failure is retryable.
+            *self = Self::Uninitialized;
+            *self = match chunk_tokenizer(selection)? {
+                Some(tokenizer) => Self::Local {
+                    selection: selection.key.clone(),
+                    tokenizer: Box::new(tokenizer),
+                },
+                None => Self::Remote {
+                    selection: selection.key.clone(),
+                },
+            };
+        }
+        match self {
+            Self::Local { tokenizer, .. } => prepare_chunks(texts, Some(tokenizer)),
+            Self::Remote { .. } => prepare_chunks(texts, None),
+            Self::Uninitialized => unreachable!("planning initialization succeeded"),
         }
     }
 }
 
+impl Default for PlanningTokenizer {
+    fn default() -> Self {
+        Self::Owned(PlanningState::default())
+    }
+}
+
 impl PlanningTokenizer {
+    fn shared(config: &Config, selection: &Selection) -> Self {
+        Self::Shared {
+            selection: selection.key.clone(),
+            client: server::Client::new(&config.directories, selection),
+        }
+    }
+
     fn materialize(
         &mut self,
         config: &Config,
@@ -270,21 +314,14 @@ impl PlanningTokenizer {
     ) -> Result<(Vec<EmbeddingDocument>, ChunkInputs)> {
         let reusable = cache::prepared(config, &selection.key)?;
         plan_records(&index.messages()?, &reusable, |texts| match self {
-            Self::Local {
+            Self::Owned(state) => state.prepare(selection, texts),
+            Self::Shared {
                 selection: key,
-                loaded,
+                client,
             } => {
-                if key.as_ref() != Some(&selection.key) {
-                    *loaded = None;
-                    *key = None;
-                }
-                if key.is_none() {
-                    *loaded = chunk_tokenizer(selection)?.map(Box::new);
-                    *key = Some(selection.key.clone());
-                }
-                prepare_chunks(texts, loaded.as_deref())
+                ensure!(key == &selection.key, "planning client selection differs");
+                client.prepare(texts)
             }
-            Self::Shared(client) => client.prepare(texts),
         })
     }
 }
@@ -413,25 +450,64 @@ fn plan_records(
     Ok((plan, inputs))
 }
 
-fn document_plan(
-    config: &Config,
-    selection: &Selection,
-    index: &ReadIndex,
-    tokenizer: &mut PlanningTokenizer,
-) -> Result<(Vec<EmbeddingDocument>, Option<ChunkInputs>)> {
-    let version = index.version();
-    if let Some(documents) = cache::documents(config, &selection.key, &version)? {
-        return Ok((documents, None));
+enum Materialization {
+    Deferred,
+    Materialized(ChunkInputs),
+}
+
+struct DocumentPlan<'a> {
+    selection: &'a Selection,
+    index: &'a ReadIndex,
+    version: String,
+    documents: Vec<EmbeddingDocument>,
+    materialization: Materialization,
+}
+
+impl DocumentPlan<'_> {
+    fn take_inputs(
+        &mut self,
+        config: &Config,
+        tokenizer: &mut PlanningTokenizer,
+    ) -> Result<ChunkInputs> {
+        // Taking inputs leaves the plan rematerializable from the same snapshot.
+        // Deferred inputs say nothing about whether its vectors are complete.
+        match std::mem::replace(&mut self.materialization, Materialization::Deferred) {
+            Materialization::Materialized(inputs) => Ok(inputs),
+            Materialization::Deferred => {
+                Ok(tokenizer.materialize(config, self.selection, self.index)?.1)
+            }
+        }
     }
-    let (documents, inputs) = tokenizer.materialize(config, selection, index)?;
-    cache::publish(
-        config,
-        &selection.key,
-        &version,
-        &documents,
-        &Cache::default(),
-    )?;
-    Ok((documents, Some(inputs)))
+}
+
+fn document_plan<'a>(
+    config: &Config,
+    selection: &'a Selection,
+    index: &'a ReadIndex,
+    tokenizer: &mut PlanningTokenizer,
+) -> Result<DocumentPlan<'a>> {
+    let version = index.version();
+    let (documents, materialization) =
+        if let Some(documents) = cache::documents(config, &selection.key, &version)? {
+            (documents, Materialization::Deferred)
+        } else {
+            let (documents, inputs) = tokenizer.materialize(config, selection, index)?;
+            cache::publish(
+                config,
+                &selection.key,
+                &version,
+                &documents,
+                &Cache::default(),
+            )?;
+            (documents, Materialization::Materialized(inputs))
+        };
+    Ok(DocumentPlan {
+        selection,
+        index,
+        version,
+        documents,
+        materialization,
+    })
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -1042,19 +1118,12 @@ fn heavy_incremental(inputs: &[(String, ChunkInput)]) -> bool {
 
 fn fill(
     config: &Config,
-    selection: &Selection,
-    index: &ReadIndex,
-    plan: FillPlan<'_>,
+    plan: &mut DocumentPlan<'_>,
+    tokenizer: &mut PlanningTokenizer,
     executor: &mut Option<Executor>,
 ) -> Result<Cache> {
     let _lock = lock(&config.directories.cache, "semantic.lock")?;
-    fill_locked(config, selection, index, plan, executor, FillMode::Query)
-}
-
-struct FillPlan<'a> {
-    documents: &'a [EmbeddingDocument],
-    inputs: Option<ChunkInputs>,
-    tokenizer: &'a mut PlanningTokenizer,
+    fill_locked(config, plan, tokenizer, executor, FillMode::Query)
 }
 
 #[derive(PartialEq, Eq)]
@@ -1089,19 +1158,15 @@ impl FillBackend {
 
 fn fill_locked(
     config: &Config,
-    selection: &Selection,
-    index: &ReadIndex,
-    plan: FillPlan<'_>,
+    plan: &mut DocumentPlan<'_>,
+    tokenizer: &mut PlanningTokenizer,
     executor: &mut Option<Executor>,
     mode: FillMode,
 ) -> Result<Cache> {
-    let FillPlan {
-        documents,
-        inputs,
-        tokenizer,
-    } = plan;
+    let selection = plan.selection;
     let mut cache = cache::load(config, &selection.key)?;
-    if documents
+    if plan
+        .documents
         .iter()
         .flat_map(|d| &d.keys)
         .all(|key| cache.vectors.contains_key(key))
@@ -1109,10 +1174,7 @@ fn fill_locked(
         cache::finish_build(config, &selection.key)?;
         return Ok(cache);
     }
-    let inputs = match inputs {
-        Some(inputs) => inputs,
-        None => tokenizer.materialize(config, selection, index)?.1,
-    };
+    let inputs = plan.take_inputs(config, tokenizer)?;
     let missing = inputs
         .into_iter()
         .filter(|(key, _)| !cache.vectors.contains_key(key))
@@ -1183,15 +1245,21 @@ fn fill_locked(
         cache::publish_batch(
             config,
             &selection.key,
-            &index.version(),
-            documents,
+            &plan.version,
+            &plan.documents,
             &completed,
         )?;
         cache.vectors.extend(completed.vectors);
     };
     // Readers of other commits can replace mappings and evict earlier batches
     // during inference. Publish the full pinned snapshot before marking it done.
-    cache::publish_batch(config, &selection.key, &index.version(), documents, &cache)?;
+    cache::publish_batch(
+        config,
+        &selection.key,
+        &plan.version,
+        &plan.documents,
+        &cache,
+    )?;
     cache::finish_build(config, &selection.key)?;
     Ok(cache)
 }
@@ -1238,19 +1306,8 @@ fn refresh_inner(config: &Config, rebuild: bool, tokenizer: &mut PlanningTokeniz
         cache::reset(config, &selection.key)?;
     }
     // Chunking and batch ordering share a vocabulary, loaded only on a cache miss.
-    let (documents, inputs) = document_plan(config, &selection, &index, tokenizer)?;
-    fill_locked(
-        config,
-        &selection,
-        &index,
-        FillPlan {
-            documents: &documents,
-            inputs,
-            tokenizer,
-        },
-        &mut None,
-        FillMode::Update,
-    )?;
+    let mut plan = document_plan(config, &selection, &index, tokenizer)?;
+    fill_locked(config, &mut plan, tokenizer, &mut None, FillMode::Update)?;
     Ok(())
 }
 
@@ -1289,7 +1346,7 @@ fn coverage(config: &Config, report: &mut SemanticStatus) -> Result<()> {
     };
     let selection = Selection::from_config(config)?;
     let cache = cache::load(config, &selection.key)?;
-    let (documents, _) = document_plan(
+    let plan = document_plan(
         config,
         &selection,
         &index,
@@ -1298,7 +1355,7 @@ fn coverage(config: &Config, report: &mut SemanticStatus) -> Result<()> {
     let mut keys = HashSet::new();
     let mut ready_documents = 0;
     let mut searchable_documents = 0;
-    for document in &documents {
+    for document in &plan.documents {
         let document_keys = &document.keys;
         let ready = document_keys
             .iter()
@@ -1322,10 +1379,10 @@ fn coverage(config: &Config, report: &mut SemanticStatus) -> Result<()> {
         State::Pending
     };
     report.documents = Some(Coverage {
-        total: documents.len(),
+        total: plan.documents.len(),
         ready: ready_documents,
         searchable: Some(searchable_documents),
-        pending: documents.len() - ready_documents,
+        pending: plan.documents.len() - ready_documents,
     });
     report.chunks = Some(Coverage {
         total: keys.len(),
@@ -1380,28 +1437,18 @@ pub fn search(
     let mut executor = Some(Executor::shared(config, &selection)?);
     let queries = executor.as_mut().unwrap().embed(terms, QUERY_PREFIX)?;
     let mut tokenizer = if selection.directory.is_some() {
-        PlanningTokenizer::Shared(server::Client::new(&config.directories, &selection))
+        PlanningTokenizer::shared(config, &selection)
     } else {
         PlanningTokenizer::default()
     };
-    let (documents, inputs) = document_plan(config, &selection, index, &mut tokenizer)?;
+    let mut plan = document_plan(config, &selection, index, &mut tokenizer)?;
     let cache = match cached {
         Some(cache) => cache,
-        None => fill(
-            config,
-            &selection,
-            index,
-            FillPlan {
-                documents: &documents,
-                inputs,
-                tokenizer: &mut tokenizer,
-            },
-            &mut executor,
-        )?,
+        None => fill(config, &mut plan, &mut tokenizer, &mut executor)?,
     };
     let mut available = Vec::new();
     let mut complete = true;
-    for document in &documents {
+    for document in &plan.documents {
         let record = &document.record;
         let keys = &document.keys;
         if keys.is_empty() {
@@ -1689,20 +1736,20 @@ pub(crate) mod tests {
             directory: Some(dir.path().into()),
         };
         let mut vocabulary = PlanningTokenizer::default();
-        let (documents, inputs) =
-            document_plan(&config, &selection, &index, &mut vocabulary).unwrap();
-        fs::remove_file(tokenizer_path).unwrap();
-        let inputs = ordered_inputs(inputs.unwrap());
+        let mut plan = document_plan(&config, &selection, &index, &mut vocabulary).unwrap();
+        fs::remove_file(&tokenizer_path).unwrap();
+        let inputs = ordered_inputs(plan.take_inputs(&config, &mut vocabulary).unwrap());
+        let documents = &plan.documents;
         assert_eq!(inputs.len(), 1);
-        let (cached, inputs) = document_plan(
+        let mut cached = document_plan(
             &config,
             &selection,
             &index,
             &mut PlanningTokenizer::default(),
         )
         .unwrap();
-        assert!(inputs.is_none());
-        assert_eq!(cached[0].keys, documents[0].keys);
+        assert!(matches!(cached.materialization, Materialization::Deferred));
+        assert_eq!(cached.documents[0].keys, documents[0].keys);
         let vectors = Cache {
             vectors: [(documents[0].keys[0].clone(), vec![1.0, 0.0])].into(),
         };
@@ -1710,19 +1757,14 @@ pub(crate) mod tests {
             &config,
             &selection.key,
             &index.version(),
-            &documents,
+            documents,
             &vectors,
         )
         .unwrap();
         let cached = fill(
             &config,
-            &selection,
-            &index,
-            FillPlan {
-                documents: &documents,
-                inputs: None,
-                tokenizer: &mut PlanningTokenizer::default(),
-            },
+            &mut cached,
+            &mut PlanningTokenizer::default(),
             &mut None,
         )
         .unwrap();
@@ -1730,22 +1772,15 @@ pub(crate) mod tests {
 
         // A different commit map forces planning, but unchanged composed input
         // is reusable even by a fresh planner with no tokenizer file available.
-        cache::publish(
-            &config,
-            &selection.key,
-            "other-commit",
-            &documents,
-            &vectors,
-        )
-        .unwrap();
-        let (reused, _) = document_plan(
+        cache::publish(&config, &selection.key, "other-commit", documents, &vectors).unwrap();
+        let reused = document_plan(
             &config,
             &selection,
             &index,
             &mut PlanningTokenizer::default(),
         )
         .unwrap();
-        assert_eq!(reused[0].keys, documents[0].keys);
+        assert_eq!(reused.documents[0].keys, documents[0].keys);
 
         // An appended reply changes the earlier user's input, not its identity.
         let reply = codex_message("assistant", "limit the number of clients");
@@ -1760,17 +1795,28 @@ pub(crate) mod tests {
             )
             .is_err()
         );
-        let (paired, _) = document_plan(&config, &selection, &next, &mut vocabulary).unwrap();
-        assert_ne!(paired[0].keys, documents[0].keys);
-        assert_eq!(paired[0].record.event_id, documents[0].record.event_id);
+        let paired = document_plan(&config, &selection, &next, &mut vocabulary).unwrap();
+        assert_ne!(paired.documents[0].keys, documents[0].keys);
+        assert_eq!(
+            paired.documents[0].record.event_id,
+            documents[0].record.event_id
+        );
 
         // Neither a previous selection's plans nor its loaded vocabulary may
         // satisfy a different model/tokenizer identity.
         let changed = Selection {
             key: "changed-tokenizer".into(),
-            ..selection
+            ..selection.clone()
         };
         assert!(document_plan(&config, &changed, &next, &mut vocabulary).is_err());
+
+        // A failed initialization must retry when the tokenizer becomes available.
+        tokenizer.save(&tokenizer_path, false).unwrap();
+        let retried = document_plan(&config, &changed, &next, &mut vocabulary).unwrap();
+        assert_eq!(
+            retried.documents[0].prepared.as_ref().unwrap().chunks,
+            paired.documents[0].prepared.as_ref().unwrap().chunks,
+        );
     }
 
     #[test]
@@ -1807,13 +1853,14 @@ pub(crate) mod tests {
         let selection = Selection::from_config(&config).unwrap();
         let plan = |index: &ReadIndex| {
             index.record_decodes.set(0);
-            document_plan(
+            let plan = document_plan(
                 &config,
                 &selection,
                 index,
                 &mut PlanningTokenizer::default(),
             )
-            .unwrap()
+            .unwrap();
+            (plan.documents, plan.materialization)
         };
         let mut user = json!({
             "type":"user", "uuid":"11111111-1111-4111-8111-111111111111",
@@ -1845,7 +1892,7 @@ pub(crate) mod tests {
             .unwrap()
             .event_id;
         let (first, inputs) = plan(&index);
-        assert!(inputs.is_some());
+        assert!(matches!(inputs, Materialization::Materialized(_)));
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].record.text, "question");
         assert!(first[0].record.source_spans.is_none());
@@ -1875,7 +1922,7 @@ pub(crate) mod tests {
             .join(format!("documents-{}-old.msgpack", selection.key));
         fs::write(&legacy, b"obsolete mapping").unwrap();
         let (cached, inputs) = plan(&irrelevant);
-        assert!(inputs.is_none());
+        assert!(matches!(inputs, Materialization::Deferred));
         assert_eq!(cached[0].keys, first[0].keys);
         assert_eq!(irrelevant.record_decodes.get(), 0);
         assert!(!legacy.exists());
@@ -1884,7 +1931,7 @@ pub(crate) mod tests {
         let visible = write(&user, Some(&assistant));
         assert_ne!(visible.version(), irrelevant.version());
         let (edited, inputs) = plan(&visible);
-        assert!(inputs.is_some());
+        assert!(matches!(inputs, Materialization::Materialized(_)));
         assert_eq!(edited.len(), 1);
         assert_eq!(
             edited[0].keys,
@@ -1897,7 +1944,7 @@ pub(crate) mod tests {
         let metadata = write(&user, Some(&assistant));
         assert_ne!(metadata.version(), visible.version());
         let (updated, inputs) = plan(&metadata);
-        assert!(inputs.is_some());
+        assert!(matches!(inputs, Materialization::Materialized(_)));
         assert_eq!(updated.len(), 1);
         assert_eq!(updated[0].keys, edited[0].keys);
         assert_eq!(updated[0].record.workspace, "/workspace/second");
@@ -1907,7 +1954,7 @@ pub(crate) mod tests {
         let deleted = write(&user, None);
         assert_ne!(deleted.version(), metadata.version());
         let (unanswered, inputs) = plan(&deleted);
-        assert!(inputs.is_some());
+        assert!(matches!(inputs, Materialization::Materialized(_)));
         assert_eq!(unanswered.len(), 1);
         assert_eq!(unanswered[0].keys, vec![digest(&["user:\nquestion"])]);
         assert_eq!(deleted.record_decodes.get(), 1);
