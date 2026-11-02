@@ -3,8 +3,8 @@
 //! clients serially. It keeps one model selection, exits after 30 idle seconds,
 //! and stores no input text.
 use super::{
-    BATCH_SIZE, ChunkInput, DOCUMENT_PREFIX, Environment, Executor, QUERY_PREFIX, Selection,
-    prepare_chunks, with_document_tokenizer,
+    BATCH_SIZE, ChunkInput, DOCUMENT_PREFIX, DocumentTokenizer, Environment, Executor,
+    QUERY_PREFIX, Selection, prepare_chunks,
 };
 use crate::{config, record::digest};
 use anyhow::{Context, Result, bail, ensure};
@@ -449,7 +449,7 @@ impl Drop for Endpoint {
 }
 
 struct Watchdog(mpsc::Sender<Option<Duration>>);
-struct Deadline<'a>(&'a Watchdog);
+struct Deadline<'a>(&'a mut Watchdog);
 impl Watchdog {
     fn new() -> Self {
         let (send, receive) = mpsc::channel::<Option<Duration>>();
@@ -473,7 +473,7 @@ impl Watchdog {
         Self(send)
     }
 
-    fn arm(&self, duration: Duration) -> Deadline<'_> {
+    fn arm(&mut self, duration: Duration) -> Deadline<'_> {
         let _ = self.0.send(Some(duration));
         Deadline(self)
     }
@@ -481,6 +481,26 @@ impl Watchdog {
 impl Drop for Deadline<'_> {
     fn drop(&mut self) {
         let _ = self.0.0.send(None);
+    }
+}
+
+struct IdleLease {
+    last_completed: Instant,
+}
+
+impl IdleLease {
+    fn new() -> Self {
+        Self {
+            last_completed: Instant::now(),
+        }
+    }
+
+    fn remaining(&self) -> Duration {
+        IDLE.saturating_sub(self.last_completed.elapsed())
+    }
+
+    fn connection_completed(&mut self) {
+        self.last_completed = Instant::now();
     }
 }
 
@@ -501,7 +521,11 @@ struct LoadedModel {
 }
 
 impl Resident {
-    fn select(&mut self, selection: Selection, watchdog: &Watchdog) -> Result<&mut LoadedModel> {
+    fn select(
+        &mut self,
+        selection: Selection,
+        watchdog: &mut Watchdog,
+    ) -> Result<&mut LoadedModel> {
         let directory = selection
             .directory
             .as_ref()
@@ -553,7 +577,7 @@ impl LoadedModel {
         let Executor::Builtin { tokenizer, .. } = &mut self.executor else {
             bail!("planning requires a built-in model")
         };
-        with_document_tokenizer(tokenizer, |tokenizer| {
+        DocumentTokenizer::prepare(tokenizer, |tokenizer| {
             prepare_chunks(texts, Some(tokenizer))
         })
     }
@@ -576,13 +600,13 @@ pub(crate) fn run(directories: &crate::directories::Directories) -> Result<()> {
     let listener = endpoint.listen()?;
     // ONNX Runtime permits one environment per process, shared across model changes.
     let mut resident = Resident::default();
-    let watchdog = Watchdog::new();
-    let mut last = Instant::now();
+    let mut watchdog = Watchdog::new();
+    let mut idle = IdleLease::new();
     loop {
         let (mut stream, _) = match listener.accept() {
             Ok(client) => client,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if last.elapsed() >= IDLE {
+                if idle.remaining().is_zero() {
                     return Ok(());
                 }
                 let mut descriptor = libc::pollfd {
@@ -590,7 +614,7 @@ pub(crate) fn run(directories: &crate::directories::Directories) -> Result<()> {
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                let remaining = IDLE.saturating_sub(last.elapsed()).as_millis() as i32;
+                let remaining = idle.remaining().as_millis() as i32;
                 // poll sleeps until a client arrives or the idle deadline ends.
                 let result = unsafe { libc::poll(&mut descriptor, 1, remaining) };
                 if result < 0
@@ -614,7 +638,7 @@ pub(crate) fn run(directories: &crate::directories::Directories) -> Result<()> {
                 Request::Select(selection) => {
                     // Release the model borrow before replacement, including failed selection.
                     selected = ConnectionSelection::Unselected;
-                    match resident.select(selection, &watchdog) {
+                    match resident.select(selection, &mut watchdog) {
                         Ok(model) => {
                             selected = ConnectionSelection::Selected(model);
                             Reply::Ready
@@ -643,7 +667,7 @@ pub(crate) fn run(directories: &crate::directories::Directories) -> Result<()> {
                 break;
             }
         }
-        last = Instant::now();
+        idle.connection_completed();
     }
 }
 
@@ -656,7 +680,7 @@ mod tests {
         let Ok(mode) = std::env::var("TRWL_WATCHDOG_TEST") else {
             return;
         };
-        let watchdog = Watchdog::new();
+        let mut watchdog = Watchdog::new();
         if mode == "complete" {
             for _ in 0..3 {
                 let _deadline = watchdog.arm(Duration::from_millis(100));

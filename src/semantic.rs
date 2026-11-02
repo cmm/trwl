@@ -296,31 +296,50 @@ fn materialize(
 ) -> Result<(Vec<EmbeddingDocument>, ChunkInputs)> {
     let records = index.messages()?;
     match tokenizer {
-        Some(tokenizer) => with_document_tokenizer(tokenizer, |tokenizer| {
+        Some(tokenizer) => DocumentTokenizer::prepare(tokenizer, |tokenizer| {
             materialize_documents(&records, Some(tokenizer))
         }),
         None => materialize_documents(&records, None),
     }
 }
 
-fn with_document_tokenizer<T>(
-    tokenizer: &mut Tokenizer,
-    prepare: impl FnOnce(&Tokenizer) -> Result<T>,
-) -> Result<T> {
-    // Chunk complete text without padding or truncation. Restore both settings
-    // even when document tokenization fails.
-    let truncation = tokenizer.get_truncation().cloned();
-    let padding = tokenizer.get_padding().cloned();
-    tokenizer
-        .with_truncation(None)
-        .map_err(|e| anyhow::anyhow!("configuring chunk tokenizer: {e}"))?;
-    tokenizer.with_padding(None);
-    let result = prepare(tokenizer);
-    tokenizer.with_padding(padding);
-    tokenizer
-        .with_truncation(truncation)
-        .map_err(|e| anyhow::anyhow!("restoring inference tokenizer: {e}"))?;
-    result
+struct DocumentTokenizer<'a> {
+    tokenizer: &'a mut Tokenizer,
+    truncation: Option<TruncationParams>,
+    padding: Option<PaddingParams>,
+}
+
+impl DocumentTokenizer<'_> {
+    fn prepare<T>(
+        tokenizer: &mut Tokenizer,
+        prepare: impl FnOnce(&Tokenizer) -> Result<T>,
+    ) -> Result<T> {
+        // Chunk complete text without padding or truncation. Restore both settings
+        // even when document tokenization fails.
+        let truncation = tokenizer.get_truncation().cloned();
+        let padding = tokenizer.get_padding().cloned();
+        tokenizer
+            .with_truncation(None)
+            .map_err(|e| anyhow::anyhow!("configuring chunk tokenizer: {e}"))?;
+        tokenizer.with_padding(None);
+        let document = DocumentTokenizer {
+            tokenizer,
+            truncation,
+            padding,
+        };
+        let result = prepare(document.tokenizer);
+        // Restoration is fallible and only runs on normal return, not unwinding.
+        document.restore()?;
+        result
+    }
+
+    fn restore(self) -> Result<()> {
+        self.tokenizer.with_padding(self.padding);
+        self.tokenizer
+            .with_truncation(self.truncation)
+            .map_err(|e| anyhow::anyhow!("restoring inference tokenizer: {e}"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
