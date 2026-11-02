@@ -22,7 +22,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -132,7 +132,7 @@ fn directory(directories: &crate::directories::Directories) -> Result<Directory>
     Directory::open(&path)
 }
 
-fn connect(directory: &Directory, timeout: Duration) -> Result<UnixStream> {
+fn connect_with_retry(directory: &Directory, timeout: Duration) -> Result<UnixStream> {
     let path = directory.path().join("socket");
     let bytes = path.as_os_str().as_bytes();
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -180,6 +180,87 @@ fn connect(directory: &Directory, timeout: Duration) -> Result<UnixStream> {
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     Ok(stream)
+}
+
+struct Startup {
+    _guard: File,
+    directory: Directory,
+    deadline: Instant,
+}
+impl Startup {
+    fn acquire(directory: Directory) -> Result<Self> {
+        // Lock acquisition and child startup share the same budget.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let guard = loop {
+            if let Some(guard) = config::try_lock(&directory.path(), "start.lock")? {
+                break guard;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "inference startup lock timed out"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        Ok(Self {
+            directory,
+            _guard: guard,
+            deadline,
+        })
+    }
+
+    fn connect_or_spawn(self, directories: &crate::directories::Directories) -> Result<UnixStream> {
+        // Another starter may have published an endpoint while we waited for the lock.
+        if let Ok(stream) = connect_with_retry(&self.directory, INITIALIZE) {
+            return Ok(stream);
+        }
+        let mut command = Command::new(std::env::current_exe()?);
+        directories.inference_environment(&mut command)?;
+        command
+            .arg("embedding-server")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().context("starting inference server")?;
+        self.wait_for_startup(child)
+    }
+
+    fn wait_for_startup(&self, mut child: Child) -> Result<UnixStream> {
+        loop {
+            if let Ok(stream) = connect_with_retry(&self.directory, INITIALIZE) {
+                reap_after_exit(child);
+                return Ok(stream);
+            }
+            if let Some(status) = child.try_wait()? {
+                bail!("inference server exited: {status}");
+            }
+            if Instant::now() >= self.deadline {
+                kill_and_reap(child);
+                bail!("inference server startup timed out");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+fn reap_after_exit(mut child: Child) {
+    // The updater can outlive many idle-expired servers.
+    // Dropping Child would leave their exit statuses unreaped.
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+}
+
+fn kill_and_reap(mut child: Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 pub(super) struct Client {
@@ -233,65 +314,10 @@ impl Client {
 
     fn connect_or_start(directories: &crate::directories::Directories) -> Result<UnixStream> {
         let directory = directory(directories)?;
-        let stream = match connect(&directory, INITIALIZE) {
-            Ok(stream) => stream,
-            Err(_) => {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let guard = loop {
-                    if let Some(guard) = config::try_lock(&directory.path(), "start.lock")? {
-                        break guard;
-                    }
-                    ensure!(
-                        Instant::now() < deadline,
-                        "inference startup lock timed out"
-                    );
-                    thread::sleep(Duration::from_millis(10));
-                };
-                let stream = match connect(&directory, INITIALIZE) {
-                    Ok(stream) => stream,
-                    Err(_) => {
-                        let mut command = Command::new(std::env::current_exe()?);
-                        directories.inference_environment(&mut command)?;
-                        command
-                            .arg("embedding-server")
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null());
-                        unsafe {
-                            command.pre_exec(|| {
-                                if libc::setsid() < 0 {
-                                    return Err(std::io::Error::last_os_error());
-                                }
-                                Ok(())
-                            });
-                        }
-                        let mut child = command.spawn().context("starting inference server")?;
-                        loop {
-                            if let Ok(stream) = connect(&directory, INITIALIZE) {
-                                // The updater can outlive many idle-expired servers.
-                                // Dropping Child would leave their exit statuses unreaped.
-                                thread::spawn(move || {
-                                    let _ = child.wait();
-                                });
-                                break stream;
-                            }
-                            if let Some(status) = child.try_wait()? {
-                                bail!("inference server exited: {status}");
-                            }
-                            if Instant::now() >= deadline {
-                                let _ = child.kill();
-                                let _ = child.wait();
-                                bail!("inference server startup timed out");
-                            }
-                            thread::sleep(Duration::from_millis(10));
-                        }
-                    }
-                };
-                drop(guard);
-                stream
-            }
-        };
-        Ok(stream)
+        match connect_with_retry(&directory, INITIALIZE) {
+            Ok(stream) => Ok(stream),
+            Err(_) => Startup::acquire(directory)?.connect_or_spawn(directories),
+        }
     }
 
     fn request(&self, request: &Request) -> Result<Reply> {
@@ -345,27 +371,74 @@ pub(crate) fn stop(directories: &crate::directories::Directories) -> Result<()> 
             continue;
         }
         let directory = Directory::open(&entry.path())?;
-        if let Ok(mut stream) = connect(&directory, INITIALIZE) {
-            send(&mut stream, &Request::Stop)?;
-            let _: Reply = receive(&mut stream)?;
-            let deadline = Instant::now() + INITIALIZE;
-            while config::is_locked(&directory.path(), "server.lock")? {
-                ensure!(
-                    Instant::now() < deadline,
-                    "inference server is still stopping"
-                );
-                thread::sleep(Duration::from_millis(10));
-            }
+        if let Ok(stream) = connect_with_retry(&directory, INITIALIZE) {
+            StopAcknowledged::request(&directory, stream)?.wait_for_lock_release()?;
         }
     }
     Ok(())
 }
 
-struct Endpoint(Directory);
+struct StopAcknowledged<'a> {
+    directory: &'a Directory,
+    _stream: UnixStream,
+}
+impl<'a> StopAcknowledged<'a> {
+    fn request(directory: &'a Directory, mut stream: UnixStream) -> Result<Self> {
+        send(&mut stream, &Request::Stop)?;
+        let _: Reply = receive(&mut stream)?;
+        Ok(Self {
+            directory,
+            _stream: stream,
+        })
+    }
+
+    fn wait_for_lock_release(self) -> Result<()> {
+        // A reply precedes endpoint teardown. Lock release does not reap the child;
+        // that belongs to the process which started it.
+        let deadline = Instant::now() + INITIALIZE;
+        while config::is_locked(&self.directory.path(), "server.lock")? {
+            ensure!(
+                Instant::now() < deadline,
+                "inference server is still stopping"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+}
+
+struct Endpoint {
+    directory: Directory,
+    _guard: File,
+}
+impl Endpoint {
+    fn acquire(directory: Directory) -> Result<Option<Self>> {
+        Ok(
+            config::try_lock(&directory.path(), "server.lock")?.map(|guard| Self {
+                directory,
+                _guard: guard,
+            }),
+        )
+    }
+
+    fn listen(&self) -> Result<UnixListener> {
+        let path = self.directory.path();
+        let _ = fs::remove_file(path.join("socket"));
+        let listener = UnixListener::bind(path.join("socket"))?;
+        listener.set_nonblocking(true)?;
+        fs::write(path.join("pid"), std::process::id().to_string())?;
+        Ok(listener)
+    }
+
+    fn remove_files(&mut self) {
+        let _ = fs::remove_file(self.directory.path().join("socket"));
+        let _ = fs::remove_file(self.directory.path().join("pid"));
+    }
+}
 impl Drop for Endpoint {
     fn drop(&mut self) {
-        let _ = fs::remove_file(self.0.path().join("socket"));
-        let _ = fs::remove_file(self.0.path().join("pid"));
+        // Drop runs before the fields, so file removal remains under server.lock.
+        self.remove_files();
     }
 }
 
@@ -406,16 +479,10 @@ impl Drop for Deadline<'_> {
 }
 
 pub(crate) fn run(directories: &crate::directories::Directories) -> Result<()> {
-    let directory = directory(directories)?;
-    let Some(_guard) = config::try_lock(&directory.path(), "server.lock")? else {
+    let Some(endpoint) = Endpoint::acquire(directory(directories)?)? else {
         return Ok(());
     };
-    let endpoint = Endpoint(directory);
-    let path = endpoint.0.path();
-    let _ = fs::remove_file(path.join("socket"));
-    let listener = UnixListener::bind(path.join("socket"))?;
-    listener.set_nonblocking(true)?;
-    fs::write(path.join("pid"), std::process::id().to_string())?;
+    let listener = endpoint.listen()?;
     // ONNX Runtime permits one environment per process, shared across model changes.
     let mut environment = None;
     let mut executor: Option<(Selection, Executor)> = None;
