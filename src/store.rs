@@ -1843,53 +1843,143 @@ fn update_with_parser(
     let path = config.directories.data.join("index");
     match update_index(config, sources, &path, full, &mut parse, &guard) {
         Err(error) if config.rebuild_incompatible() && incompatible(error.error()) => {
-            // Rebuilding an entire index must include configured histories even
-            // when this invocation requested only one explicit input.
-            let mut rebuild_sources = config.sources()?;
-            rebuild_sources.extend_from_slice(sources);
-            let staging = tempfile::Builder::new()
-                .prefix(".index-rebuild-")
-                .tempdir_in(&config.directories.data)?;
-            let report = update_index(
-                config,
-                &rebuild_sources,
-                staging.path(),
-                true,
-                &mut parse,
-                &guard,
-            )
-            .map_err(ImportFailure::into_error)?;
-            if report.completed() {
-                // The update lock covers both the build and publication. Exchange
-                // directories atomically so a crash cannot leave the index absent.
-                exchange_directories(staging.path(), &path)?;
-                File::open(&config.directories.data)?.sync_all()?;
-                // After the exchange this directory contains the obsolete index.
-                staging.close().context("removing obsolete history index")?;
-            }
-            Ok(report)
+            rebuild::replace(config, sources, &path, &mut parse, &guard)
+                .map_err(ImportFailure::into_error)
         }
         result => result.map_err(ImportFailure::into_error),
     }
 }
 
-fn exchange_directories(left: &Path, right: &Path) -> Result<()> {
-    let left = CString::new(left.as_os_str().as_bytes())?;
-    let right = CString::new(right.as_os_str().as_bytes())?;
-    // Both paths are NUL-terminated and remain alive for the system call.
-    let result = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            left.as_ptr(),
-            libc::AT_FDCWD,
-            right.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error()).context("publishing rebuilt history index");
+mod rebuild {
+    use super::*;
+
+    enum Build<'lock> {
+        Incomplete(ImportReport),
+        Complete(CompleteCandidate<'lock>),
     }
-    Ok(())
+
+    struct CompleteCandidate<'lock> {
+        directory: tempfile::TempDir,
+        report: ImportReport,
+        parent: &'lock Path,
+        update_lock: &'lock File,
+    }
+
+    struct ObsoleteIndex<'lock> {
+        directory: tempfile::TempDir,
+        report: ImportReport,
+        parent: &'lock Path,
+        _update_lock: &'lock File,
+    }
+
+    pub(super) fn replace(
+        config: &Config,
+        sources: &[Source],
+        current: &Path,
+        parse: &mut impl FnMut(
+            Provider,
+            &Path,
+            Option<&providers::Checkpoint>,
+            &mut dyn FnMut(&Record) -> Result<()>,
+        ) -> Result<providers::Parsed>,
+        update_lock: &File,
+    ) -> Result<ImportReport, ImportFailure> {
+        // Publication here means replacing the current index, not committing to
+        // the candidate directory while building it.
+        match build(config, sources, parse, update_lock)
+            .map_err(ImportFailure::BeforePublication)?
+        {
+            Build::Incomplete(report) => Ok(report),
+            Build::Complete(candidate) => candidate
+                .exchange(current)
+                .map_err(ImportFailure::BeforePublication)?
+                .finish()
+                .map_err(ImportFailure::AfterPublication),
+        }
+    }
+
+    fn build<'lock>(
+        config: &'lock Config,
+        sources: &[Source],
+        parse: &mut impl FnMut(
+            Provider,
+            &Path,
+            Option<&providers::Checkpoint>,
+            &mut dyn FnMut(&Record) -> Result<()>,
+        ) -> Result<providers::Parsed>,
+        update_lock: &'lock File,
+    ) -> Result<Build<'lock>> {
+        // Rebuilding an entire index must include configured histories even
+        // when this invocation requested only one explicit input.
+        let mut rebuild_sources = config.sources()?;
+        rebuild_sources.extend_from_slice(sources);
+        let directory = tempfile::Builder::new()
+            .prefix(".index-rebuild-")
+            .tempdir_in(&config.directories.data)?;
+        let report = update_index(
+            config,
+            &rebuild_sources,
+            directory.path(),
+            true,
+            parse,
+            update_lock,
+        )
+        .map_err(ImportFailure::into_error)?;
+        if !report.completed() {
+            return Ok(Build::Incomplete(report));
+        }
+        Ok(Build::Complete(CompleteCandidate {
+            directory,
+            report,
+            parent: &config.directories.data,
+            update_lock,
+        }))
+    }
+
+    impl<'lock> CompleteCandidate<'lock> {
+        fn exchange(self, current: &Path) -> Result<ObsoleteIndex<'lock>> {
+            // The update lock covers both the build and publication. Exchange
+            // directories atomically so a crash cannot leave the index absent.
+            exchange_directories(self.directory.path(), current)?;
+            // After the exchange this directory contains the obsolete index.
+            Ok(ObsoleteIndex {
+                directory: self.directory,
+                report: self.report,
+                parent: self.parent,
+                _update_lock: self.update_lock,
+            })
+        }
+    }
+
+    impl ObsoleteIndex<'_> {
+        fn finish(self) -> Result<ImportReport> {
+            File::open(self.parent)?.sync_all()?;
+            self.directory
+                .close()
+                .context("removing obsolete history index")?;
+            Ok(self.report)
+        }
+    }
+
+    fn exchange_directories(left: &Path, right: &Path) -> Result<()> {
+        let left = CString::new(left.as_os_str().as_bytes())?;
+        let right = CString::new(right.as_os_str().as_bytes())?;
+        // Both paths are NUL-terminated and remain alive for the system call.
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                left.as_ptr(),
+                libc::AT_FDCWD,
+                right.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("publishing rebuilt history index");
+        }
+        Ok(())
+    }
 }
 
 fn update_index(
