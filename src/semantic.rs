@@ -618,9 +618,8 @@ impl Selection {
 enum Executor {
     Shared(server::Client),
     Builtin {
-        session: Session,
+        session: BuiltinSession,
         tokenizer: Box<Tokenizer>,
-        profile_pending: bool,
     },
     Http {
         agent: ureq::Agent,
@@ -658,13 +657,11 @@ impl Executor {
     }
 
     fn builtin(directory: &Path, environment: &Environment) -> Result<Self> {
-        let (session, profile_pending) =
-            builtin_session(environment, &directory.join("onnx/model.onnx"), None)
-                .with_context(|| format!("loading model in {}", directory.display()))?;
+        let session = builtin_session(environment, &directory.join("onnx/model.onnx"), None)
+            .with_context(|| format!("loading model in {}", directory.display()))?;
         Ok(Self::Builtin {
             session,
             tokenizer: Box::new(inference_tokenizer(directory)?),
-            profile_pending,
         })
     }
 
@@ -700,12 +697,11 @@ impl Executor {
                 &directory.join("onnx/model.onnx"),
                 Some(provider),
             ) {
-                Ok((session, profile_pending)) => {
+                Ok(session) => {
                     return Ok(Some((
                         Self::Builtin {
                             session,
                             tokenizer: Box::new(tokenizer),
-                            profile_pending,
                         },
                         device,
                     )));
@@ -746,11 +742,7 @@ impl Executor {
                         .context("invalid embedding response JSON")?;
                 http_vectors(&response, texts.len())?
             }
-            Self::Builtin {
-                session,
-                tokenizer,
-                profile_pending,
-            } => {
+            Self::Builtin { session, tokenizer } => {
                 let encoded = tokenizer
                     .encode_batch(
                         texts
@@ -773,61 +765,55 @@ impl Executor {
                     .iter()
                     .flat_map(|e| e.get_type_ids().iter().map(|&n| n as i64))
                     .collect();
-                let mut inputs = ort::inputs![
-                    "input_ids" => Tensor::from_array(([texts.len(), width], ids))?,
-                    "attention_mask" => Tensor::from_array(([texts.len(), width], mask.clone()))?,
-                ];
-                if session
-                    .inputs()
-                    .iter()
-                    .any(|i| i.name() == "token_type_ids")
-                {
-                    inputs.push((
-                        "token_type_ids".into(),
-                        Tensor::from_array(([texts.len(), width], types))?.into(),
-                    ));
-                }
-                let outputs = session.run(inputs)?;
-                let (shape, hidden) = outputs[0].try_extract_tensor::<f32>()?;
-                ensure!(
-                    shape.len() == 3
-                        && shape[0] as usize == texts.len()
-                        && shape[1] as usize == width,
-                    "unexpected E5 output shape {shape:?}"
-                );
-                let dimensions = shape[2] as usize;
-                let mut result = Vec::with_capacity(texts.len());
-                for batch in 0..texts.len() {
-                    let mut vector = vec![0.0; dimensions];
-                    let mut count = 0;
-                    for token in 0..width {
-                        if mask[batch * width + token] == 0 {
-                            continue;
-                        }
-                        count += 1;
-                        let start = (batch * width + token) * dimensions;
-                        for (value, hidden) in
-                            vector.iter_mut().zip(&hidden[start..start + dimensions])
-                        {
-                            *value += hidden;
-                        }
+                session.batch(|session| {
+                    let mut inputs = ort::inputs![
+                        "input_ids" => Tensor::from_array(([texts.len(), width], ids))?,
+                        "attention_mask" => Tensor::from_array(([texts.len(), width], mask.clone()))?,
+                    ];
+                    if session
+                        .inputs()
+                        .iter()
+                        .any(|i| i.name() == "token_type_ids")
+                    {
+                        inputs.push((
+                            "token_type_ids".into(),
+                            Tensor::from_array(([texts.len(), width], types))?.into(),
+                        ));
                     }
-                    ensure!(count > 0, "tokenizer produced an empty attention mask");
-                    for value in &mut vector {
-                        *value /= count as f32;
+                    let outputs = session.run(inputs)?;
+                    let (shape, hidden) = outputs[0].try_extract_tensor::<f32>()?;
+                    ensure!(
+                        shape.len() == 3
+                            && shape[0] as usize == texts.len()
+                            && shape[1] as usize == width,
+                        "unexpected E5 output shape {shape:?}"
+                    );
+                    let dimensions = shape[2] as usize;
+                    let mut result = Vec::with_capacity(texts.len());
+                    for batch in 0..texts.len() {
+                        let mut vector = vec![0.0; dimensions];
+                        let mut count = 0;
+                        for token in 0..width {
+                            if mask[batch * width + token] == 0 {
+                                continue;
+                            }
+                            count += 1;
+                            let start = (batch * width + token) * dimensions;
+                            for (value, hidden) in
+                                vector.iter_mut().zip(&hidden[start..start + dimensions])
+                            {
+                                *value += hidden;
+                            }
+                        }
+                        ensure!(count > 0, "tokenizer produced an empty attention mask");
+                        for value in &mut vector {
+                            *value /= count as f32;
+                        }
+                        result.push(vector);
                     }
-                    result.push(vector);
-                }
-                drop(outputs);
-                if *profile_pending {
-                    // Flush the first batch before replying: the GPU worker is
-                    // killed after the build, so session destruction cannot do it.
-                    session
-                        .end_profiling()
-                        .context("flushing ONNX execution profile")?;
-                    *profile_pending = false;
-                }
-                result
+                    drop(outputs);
+                    Ok(result)
+                })?
             }
         };
         let dimensions = vectors[0].len();
@@ -905,11 +891,31 @@ fn inference_tokenizer(directory: &Path) -> Result<Tokenizer> {
     Ok(tokenizer)
 }
 
+struct BuiltinSession {
+    session: Session,
+    profile_pending: bool,
+}
+
+impl BuiltinSession {
+    fn batch<T>(&mut self, operation: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
+        let result = operation(&mut self.session)?;
+        if self.profile_pending {
+            // Flush the first batch before replying: the GPU worker is
+            // killed after the build, so session destruction cannot do it.
+            self.session
+                .end_profiling()
+                .context("flushing ONNX execution profile")?;
+            self.profile_pending = false;
+        }
+        Ok(result)
+    }
+}
+
 fn builtin_session(
     environment: &Environment,
     model: &Path,
     provider: Option<ExecutionProviderDispatch>,
-) -> Result<(Session, bool)> {
+) -> Result<BuiltinSession> {
     let mut builder = Session::builder(environment)?
         .with_intra_threads(INFERENCE_THREADS)
         .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -930,10 +936,10 @@ fn builtin_session(
             .with_profiling(Path::new(directory).join(format!("ort-{}", std::process::id())))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    Ok((
-        builder.commit_from_file(model)?,
-        profile_directory.is_some(),
-    ))
+    Ok(BuiltinSession {
+        session: builder.commit_from_file(model)?,
+        profile_pending: profile_directory.is_some(),
+    })
 }
 
 fn http_vectors(value: &Value, count: usize) -> Result<Vec<Vec<f32>>> {
@@ -1597,7 +1603,7 @@ pub(crate) mod tests {
             .join("onnx/model.onnx");
         let texts = ["database connection pool".into(), "日本語の検索".into()];
         let cpu = executor.embed(&texts, QUERY_PREFIX).unwrap();
-        let (session, profile_pending) = builtin_session(
+        let session = builtin_session(
             &environment,
             &model,
             Some(ort::ep::OpenVINO::default().with_device_type("CPU").build()),
@@ -1605,7 +1611,6 @@ pub(crate) mod tests {
         .unwrap();
         let mut openvino = Executor::Builtin {
             session,
-            profile_pending,
             tokenizer: Box::new(
                 inference_tokenizer(selection.directory.as_ref().unwrap()).unwrap(),
             ),
