@@ -907,7 +907,6 @@ fn opencode_part(
         .get::<_, Option<String>>(5)?
         .map(|p| session_id(Provider::Opencode, &p));
     record.is_subagent = record.parent_session_id.is_some();
-    record.sequence = session.records.0 as u64;
     if kind == EventType::ToolCall {
         let args = &value["state"]["input"];
         let tool = value["tool"].as_str().unwrap_or("tool");
