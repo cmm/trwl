@@ -340,6 +340,36 @@ pub struct ReadIndex {
     summary_decodes: std::cell::Cell<usize>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum PageRequest<'a> {
+    Initial,
+    Continuation(&'a str),
+}
+
+impl<'a> PageRequest<'a> {
+    pub(crate) fn resolve<T>(
+        self,
+        lookup: impl FnOnce(&'a str) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        match self {
+            Self::Initial => Ok(None),
+            Self::Continuation(cursor) => lookup(cursor)?
+                .context("cursor no longer matches this selection")
+                .map(Some),
+        }
+    }
+}
+
+pub(crate) struct Page {
+    pub records: Vec<Record>,
+    pub state: PageState,
+}
+
+pub(crate) enum PageState {
+    More(String),
+    Exhausted,
+}
+
 #[cfg(test)]
 thread_local! {
     // Count reads across indexes opened by the operation under test.
@@ -1033,28 +1063,31 @@ impl ReadIndex {
         Ok(ids)
     }
 
-    pub fn page(
+    pub(crate) fn page(
         &self,
         filters: &Filters,
         sessions: bool,
         limit: usize,
-        cursor: Option<&str>,
+        request: PageRequest<'_>,
         workspace: &workspace::Selection,
-    ) -> Result<(Vec<Record>, Option<String>)> {
+    ) -> Result<Page> {
         let mut selection = self.selection(filters, false, workspace)?;
-        if !sessions && let Some(id) = cursor {
-            let selected_cursor = BooleanQuery::new(vec![
-                (Occur::Must, selection.box_clone()),
-                (
-                    Occur::Must,
-                    term_query(Term::from_field_text(self.fields.id, id)),
-                ),
-            ]);
-            let address = self
-                .addresses(&selected_cursor)?
-                .into_iter()
-                .next()
-                .context("cursor no longer matches this selection")?;
+        if !sessions
+            && let Some((id, address)) = request.resolve(|id| {
+                let selected_cursor = BooleanQuery::new(vec![
+                    (Occur::Must, selection.box_clone()),
+                    (
+                        Occur::Must,
+                        term_query(Term::from_field_text(self.fields.id, id)),
+                    ),
+                ]);
+                Ok(self
+                    .addresses(&selected_cursor)?
+                    .into_iter()
+                    .next()
+                    .map(|address| (id, address)))
+            })?
+        {
             let previous = self.summary(address)?;
             use std::ops::Bound;
             let greater = |term| {
@@ -1122,17 +1155,19 @@ impl ReadIndex {
             },
         )?;
         rows.sort_by(|a, b| b.cmp(a));
-        let start = match cursor {
-            Some(id) if sessions => {
-                rows.iter()
-                    .position(|r| r.priority.id() == id)
-                    .context("cursor no longer matches this selection")?
-                    + 1
-            }
-            _ => 0,
+        let start = if sessions {
+            request
+                .resolve(|id| Ok(rows.iter().position(|r| r.priority.id() == id)))?
+                .map_or(0, |position| position + 1)
+        } else {
+            0
         };
         let end = start.saturating_add(limit).min(rows.len());
-        let next = (end < rows.len()).then(|| rows[end - 1].priority.id().to_owned());
+        let state = if end < rows.len() {
+            PageState::More(rows[end - 1].priority.id().to_owned())
+        } else {
+            PageState::Exhausted
+        };
         let page = rows[start..end]
             .iter()
             .map(|r| {
@@ -1143,7 +1178,10 @@ impl ReadIndex {
                 }
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok((page, next))
+        Ok(Page {
+            records: page,
+            state,
+        })
     }
 
     pub fn messages(&self) -> Result<Vec<ConversationMessage>> {
@@ -2672,16 +2710,19 @@ pub(crate) mod tests {
                 {"type":"text", "text":before}, {"type":"text", "text":after}
             ])
         );
-        let (page, next) = index
+        let Page {
+            records: page,
+            state,
+        } = index
             .page(
                 &Filters::default(),
                 false,
                 10,
-                None,
+                PageRequest::Initial,
                 &workspace::Selection::All,
             )
             .unwrap();
-        assert!(next.is_none());
+        assert!(matches!(state, PageState::Exhausted));
         assert_eq!(page.len(), 1);
         assert_eq!(
             serde_json::to_value(page.into_iter().next().unwrap().project().unwrap()).unwrap(),

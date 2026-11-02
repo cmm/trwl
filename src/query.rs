@@ -18,7 +18,7 @@ use crate::{
         SessionEvents, SessionsPage, State,
     },
     semantic,
-    store::{self, ReadIndex},
+    store::{self, Page, PageRequest, PageState, ReadIndex},
     workspace,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -365,7 +365,11 @@ pub fn list(
     cursor: Option<&str>,
 ) -> Result<Report> {
     ensure!(limit > 0, "list limit must be positive");
-    let (records, next) = match ReadIndex::open(root)? {
+    let request = match cursor {
+        Some(cursor) => PageRequest::Continuation(cursor),
+        None => PageRequest::Initial,
+    };
+    let Page { records, state } = match ReadIndex::open(root)? {
         Some(index) => {
             let workspace =
                 workspace::Selection::resolve(&filters.workspace, || index.workspace_roots())?;
@@ -373,14 +377,21 @@ pub fn list(
                 filters,
                 matches!(kind, ListKind::Sessions),
                 limit,
-                cursor,
+                request,
                 &workspace,
             )?
         }
         None => {
-            ensure!(cursor.is_none(), "cursor no longer matches this selection");
-            (Vec::new(), None)
+            request.resolve::<()>(|_| Ok(None))?;
+            Page {
+                records: Vec::new(),
+                state: PageState::Exhausted,
+            }
         }
+    };
+    let next = match state {
+        PageState::More(cursor) => Some(cursor),
+        PageState::Exhausted => None,
     };
     match kind {
         ListKind::Events => Ok(Report::Events(EventsPage {
@@ -653,25 +664,26 @@ mod tests {
     fn cursor_pages_keep_ties_and_decode_only_the_page() {
         let (_dir, index) = fixture_index(&["2026-01-01T00:00:00Z"; 5]);
         let filters = Filters::default();
-        let mut cursor = None;
+        let mut cursor;
+        let mut request = PageRequest::Initial;
         let mut records = Vec::new();
         loop {
             index.record_decodes.set(0);
-            let (page, next) = index
-                .page(
-                    &filters,
-                    false,
-                    2,
-                    cursor.as_deref(),
-                    &workspace::Selection::All,
-                )
+            let Page {
+                records: page,
+                state,
+            } = index
+                .page(&filters, false, 2, request, &workspace::Selection::All)
                 .unwrap();
             assert_eq!(index.record_decodes.get(), page.len());
             assert!(page.len() <= 2);
             records.extend(page);
-            cursor = next;
-            if cursor.is_none() {
-                break;
+            match state {
+                PageState::More(next) => {
+                    cursor = next;
+                    request = PageRequest::Continuation(&cursor);
+                }
+                PageState::Exhausted => break,
             }
         }
         assert_eq!(
@@ -689,12 +701,21 @@ mod tests {
                 .len(),
             5
         );
-        let (sessions, next) = index
-            .page(&filters, true, 1, None, &workspace::Selection::All)
+        let Page {
+            records: sessions,
+            state,
+        } = index
+            .page(
+                &filters,
+                true,
+                1,
+                PageRequest::Initial,
+                &workspace::Selection::All,
+            )
             .unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].event_id, records[0].event_id);
-        assert!(next.is_none());
+        assert!(matches!(state, PageState::Exhausted));
         let changed = Filters {
             provider: vec![crate::record::Provider::Pi],
             ..Default::default()
@@ -705,7 +726,7 @@ mod tests {
                     &changed,
                     false,
                     2,
-                    Some(&records[0].event_id),
+                    PageRequest::Continuation(&records[0].event_id),
                     &workspace::Selection::All,
                 )
                 .is_err()
@@ -716,7 +737,7 @@ mod tests {
                     &filters,
                     false,
                     2,
-                    Some("missing"),
+                    PageRequest::Continuation("missing"),
                     &workspace::Selection::All,
                 )
                 .is_err()
