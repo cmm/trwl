@@ -3,8 +3,8 @@
 //! clients serially. It keeps one model selection, exits after 30 idle seconds,
 //! and stores no input text.
 use super::{
-    BATCH_SIZE, ChunkInput, DOCUMENT_PREFIX, Executor, QUERY_PREFIX, Selection, prepare_chunks,
-    with_document_tokenizer,
+    BATCH_SIZE, ChunkInput, DOCUMENT_PREFIX, Environment, Executor, QUERY_PREFIX, Selection,
+    prepare_chunks, with_document_tokenizer,
 };
 use crate::{config, record::digest};
 use anyhow::{Context, Result, bail, ensure};
@@ -281,7 +281,7 @@ impl Client {
     fn connection(
         directories: &crate::directories::Directories,
         selection: &Selection,
-    ) -> Result<UnixStream> {
+    ) -> Result<SelectedConnection> {
         for attempt in 0..2 {
             let mut stream = Self::connect_or_start(directories)?;
             let reply = send(&mut stream, &Request::Select(selection.clone()))
@@ -290,7 +290,7 @@ impl Client {
                 Ok(Reply::Ready) => {
                     stream.set_read_timeout(Some(REQUEST))?;
                     stream.set_write_timeout(Some(REQUEST))?;
-                    return Ok(stream);
+                    return Ok(SelectedConnection(stream));
                 }
                 Ok(Reply::Failed(message)) => bail!("inference initialization: {message}"),
                 Ok(_) => bail!("unexpected inference initialization response"),
@@ -323,12 +323,7 @@ impl Client {
     fn request(&self, request: &Request) -> Result<Reply> {
         // Do not hold a server connection while acquiring an index/cache lock.
         // Updaters can hold that lock while waiting for their own inference.
-        let mut stream = Self::connection(&self.directories, &self.selection)?;
-        send(&mut stream, request)?;
-        match receive(&mut stream)? {
-            Reply::Failed(message) => bail!("inference failed: {message}"),
-            reply => Ok(reply),
-        }
+        Self::connection(&self.directories, &self.selection)?.request(request)
     }
 
     pub(super) fn prepare(&mut self, texts: &[String]) -> Result<Vec<Vec<ChunkInput>>> {
@@ -355,6 +350,17 @@ impl Client {
                 Ok(vectors)
             }
             _ => bail!("unexpected inference response"),
+        }
+    }
+}
+
+struct SelectedConnection(UnixStream);
+impl SelectedConnection {
+    fn request(mut self, request: &Request) -> Result<Reply> {
+        send(&mut self.0, request)?;
+        match receive(&mut self.0)? {
+            Reply::Failed(message) => bail!("inference failed: {message}"),
+            reply => Ok(reply),
         }
     }
 }
@@ -478,14 +484,98 @@ impl Drop for Deadline<'_> {
     }
 }
 
+#[derive(Default)]
+struct Resident {
+    runtime: Option<InitializedRuntime>,
+}
+
+struct InitializedRuntime {
+    // Drop the model before releasing the runtime it uses.
+    model: Option<LoadedModel>,
+    environment: Environment,
+}
+
+struct LoadedModel {
+    selection: Selection,
+    executor: Executor,
+}
+
+impl Resident {
+    fn select(&mut self, selection: Selection, watchdog: &Watchdog) -> Result<&mut LoadedModel> {
+        let directory = selection
+            .directory
+            .as_ref()
+            .context("inference server requires a built-in model")?;
+        if self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.model.as_ref())
+            .is_none_or(|model| model.selection != selection)
+        {
+            let _deadline = watchdog.arm(INITIALIZE);
+            let runtime = match &mut self.runtime {
+                Some(runtime) => runtime,
+                None => self.runtime.insert(InitializedRuntime {
+                    model: None,
+                    environment: super::load_runtime()?,
+                }),
+            };
+            runtime.model = None;
+            let executor = Executor::builtin(directory, &runtime.environment)?;
+            runtime.model = Some(LoadedModel {
+                selection,
+                executor,
+            });
+        }
+        self.runtime
+            .as_mut()
+            .and_then(|runtime| runtime.model.as_mut())
+            .context("inference executor missing")
+    }
+}
+
+enum ConnectionSelection<'a> {
+    Unselected,
+    Selected(&'a mut LoadedModel),
+}
+impl ConnectionSelection<'_> {
+    fn model(&mut self) -> Result<&mut LoadedModel> {
+        match self {
+            Self::Unselected => bail!("inference selection missing"),
+            Self::Selected(model) => Ok(model),
+        }
+    }
+}
+
+impl LoadedModel {
+    fn prepare(&mut self, texts: &[String]) -> Result<Vec<Vec<ChunkInput>>> {
+        ensure!(texts.len() <= BATCH_SIZE, "planning batch is too large");
+        let Executor::Builtin { tokenizer, .. } = &mut self.executor else {
+            bail!("planning requires a built-in model")
+        };
+        with_document_tokenizer(tokenizer, |tokenizer| {
+            prepare_chunks(texts, Some(tokenizer))
+        })
+    }
+
+    fn embed(&mut self, texts: &[String], kind: InputKind) -> Result<Vec<Vec<f32>>> {
+        self.executor.embed(
+            texts,
+            match kind {
+                InputKind::Query => QUERY_PREFIX,
+                InputKind::Document => DOCUMENT_PREFIX,
+            },
+        )
+    }
+}
+
 pub(crate) fn run(directories: &crate::directories::Directories) -> Result<()> {
     let Some(endpoint) = Endpoint::acquire(directory(directories)?)? else {
         return Ok(());
     };
     let listener = endpoint.listen()?;
     // ONNX Runtime permits one environment per process, shared across model changes.
-    let mut environment = None;
-    let mut executor: Option<(Selection, Executor)> = None;
+    let mut resident = Resident::default();
     let watchdog = Watchdog::new();
     let mut last = Instant::now();
     loop {
@@ -514,7 +604,7 @@ pub(crate) fn run(directories: &crate::directories::Directories) -> Result<()> {
         };
         stream.set_read_timeout(Some(REQUEST))?;
         stream.set_write_timeout(Some(REQUEST))?;
-        let mut selected = false;
+        let mut selected = ConnectionSelection::Unselected;
         while let Ok(request) = receive(&mut stream) {
             let reply = match request {
                 Request::Stop => {
@@ -522,43 +612,19 @@ pub(crate) fn run(directories: &crate::directories::Directories) -> Result<()> {
                     return Ok(());
                 }
                 Request::Select(selection) => {
-                    let initialized = (|| -> Result<()> {
-                        let directory = selection
-                            .directory
-                            .as_ref()
-                            .context("inference server requires a built-in model")?;
-                        if executor.as_ref().is_none_or(|(old, _)| old != &selection) {
-                            let _deadline = watchdog.arm(INITIALIZE);
-                            executor = None;
-                            let environment = match &environment {
-                                Some(environment) => environment,
-                                None => environment.insert(super::load_runtime()?),
-                            };
-                            let loaded = Executor::builtin(directory, environment)?;
-                            executor = Some((selection, loaded));
+                    // Release the model borrow before replacement, including failed selection.
+                    selected = ConnectionSelection::Unselected;
+                    match resident.select(selection, &watchdog) {
+                        Ok(model) => {
+                            selected = ConnectionSelection::Selected(model);
+                            Reply::Ready
                         }
-                        Ok(())
-                    })();
-                    selected = initialized.is_ok();
-                    match initialized {
-                        Ok(()) => Reply::Ready,
                         Err(error) => Reply::Failed(format!("{error:#}")),
                     }
                 }
                 Request::Prepare { texts } => {
                     let _deadline = watchdog.arm(REQUEST);
-                    let result = (|| -> Result<_> {
-                        ensure!(selected, "inference selection missing");
-                        ensure!(texts.len() <= BATCH_SIZE, "planning batch is too large");
-                        let Executor::Builtin { tokenizer, .. } =
-                            &mut executor.as_mut().context("inference executor missing")?.1
-                        else {
-                            bail!("planning requires a built-in model")
-                        };
-                        with_document_tokenizer(tokenizer, |tokenizer| {
-                            prepare_chunks(&texts, Some(tokenizer))
-                        })
-                    })();
+                    let result = selected.model().and_then(|model| model.prepare(&texts));
                     match result {
                         Ok(chunks) => Reply::Chunks(chunks),
                         Err(error) => Reply::Failed(format!("{error:#}")),
@@ -566,20 +632,7 @@ pub(crate) fn run(directories: &crate::directories::Directories) -> Result<()> {
                 }
                 Request::Embed { texts, kind } => {
                     let _deadline = watchdog.arm(REQUEST);
-                    let result = (|| -> Result<_> {
-                        ensure!(selected, "inference selection missing");
-                        executor
-                            .as_mut()
-                            .context("inference executor missing")?
-                            .1
-                            .embed(
-                                &texts,
-                                match kind {
-                                    InputKind::Query => QUERY_PREFIX,
-                                    InputKind::Document => DOCUMENT_PREFIX,
-                                },
-                            )
-                    })();
+                    let result = selected.model().and_then(|model| model.embed(&texts, kind));
                     match result {
                         Ok(vectors) => Reply::Vectors(vectors),
                         Err(error) => Reply::Failed(format!("{error:#}")),

@@ -207,6 +207,11 @@ def executor_reuse(case):
     query()
     require(worker()[1] == pid, "malformed client killed the inference server")
 
+    if case.model_dir is not None:
+        _selection_protocol(case, pid_file)
+        query()
+        require(worker()[1] == pid, "selection failure restarted the inference server")
+
     os.kill(pid, signal.SIGKILL)
     deadline = time.monotonic() + 5
     while True:
@@ -230,6 +235,119 @@ def executor_reuse(case):
     require(not pid_file.exists(), "semantic disable left inference resident")
     case.check(
         "inference reuse, concurrent startup, malformed client isolation, crash recovery, idle expiry and shutdown"
+    )
+
+
+def _selection_protocol(case, pid_file):
+    model = case.root / "selection-model"
+    model.symlink_to(case.model_dir, target_is_directory=True)
+    selection = {
+        "key": "selection-protocol",
+        "executor": "builtin",
+        "model": "multilingual-e5-small",
+        "directory": str(model),
+    }
+    prepare = {"Prepare": {"texts": [TEXT]}}
+    embed = {"Embed": {"texts": [QUERY], "kind": "Query"}}
+    missing = {"Failed": "inference selection missing"}
+
+    def receive(stream, size):
+        data = bytearray()
+        while len(data) < size:
+            part = stream.recv(size - len(data))
+            require(part, "inference server closed during selection protocol")
+            data.extend(part)
+        return data
+
+    def request(stream, value):
+        data = json.dumps(value).encode()
+        stream.sendall(struct.pack("<I", len(data)) + data)
+        size = struct.unpack("<I", receive(stream, 4))[0]
+        return json.loads(receive(stream, size))
+
+    descriptor = os.open(pid_file.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with socket.socket(socket.AF_UNIX) as stream:
+            stream.settimeout(120)
+            stream.connect(f"/proc/self/fd/{descriptor}/socket")
+            require(request(stream, prepare) == missing, "unselected Prepare succeeded")
+            require(request(stream, embed) == missing, "unselected Embed succeeded")
+            require(
+                "Failed"
+                in request(stream, {"Select": dict(selection, directory=None)}),
+                "non-built-in selection succeeded",
+            )
+            require(
+                request(stream, {"Select": selection}) == "Ready", "selection failed"
+            )
+            chunks = request(stream, prepare)
+            vectors = request(stream, embed)
+            require(
+                "Chunks" in chunks and "Vectors" in vectors,
+                "selected operations failed",
+            )
+            require(
+                request(stream, {"Prepare": {"texts": [TEXT] * 1024}})
+                == {"Failed": "planning batch is too large"},
+                "oversized planning request did not fail",
+            )
+            require(
+                request(stream, embed) == vectors, "failed operation lost selection"
+            )
+            # Equal selections must reuse the loaded model, even if its files disappear.
+            model.unlink()
+            require(
+                request(stream, {"Select": selection}) == "Ready", "model was reloaded"
+            )
+            require(request(stream, prepare) == chunks, "reselection changed planning")
+            require(
+                "Failed"
+                in request(stream, {"Select": dict(selection, directory=None)}),
+                "invalid replacement succeeded",
+            )
+            require(
+                request(stream, embed) == missing, "failed selection stayed selected"
+            )
+            require(
+                request(stream, {"Select": selection}) == "Ready",
+                "resident model was lost",
+            )
+
+        with socket.socket(socket.AF_UNIX) as stream:
+            stream.settimeout(120)
+            stream.connect(f"/proc/self/fd/{descriptor}/socket")
+            require(
+                request(stream, embed) == missing, "new connection inherited selection"
+            )
+            require(
+                request(stream, {"Select": selection}) == "Ready",
+                "disconnect lost model",
+            )
+            require(request(stream, embed) == vectors, "resident inference changed")
+            changed = dict(selection, key="replacement-selection")
+            require(
+                "Failed" in request(stream, {"Select": changed}),
+                "changed selection reused a different model selection",
+            )
+            require(
+                request(stream, prepare) == missing,
+                "failed replacement stayed selected",
+            )
+            require(
+                "Failed" in request(stream, {"Select": selection}),
+                "failed replacement retained the old model",
+            )
+            model.symlink_to(case.model_dir, target_is_directory=True)
+            require(
+                request(stream, {"Select": changed}) == "Ready",
+                "replacement recovery failed",
+            )
+            require(request(stream, prepare) == chunks, "recovered planning changed")
+            require(request(stream, embed) == vectors, "recovered inference changed")
+    finally:
+        os.close(descriptor)
+    case.check(
+        "selection ordering, failed replacement recovery, and resident model reuse across requests and connections"
     )
 
 
