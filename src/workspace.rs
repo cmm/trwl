@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use globset::{Glob, GlobBuilder, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, btree_map::Entry},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -84,28 +84,66 @@ fn discover(path: &Path) -> Result<Discovery> {
     })
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(from = "Option<Root>")]
+enum RecordedRoot {
+    Resolved(Root),
+    Failure,
+}
+
+impl RecordedRoot {
+    fn root(&self) -> Option<&Root> {
+        match self {
+            Self::Resolved(root) => Some(root),
+            Self::Failure => None,
+        }
+    }
+}
+
+impl From<Option<Root>> for RecordedRoot {
+    fn from(root: Option<Root>) -> Self {
+        match root {
+            Some(root) => Self::Resolved(root),
+            None => Self::Failure,
+        }
+    }
+}
+
+impl Serialize for RecordedRoot {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.root().serialize(serializer)
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Roots {
-    identities: BTreeMap<String, Option<Root>>,
+    identities: BTreeMap<String, RecordedRoot>,
     #[serde(skip)]
-    discovered: HashMap<String, Option<Root>>,
+    discovered: HashMap<String, RecordedRoot>,
 }
 
 impl Roots {
     pub fn resolve(&mut self, session: &str, directory: &str) -> Option<Root> {
-        let discovered = &mut self.discovered;
-        self.identities
+        let recorded = match self
+            .identities
             .entry(crate::record::digest(&[session, directory]))
-            .or_insert_with(|| {
-                discovered
+        {
+            Entry::Occupied(entry) => entry.into_mut(),
+            // Absence is unresolved; a recorded failure must never retry discovery.
+            Entry::Vacant(entry) => entry.insert(
+                self.discovered
                     .entry(directory.into())
-                    .or_insert_with(|| match discover(Path::new(directory)).ok()? {
-                        Discovery::Git(root) | Discovery::Directory(root) => Some(root),
+                    .or_insert_with(|| match discover(Path::new(directory)) {
+                        Ok(Discovery::Git(root) | Discovery::Directory(root)) => {
+                            RecordedRoot::Resolved(root)
+                        }
+                        Err(_) => RecordedRoot::Failure,
                     })
-                    .clone()
-            })
-            .clone()
+                    .clone(),
+            ),
+        };
+        recorded.root().cloned()
     }
 }
 

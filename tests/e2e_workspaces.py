@@ -5,6 +5,7 @@ import shutil
 
 from e2e_http import EmbeddingServer
 from e2e_providers import native_records, write_jsonl
+from e2e_rebuild import _obsolete, _rebuild_setting
 from e2e_support import OpenCodeFixture, codex_fixture, git, require
 
 
@@ -262,3 +263,74 @@ def workspaces(case):
         case.check(
             "deleted checkouts retain roots and direct transcript retrieval remains global"
         )
+
+        identities = case.providers / "identities"
+        identities.mkdir()
+        missing = case.root / "later-created"
+
+        def write_identities(text):
+            for session, directory in (
+                ("positive", alias / "src"),
+                ("negative", missing),
+            ):
+                codex_fixture(
+                    identities / (session + ".jsonl"),
+                    directory,
+                    session,
+                    [("user", marker + " " + text)],
+                )
+
+        def identity_roots():
+            return {
+                hit["provider_session_id"]: hit["workspace_root"]
+                for hit in case.search(marker, "--workspace", "**", "--limit", "100")[
+                    "results"
+                ]
+                if hit["provider_session_id"] in ("positive", "negative")
+            }
+
+        def import_identities(*args):
+            case.json_command(
+                "import", "--provider", "codex", "--path", identities, *args
+            )
+
+        write_identities("before filesystem changes")
+        import_identities()
+        recorded = {"positive": str(peer), "negative": None}
+        require(identity_roots() == recorded, "wrong initial identity outcomes")
+        alias.unlink()
+        alias.symlink_to(main, target_is_directory=True)
+        missing.mkdir()
+        git(missing, "init", "--quiet")
+        write_identities("after filesystem changes")
+        for args in ((), ("--full",)):
+            import_identities(*args)
+            require(
+                identity_roots() == recorded,
+                "ordinary or full import rediscovered a recorded identity",
+            )
+        case.check(
+            "positive and negative workspace identities survive ordinary and full imports"
+        )
+
+        for path in identities.iterdir():
+            path.unlink()
+        import_identities()
+        require(not identity_roots(), "deleted inputs retained records")
+        write_identities("after input removal")
+        import_identities()
+        require(
+            identity_roots() == recorded, "input removal pruned workspace identities"
+        )
+        case.check(
+            "input removal and reintroduction preserve positive and negative identities"
+        )
+
+        _rebuild_setting(case, "true")
+        _obsolete(case)
+        import_identities()
+        require(
+            identity_roots() == {"positive": str(main), "negative": str(missing)},
+            "rebuild did not reset positive and negative workspace identities",
+        )
+        case.check("rebuild rediscovers positive and negative workspace identities")
