@@ -2563,26 +2563,35 @@ pub(crate) mod tests {
             unsafe {
                 assert_eq!(libc::read(ready[0], byte.as_mut_ptr().cast(), 1), 1);
             }
-            writer.wait_merging_threads().unwrap();
-            assert!(matches!(
-                index.directory().acquire_lock(&INDEX_WRITER_LOCK),
-                Err(LockError::LockBusy)
-            ));
-            let releaser = std::thread::spawn(move || {
-                std::thread::sleep(delay);
+            // Release and reap the child even when a lock assertion fails.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                writer.wait_merging_threads().unwrap();
+                assert!(matches!(
+                    index.directory().acquire_lock(&INDEX_WRITER_LOCK),
+                    Err(LockError::LockBusy)
+                ));
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        std::thread::sleep(delay);
+                        unsafe {
+                            assert_eq!(libc::write(release[1], [1u8].as_ptr().cast(), 1), 1);
+                        }
+                    });
+                    run()
+                })
+            }));
+            if result.is_err() {
                 unsafe {
                     assert_eq!(libc::write(release[1], [1u8].as_ptr().cast(), 1), 1);
                 }
-            });
-            let result = run();
-            releaser.join().unwrap();
+            }
             assert!(child.join().unwrap().success());
             unsafe {
                 for fd in ready.into_iter().chain(release) {
                     libc::close(fd);
                 }
             }
-            result
+            result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         }
 
         let (_dir, config, path) = crate::test_support::history_file("input.jsonl");
