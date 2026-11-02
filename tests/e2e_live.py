@@ -485,40 +485,52 @@ def semantic_recovery(case):
                 )
                 case.check("executor changes during a fill use a separate cache")
 
-                reached, release = gate(
-                    "restartdocumentbeacon", alternate_model, "/alternate/v1/embeddings"
-                )
-                fixture.message(
-                    SESSION,
-                    "msg_restart",
-                    "restartdocumentbeacon History awaiting embedding publication.",
-                )
-                require(reached.wait(10), "interrupted fill did not start")
-                restart_id = lexical_id("restartdocumentbeacon")
-                case.stop(daemon)
-                result = case.search(
-                    QUERY, "--events", "--limit", "100", backend="semantic"
-                )
-                require(
-                    result["retrieval"]["semantic_status"] == "partial"
-                    and any(
-                        r["trwl_event_id"] == expected["trwl_event_id"]
-                        for r in result["results"]
+                for stop in ("terminate", "request"):
+                    marker = f"{stop}restartdocumentbeacon"
+                    reached, release = gate(
+                        marker, alternate_model, "/alternate/v1/embeddings"
                     )
-                    and all(
-                        r["trwl_event_id"] != restart_id for r in result["results"]
-                    ),
-                    "interrupted fill replaced published embeddings",
-                )
-                release.set()
-                daemon = case.start(
-                    "daemon", "run", "--loop-interval-seconds", "1", timeout=20
-                )
-                await_ready(restart_id)
-                _show(case, expected)
-                case.check(
-                    "restart completes interrupted embedding work while preserving the previous cache"
-                )
+                    fixture.message(
+                        SESSION,
+                        f"msg_restart_{stop}",
+                        f"{marker} History awaiting embedding publication.",
+                    )
+                    require(reached.wait(10), "interrupted fill did not start")
+                    restart_id = lexical_id(marker)
+                    if stop == "terminate":
+                        case.stop(daemon)
+                    else:
+                        # The HTTP batch remains held: a stop request must release
+                        # daemon ownership without joining the embedding thread.
+                        case.command("daemon", "stop", timeout=5)
+                        case.wait(daemon)
+                        require(
+                            not case.json_command("daemon", "status")["running"],
+                            "stop request left daemon ownership held",
+                        )
+                    result = case.search(
+                        QUERY, "--events", "--limit", "100", backend="semantic"
+                    )
+                    require(
+                        result["retrieval"]["semantic_status"] == "partial"
+                        and any(
+                            r["trwl_event_id"] == expected["trwl_event_id"]
+                            for r in result["results"]
+                        )
+                        and all(
+                            r["trwl_event_id"] != restart_id for r in result["results"]
+                        ),
+                        "interrupted fill replaced published embeddings",
+                    )
+                    release.set()
+                    daemon = case.start(
+                        "daemon", "run", "--loop-interval-seconds", "1", timeout=20
+                    )
+                    await_ready(restart_id)
+                    _show(case, expected)
+                    case.check(
+                        f"{stop}: restart completes interrupted embedding work while preserving the previous cache"
+                    )
             finally:
                 for _, _, _, _, release in gates:
                     release.set()

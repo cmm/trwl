@@ -28,7 +28,7 @@ use config::{Config, Source};
 use report::{OverallStatus, Report, Running, State, Status};
 use serde_json::json;
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Write,
     os::unix::process::CommandExt,
     path::Path,
@@ -60,77 +60,154 @@ fn start_daemon(config: &Config) -> Result<()> {
     if !config.automatic() {
         return Ok(());
     }
-    let _startup = config::lock(&config.directories.data, DAEMON_START)?;
-    if daemon_running(&config.directories.data)? {
+    let startup = DaemonStartup::acquire(&config.directories)?;
+    match startup.decision(config)? {
+        DaemonStartDecision::KeepRunning => return Ok(()),
+        DaemonStartDecision::Takeover => startup.takeover()?,
+        DaemonStartDecision::Spawn => {}
+    }
+    startup.spawn()
+}
+
+enum DaemonStartDecision {
+    KeepRunning,
+    Takeover,
+    Spawn,
+}
+
+struct DaemonStartup<'a> {
+    directories: &'a Directories,
+    _lock: File,
+}
+
+impl<'a> DaemonStartup<'a> {
+    fn acquire(directories: &'a Directories) -> Result<Self> {
+        Ok(Self {
+            directories,
+            _lock: config::lock(&directories.data, DAEMON_START)?,
+        })
+    }
+
+    fn decision(&self, config: &Config) -> Result<DaemonStartDecision> {
+        if !daemon_running(&self.directories.data)? {
+            return Ok(DaemonStartDecision::Spawn);
+        }
         // A daemon from an older executable may keep accepting the old format.
         // Do not interrupt a current daemon while it is rebuilding that index.
-        let current = fs::read_to_string(config.directories.data.join(DAEMON_LOCK))
+        let current = fs::read_to_string(self.directories.data.join(DAEMON_LOCK))
             .is_ok_and(|version| version == env!("CARGO_PKG_VERSION"));
         if !config.rebuild_incompatible()
             || current
-            || !store::ReadIndex::open(&config.directories.data)
+            || !store::ReadIndex::open(&self.directories.data)
                 .err()
                 .is_some_and(|error| store::incompatible(&error))
         {
-            return Ok(());
+            return Ok(DaemonStartDecision::KeepRunning);
         }
-        stop_daemon(&config.directories)?;
+        Ok(DaemonStartDecision::Takeover)
     }
-    fs::create_dir_all(&config.directories.state)?;
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(config.directories.state.join("daemon.log"))?;
-    let mut process = Process::new(std::env::current_exe()?);
-    config.directories.child_environment(&mut process);
-    process
-        .args(["daemon", "run"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(log);
-    // The detached process owns no terminal or inherited pipe. Its file lock
-    // prevents duplicate workers, including simultaneous background requests.
-    unsafe {
-        process.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
+
+    fn takeover(&self) -> Result<()> {
+        // The stop request ends before spawn, but startup remains serialized.
+        stop_daemon(self.directories)
+    }
+
+    fn spawn(self) -> Result<()> {
+        fs::create_dir_all(&self.directories.state)?;
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.directories.state.join("daemon.log"))?;
+        let mut process = Process::new(std::env::current_exe()?);
+        self.directories.child_environment(&mut process);
+        process
+            .args(["daemon", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log);
+        // The detached process owns no terminal or inherited pipe. Its file lock
+        // prevents duplicate workers, including simultaneous background requests.
+        unsafe {
+            process.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = process.spawn()?;
+        thread::spawn(move || {
+            let _ = child.wait();
         });
+        // Spawning does not claim daemon ownership. The child acquires startup
+        // anew after this guard is released; the parent never waits for it.
+        Ok(())
     }
-    let mut child = process.spawn()?;
-    thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
+
+    fn claim(self) -> Result<Option<RunningDaemon>> {
+        let Some(mut lock) = config::try_lock(&self.directories.data, DAEMON_LOCK)? else {
+            return Ok(None);
+        };
+        // On publication failure this local drops before the startup guard.
+        lock.set_len(0)?;
+        lock.write_all(env!("CARGO_PKG_VERSION").as_bytes())?;
+        drop(self);
+        Ok(Some(RunningDaemon { _lock: lock }))
+    }
+}
+
+struct DaemonStopRequest<'a> {
+    directories: &'a Directories,
+    _lock: File,
+}
+
+impl<'a> DaemonStopRequest<'a> {
+    fn acquire(directories: &'a Directories) -> Result<Self> {
+        Ok(Self {
+            directories,
+            _lock: config::lock(&directories.data, DAEMON_STOP)?,
+        })
+    }
+
+    fn wait(self) -> Result<()> {
+        // Waiting for the request lock is outside this deadline.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while daemon_running(&self.directories.data)? {
+            ensure!(
+                Instant::now() < deadline,
+                "background updater is still finishing its current update"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        semantic::server::stop(self.directories)
+    }
 }
 
 fn stop_daemon(directories: &Directories) -> Result<()> {
-    let root = &directories.data;
-    let _request = config::lock(root, DAEMON_STOP)?;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while daemon_running(root)? {
-        ensure!(
-            Instant::now() < deadline,
-            "background updater is still finishing its current update"
-        );
-        thread::sleep(Duration::from_millis(50));
+    DaemonStopRequest::acquire(directories)?.wait()
+}
+
+struct RunningDaemon {
+    _lock: File,
+}
+
+impl RunningDaemon {
+    fn exit(self, embedding: EmbeddingUpdater) {
+        // Dropping a job detaches it. Lock release must not wait for a fill;
+        // process exit ends outstanding work, including an in-flight batch.
+        drop(embedding);
+        drop(self);
     }
-    semantic::server::stop(directories)
 }
 
 fn run_daemon(directories: &Directories, interval: u64) -> Result<()> {
-    let startup = config::lock(&directories.data, DAEMON_START)?;
-    let Some(mut guard) = config::try_lock(&directories.data, DAEMON_LOCK)? else {
+    let Some(daemon) = DaemonStartup::acquire(directories)?.claim()? else {
         return Ok(());
     };
-    guard.set_len(0)?;
-    guard.write_all(env!("CARGO_PKG_VERSION").as_bytes())?;
-    drop(startup);
     let mut embedding = EmbeddingUpdater::default();
     // Exiting ends the embedding thread with the process; an interrupted fill
     // keeps completed batches and the next updater resumes it.
-    while !daemon_stopping(directories)? {
+    'running: while !daemon_stopping(directories)? {
         let config = Config::load(directories)?;
         embedding = embedding.collect();
         match update_iteration(&config) {
@@ -141,11 +218,12 @@ fn run_daemon(directories: &Directories, interval: u64) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(interval.max(1));
         while Instant::now() < deadline {
             if daemon_stopping(directories)? {
-                return Ok(());
+                break 'running;
             }
             thread::sleep(Duration::from_millis(100));
         }
     }
+    daemon.exit(embedding);
     Ok(())
 }
 
