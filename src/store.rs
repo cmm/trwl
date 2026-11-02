@@ -79,6 +79,9 @@ fn retry_writer_lock<T, E>(
                     return Err(error);
                 }
                 std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
             }
             result => return result,
         }
