@@ -121,14 +121,85 @@ struct SqlitePrefix {
     diagnostics: Diagnostics,
 }
 
-impl SqliteSession {
-    fn save_prefix(&mut self, rows: usize, hasher: &Sha256) {
-        self.prefixes.push(SqlitePrefix {
+#[derive(Default)]
+struct SqliteOutput {
+    records: EmittedRecords,
+    diagnostics: Diagnostics,
+}
+
+#[derive(Clone, Default)]
+struct SqlitePosition {
+    rows: usize,
+    hasher: Sha256,
+}
+
+/// One verified boundary, including output counts that can differ from row counts.
+#[derive(Default)]
+struct VerifiedSqlitePrefix {
+    position: SqlitePosition,
+    output: SqliteOutput,
+    prefixes: Vec<SqlitePrefix>,
+}
+
+struct SqliteResume<'stmt> {
+    rows: rusqlite::Rows<'stmt>,
+    verified: VerifiedSqlitePrefix,
+    replacement: Option<SessionSuffix>,
+}
+
+impl VerifiedSqlitePrefix {
+    fn advance(mut self, prefix: &SqlitePrefix, position: SqlitePosition) -> Self {
+        self.prefixes.push(prefix.clone());
+        Self {
+            position,
+            output: SqliteOutput {
+                records: EmittedRecords(prefix.records),
+                diagnostics: prefix.diagnostics.clone(),
+            },
+            prefixes: self.prefixes,
+        }
+    }
+
+    fn restart<'stmt>(
+        self,
+        ordered: &'stmt mut rusqlite::Statement<'_>,
+        id: &str,
+    ) -> Result<SqliteResume<'stmt>> {
+        let mut rows = ordered.query([id])?;
+        for _ in 0..self.position.rows {
+            rows.next()?
+                .context("OpenCode prefix missing from snapshot")?;
+        }
+        Ok(self.replace(rows, id))
+    }
+
+    fn replace<'stmt>(self, rows: rusqlite::Rows<'stmt>, id: &str) -> SqliteResume<'stmt> {
+        SqliteResume {
             rows,
-            hash: hex::encode(hasher.clone().finalize()),
-            records: self.records,
-            diagnostics: self.diagnostics.clone(),
+            replacement: Some(SessionSuffix {
+                native_session: id.to_owned(),
+                from_sequence: self.output.records.0 as u64,
+            }),
+            verified: self,
+        }
+    }
+
+    fn save_prefix(&mut self) {
+        self.prefixes.push(SqlitePrefix {
+            rows: self.position.rows,
+            hash: hex::encode(self.position.hasher.clone().finalize()),
+            records: self.output.records.0,
+            diagnostics: self.output.diagnostics.clone(),
         });
+    }
+
+    fn capture(self, fingerprint: String) -> SqliteSession {
+        SqliteSession {
+            fingerprint,
+            records: self.output.records.0,
+            diagnostics: self.output.diagnostics,
+            prefixes: self.prefixes,
+        }
     }
 }
 
@@ -670,84 +741,84 @@ fn opencode(
                 Some(old) if &old.fingerprint == fingerprint => old.clone(),
                 _ => {
                     let mut rows = ordered.query([&id])?;
-                    let mut hasher = Sha256::new();
-                    let mut count = 0;
-                    let mut session = SqliteSession {
-                        fingerprint: fingerprint.clone(),
-                        records: 0,
-                        diagnostics: Diagnostics::default(),
-                        prefixes: Vec::new(),
-                    };
+                    let mut verified = VerifiedSqlitePrefix::default();
                     if let Some(old) = old {
                         for prefix in &old.prefixes {
-                            let verified_hasher = hasher.clone();
-                            while count < prefix.rows {
+                            let mut position = verified.position.clone();
+                            while position.rows < prefix.rows {
                                 let Some(row) = rows.next()? else { break };
                                 let mut payload = statement.query([row.get::<_, i64>(0)?])?;
                                 let row = payload
                                     .next()?
                                     .context("OpenCode row missing from snapshot")?;
-                                hash_opencode_row(&mut hasher, row)?;
-                                count += 1;
+                                hash_opencode_row(&mut position.hasher, row)?;
+                                position.rows += 1;
                             }
-                            if count != prefix.rows
-                                || hex::encode(hasher.clone().finalize()) != prefix.hash
+                            if position.rows != prefix.rows
+                                || hex::encode(position.hasher.clone().finalize()) != prefix.hash
                             {
                                 // A growing session can also contain edits, removals
                                 // or parts inserted before the old end. Restart at
                                 // the last verified prefix, before staging records.
-                                hasher = verified_hasher;
-                                count = session.prefixes.last().map_or(0, |p| p.rows);
-                                drop(rows);
-                                rows = ordered.query([&id])?;
-                                for _ in 0..count {
-                                    rows.next()?
-                                        .context("OpenCode prefix missing from snapshot")?;
-                                }
                                 break;
                             }
-                            session.records = prefix.records;
-                            session.diagnostics = prefix.diagnostics.clone();
-                            session.prefixes.push(prefix.clone());
-                        }
-                        if old.prefixes.is_empty() || session.prefixes.len() != old.prefixes.len() {
-                            changed.push(SessionSuffix {
-                                native_session: id.clone(),
-                                from_sequence: session.records as u64,
-                            });
+                            verified = verified.advance(prefix, position);
                         }
                     }
+                    let SqliteResume {
+                        mut rows,
+                        mut verified,
+                        replacement,
+                    } = if old.is_some_and(|old| verified.prefixes.len() != old.prefixes.len()) {
+                        drop(rows);
+                        verified.restart(&mut ordered, id)?
+                    } else if old.is_some_and(|old| old.prefixes.is_empty()) {
+                        verified.replace(rows, id)
+                    } else {
+                        SqliteResume {
+                            rows,
+                            verified,
+                            replacement: None,
+                        }
+                    };
+                    changed.extend(replacement);
                     // Keep checkpoints every 64 rows and at the end, rather than
                     // accumulating one checkpoint for every small append.
                     const PREFIX_ROWS: usize = 64;
-                    if session
+                    if verified
                         .prefixes
                         .last()
                         .is_some_and(|p| p.rows % PREFIX_ROWS != 0)
                     {
-                        session.prefixes.pop();
+                        verified.prefixes.pop();
                     }
                     while let Some(row) = rows.next()? {
                         let mut payload = statement.query([row.get::<_, i64>(0)?])?;
                         let row = payload
                             .next()?
                             .context("OpenCode row missing from snapshot")?;
-                        hash_opencode_row(&mut hasher, row)?;
-                        count += 1;
+                        hash_opencode_row(&mut verified.position.hasher, row)?;
+                        verified.position.rows += 1;
                         match schema {
-                            OpencodeSchema::V1 => opencode_part(path, id, row, &mut session, emit)?,
+                            OpencodeSchema::V1 => {
+                                opencode_part(path, id, row, &mut verified.output, emit)?
+                            }
                             OpencodeSchema::V2 { .. } => {
-                                opencode_v2_message(path, id, row, &mut session, emit)?
+                                opencode_v2_message(path, id, row, &mut verified.output, emit)?
                             }
                         }
-                        if count % PREFIX_ROWS == 0 {
-                            session.save_prefix(count, &hasher);
+                        if verified.position.rows % PREFIX_ROWS == 0 {
+                            verified.save_prefix();
                         }
                     }
-                    if session.prefixes.last().is_none_or(|p| p.rows != count) {
-                        session.save_prefix(count, &hasher);
+                    if verified
+                        .prefixes
+                        .last()
+                        .is_none_or(|p| p.rows != verified.position.rows)
+                    {
+                        verified.save_prefix();
                     }
-                    session
+                    verified.capture(fingerprint.clone())
                 }
             };
             sessions.insert(id.clone(), session);
@@ -804,7 +875,7 @@ fn opencode_part(
     path: &Path,
     native_session: &str,
     row: &rusqlite::Row,
-    session: &mut SqliteSession,
+    session: &mut SqliteOutput,
     emit: &mut impl FnMut(&Record) -> Result<()>,
 ) -> Result<()> {
     let id: String = row.get(0)?;
@@ -836,7 +907,7 @@ fn opencode_part(
         .get::<_, Option<String>>(5)?
         .map(|p| session_id(Provider::Opencode, &p));
     record.is_subagent = record.parent_session_id.is_some();
-    record.sequence = session.records as u64;
+    record.sequence = session.records.0 as u64;
     if kind == EventType::ToolCall {
         let args = &value["state"]["input"];
         let tool = value["tool"].as_str().unwrap_or("tool");
@@ -874,17 +945,14 @@ fn opencode_part(
     let output = (kind == EventType::ToolCall && !output.is_empty()).then(|| output.join("\n"));
     record.structured_content = value;
     compose_message(&mut record)?;
-    emit(&record)?;
-    session.records += 1;
+    session.records.emit(&mut record, emit)?;
     if let Some(output) = output {
         record.event_type = crate::record::EventType::ToolOutput;
         record.event_id = digest(&["event", &record.session_id, &id, "tool_output"]);
         record.text = output;
         // The call record, one sequence number earlier, holds the native part.
         record.structured_content = Value::Null;
-        record.sequence += 1;
-        emit(&record)?;
-        session.records += 1;
+        session.records.emit(&mut record, emit)?;
     }
     Ok(())
 }
@@ -893,7 +961,7 @@ fn opencode_v2_message(
     path: &Path,
     native_session: &str,
     row: &rusqlite::Row,
-    session: &mut SqliteSession,
+    session: &mut SqliteOutput,
     sink: &mut impl FnMut(&Record) -> Result<()>,
 ) -> Result<()> {
     let id: String = row.get(0)?;
@@ -964,10 +1032,7 @@ fn opencode_v2_message(
         record.structured_content = structured;
         compose_message(&mut record)?;
         record.files = files;
-        record.sequence = session.records as u64;
-        sink(&record)?;
-        session.records += 1;
-        Ok(())
+        session.records.emit(&mut record, sink)
     };
     match kind.as_str() {
         "compaction" if value["status"] == "completed" => {
@@ -1129,11 +1194,11 @@ struct EmittedRecords(usize);
 impl EmittedRecords {
     fn emit(
         &mut self,
-        mut record: Record,
+        record: &mut Record,
         sink: &mut impl FnMut(&Record) -> Result<()>,
     ) -> Result<()> {
         record.sequence = self.0 as u64;
-        sink(&record)?;
+        sink(record)?;
         self.0 += 1;
         Ok(())
     }
@@ -1453,7 +1518,7 @@ fn jsonl(
             }
             compose_message(&mut record)?;
             record.files = files;
-            state.emitted_records.emit(record, sink)
+            state.emitted_records.emit(&mut record, sink)
         };
         let message_kind = message["type"].as_str().unwrap_or("");
         if compaction {
