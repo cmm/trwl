@@ -244,7 +244,7 @@ fn update_iteration(config: &Config) -> Result<Option<store::ConversationRevisio
 }
 
 /// One background embedding fill at a time. A fill runs when conversation inputs
-/// or configuration differs from the last successful fill. After a failure,
+/// or configuration differs from the last successful fill, or coverage is lost. After a failure,
 /// unchanged configuration waits for a backoff delay before the next attempt.
 #[derive(Default)]
 struct EmbeddingUpdater {
@@ -357,7 +357,14 @@ impl EmbeddingUpdater {
             selection.as_str(),
         ]);
         if self.completed.as_ref() == Some(&state) {
-            return ScheduleDecision::AlreadyCurrent;
+            match semantic::Planner::covered(config, &selection, semantic_version) {
+                Ok(true) => return ScheduleDecision::AlreadyCurrent,
+                Ok(false) => {}
+                Err(error) => {
+                    self.record_failure(configuration, &format!("{error:#}"));
+                    return ScheduleDecision::SelectionFailed;
+                }
+            }
         }
         ScheduleDecision::Start(Launch {
             state,
@@ -766,7 +773,7 @@ mod updater_tests {
                 &config,
                 &crate::store::ConversationRevision::from_storage("launch-input".into())
             ),
-            ScheduleDecision::AlreadyCurrent
+            ScheduleDecision::Start(_)
         ));
         assert!(matches!(
             updater.scheduling_decision(
@@ -787,7 +794,7 @@ mod updater_tests {
                 &config,
                 &crate::store::ConversationRevision::from_storage("launch-input".into())
             ),
-            ScheduleDecision::AlreadyCurrent
+            ScheduleDecision::Start(_)
         ));
         assert!(updater.failure.is_some());
     }
@@ -848,7 +855,7 @@ mod updater_tests {
                     &changed,
                     &crate::store::ConversationRevision::from_storage("retry-input".into())
                 ),
-                ScheduleDecision::AlreadyCurrent
+                ScheduleDecision::Start(_)
             ));
         }
     }

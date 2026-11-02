@@ -10,7 +10,7 @@
 //! Built-in chunks use the model's token budget; HTTP chunks use a character
 //! budget. SQLite stores one document-to-chunk mapping per selection and vectors
 //! keyed by chunk content. Cache hits do not load transcripts. Readers with different
-//! conversation inputs rebuild mappings from their pinned index. Selection includes the input
+//! conversation inputs plan locally from their pinned index. Selection includes the input
 //! version and executor/model; built-in selection includes a hash of the model
 //! files. File hashes are cached by path, inode, size, mtime and ctime.
 //! Unchanged chunks reuse vectors. Obsolete mappings and unreferenced vectors
@@ -35,7 +35,7 @@ use crate::{
     config::{Config, atomic_write, is_locked, lock},
     record::{ConversationMessage, Record, digest},
     report::{Coverage, SemanticStatus, State},
-    store::ReadIndex,
+    store::{self, ReadIndex},
 };
 use anyhow::{Context, Result, bail, ensure};
 use ort::{
@@ -555,9 +555,6 @@ fn document_plan<'a>(
         documents,
         materialization,
     };
-    if matches!(plan.materialization, Materialization::Materialized(_)) {
-        cache::publish_mapping(config, &plan)?;
-    }
     Ok(plan)
 }
 
@@ -1208,7 +1205,9 @@ fn fill(
     executor: &mut Option<Executor>,
 ) -> Result<Cache> {
     let _lock = lock(&config.directories.cache, "semantic.lock")?;
-    fill_locked(config, plan, tokenizer, executor, FillMode::Query)
+    let publish =
+        store::semantic_version(&config.directories.data)?.as_ref() == Some(&plan.version);
+    fill_locked(config, plan, tokenizer, executor, FillMode::Query, publish)
 }
 
 #[derive(PartialEq, Eq)]
@@ -1247,11 +1246,18 @@ fn fill_locked(
     tokenizer: &mut PlanningTokenizer,
     executor: &mut Option<Executor>,
     mode: FillMode,
+    publish: bool,
 ) -> Result<Cache> {
     let selection = plan.selection;
     let mut cache = cache::load(config, &selection.key)?;
+    if publish {
+        cache::publish_mapping(config, plan)?;
+    }
     if matches!(plan.vector_coverage(&cache), VectorCoverage::Complete) {
-        cache::mark_build_complete(config, plan)?;
+        if publish {
+            cache::repair_snapshot(config, plan, &cache)?;
+            cache::mark_build_complete(config, plan)?;
+        }
         return Ok(cache);
     }
     let inputs = plan.take_inputs(config, tokenizer)?;
@@ -1323,13 +1329,16 @@ fn fill_locked(
             Some(batch) => backend.submit(batch),
             None => FillProgress::Finished(backend),
         };
-        cache::publish_batch(config, plan, &completed)?;
+        if publish {
+            cache::publish_batch(config, plan, &completed)?;
+        }
         cache.vectors.extend(completed.vectors);
     };
-    // Readers of other commits can replace mappings and evict earlier batches
-    // during inference. Publish the full pinned snapshot before marking it done.
-    cache::repair_snapshot(config, plan, &cache)?;
-    cache::mark_build_complete(config, plan)?;
+    if publish {
+        // Retention may evict earlier batches while inference runs.
+        cache::repair_snapshot(config, plan, &cache)?;
+        cache::mark_build_complete(config, plan)?;
+    }
     Ok(cache)
 }
 
@@ -1349,6 +1358,14 @@ pub struct Planner {
 impl Planner {
     pub fn selection_key(config: &Config) -> Result<SelectionIdentity> {
         Ok(Selection::from_config(config)?.key)
+    }
+
+    pub fn covered(
+        config: &Config,
+        selection: &SelectionIdentity,
+        version: &store::ConversationRevision,
+    ) -> Result<bool> {
+        cache::covered(config, selection, version)
     }
 
     pub fn refresh(&mut self, config: &Config) -> Result<()> {
@@ -1376,7 +1393,14 @@ fn refresh_inner(config: &Config, rebuild: bool, tokenizer: &mut PlanningTokeniz
     }
     // Chunking and batch ordering share a vocabulary, loaded only on a cache miss.
     let mut plan = document_plan(config, &selection, &index, tokenizer)?;
-    fill_locked(config, &mut plan, tokenizer, &mut None, FillMode::Update)?;
+    fill_locked(
+        config,
+        &mut plan,
+        tokenizer,
+        &mut None,
+        FillMode::Update,
+        true,
+    )?;
     Ok(())
 }
 
@@ -1805,6 +1829,7 @@ pub(crate) mod tests {
         };
         let mut vocabulary = PlanningTokenizer::default();
         let mut plan = document_plan(&config, &selection, &index, &mut vocabulary).unwrap();
+        cache::publish_mapping(&config, &plan).unwrap();
         fs::remove_file(&tokenizer_path).unwrap();
         let inputs = ordered_inputs(plan.take_inputs(&config, &mut vocabulary).unwrap());
         let documents = &plan.documents;
@@ -1975,6 +2000,14 @@ pub(crate) mod tests {
             vec![digest(&["user:\nquestion\n\nassistant:\nanswer"])]
         );
         assert_eq!(index.record_decodes.get(), 2);
+        let initial = document_plan(
+            &config,
+            &selection,
+            &index,
+            &mut PlanningTokenizer::default(),
+        )
+        .unwrap();
+        cache::publish_mapping(&config, &initial).unwrap();
 
         assistant["message"]["content"][0]["thinking"] = json!("revised private reasoning");
         user["message"]["content"][0]["thinking"] = json!("revised selected user prefix");
@@ -2037,7 +2070,7 @@ pub(crate) mod tests {
         assert_eq!(pinned[0].keys, first[0].keys);
         assert_eq!(pinned[0].record.workspace, "/workspace/first");
         assert_eq!(pinned[0].record.occurred_at, "2026-01-01T00:00:00.000Z");
-        assert_eq!(irrelevant.record_decodes.get(), 2);
+        assert_eq!(irrelevant.record_decodes.get(), 0);
     }
 
     #[test]

@@ -609,6 +609,27 @@ pub(super) fn documents(
     with_database(config, selection, |db| db.documents(selection, version))
 }
 
+pub(super) fn covered(
+    config: &Config,
+    selection: &SelectionIdentity,
+    version: &ConversationRevision,
+) -> Result<bool> {
+    let cache = LockedCache::acquire(config)?;
+    let result = cache.run_connected(selection, None, |db| {
+        if !Mapping::read(&db.connection, selection)?.matches(version) {
+            return Ok(false);
+        }
+        let missing: bool = db.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chunks c WHERE c.selection=? AND NOT EXISTS \
+             (SELECT 1 FROM vectors v WHERE v.selection=c.selection AND v.key=c.key))",
+            [selection.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(!missing)
+    });
+    cache.reset_if_disk_full(result)
+}
+
 pub(super) fn prepared(
     config: &Config,
     selection: &SelectionIdentity,
@@ -700,8 +721,6 @@ pub(super) fn publish_batch(
     plan: &DocumentPlan<'_>,
     vectors: &Cache,
 ) -> Result<()> {
-    // A status check or another pinned reader may have replaced the map
-    // during inference. Otherwise only write the newly completed batch.
     with_database(config, &plan.selection.key, |db| {
         db.publish_snapshot(plan, vectors)?.into_result()
     })
