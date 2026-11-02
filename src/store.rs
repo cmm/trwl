@@ -42,12 +42,13 @@ use std::{
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 use tantivy::{
     DocAddress, DocSet, Index, ReloadPolicy, Searcher, SegmentReader, TERMINATED, TantivyDocument,
     Term,
     collector::{Collector, Count, DocSetCollector, SegmentCollector, TopDocs},
-    directory::{Directory, INDEX_WRITER_LOCK, META_LOCK},
+    directory::{Directory, INDEX_WRITER_LOCK, META_LOCK, error::LockError},
     doc,
     index::{SegmentComponent, SegmentId},
     query::{
@@ -63,6 +64,37 @@ struct Stamp(Vec<Option<FileStamp>>);
 
 const WRITER_THREADS: usize = 2;
 const WRITER_MEMORY_BYTES: usize = 64_000_000;
+
+// A forked child can briefly retain Tantivy's writer lock until it execs.
+fn retry_writer_lock<T, E>(
+    mut acquire: impl FnMut() -> std::result::Result<T, E>,
+    busy: impl Fn(&E) -> bool,
+) -> std::result::Result<T, E> {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match acquire() {
+            Err(error) if busy(&error) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            result => return result,
+        }
+    }
+}
+
+fn directory_lock_busy(error: &LockError) -> bool {
+    matches!(error, LockError::LockBusy)
+}
+
+fn writer_lock_busy(error: &tantivy::TantivyError) -> bool {
+    matches!(
+        error,
+        tantivy::TantivyError::LockFailure(LockError::LockBusy, _)
+    )
+}
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct FileStamp {
@@ -1928,7 +1960,10 @@ fn open_searcher_and_reclaim(index: &Index, path: &Path) -> Result<Searcher> {
         .searcher();
     // The reader checks segment compatibility before any files are removed.
     // Also collect forgotten files when no source has changed and no writer is needed.
-    let _writer_lock = index.directory().acquire_lock(&INDEX_WRITER_LOCK)?;
+    let _writer_lock = retry_writer_lock(
+        || index.directory().acquire_lock(&INDEX_WRITER_LOCK),
+        directory_lock_busy,
+    )?;
     // A reader of an older commit must finish opening its files before deletion.
     // Subsequent readers load the current commit, which this scan preserves.
     let meta_lock = index.directory().acquire_lock(&META_LOCK)?;
@@ -2332,7 +2367,10 @@ impl CompletedImport {
         } = self;
         // The budget is split across workers. Small per-worker buffers cause
         // frequent segment flushes and merges for content-heavy transcripts.
-        let mut writer = index.writer_with_num_threads(WRITER_THREADS, WRITER_MEMORY_BYTES)?;
+        let mut writer = retry_writer_lock(
+            || index.writer_with_num_threads(WRITER_THREADS, WRITER_MEMORY_BYTES),
+            writer_lock_busy,
+        )?;
         let mut removed_messages = Vec::new();
         let mut added_messages = Vec::new();
         for (key, change) in changes {
@@ -2473,6 +2511,148 @@ pub(crate) mod tests {
         record::EventType,
         test_support::{import, opencode_db, source},
     };
+
+    #[test]
+    fn inherited_writer_lock_is_retried_at_both_import_acquisitions() {
+        use std::os::unix::process::CommandExt;
+
+        // Isolate the intentional fork pause from writers in other parallel tests.
+        if std::env::var_os("TRWL_LOCK_PROBE_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "store::tests::inherited_writer_lock_is_retried_at_both_import_acquisitions",
+                ])
+                .env("TRWL_LOCK_PROBE_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        fn held_through_exec<T>(index: &Index, delay: Duration, run: impl FnOnce() -> T) -> T {
+            let writer = index
+                .writer_with_num_threads::<TantivyDocument>(1, 15_000_000)
+                .unwrap();
+            let mut ready = [0; 2];
+            let mut release = [0; 2];
+            unsafe {
+                assert_eq!(libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC), 0);
+                assert_eq!(libc::pipe2(release.as_mut_ptr(), libc::O_CLOEXEC), 0);
+            }
+            let child = std::thread::spawn(move || {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", "no_such_test"]);
+                unsafe {
+                    command.pre_exec(move || {
+                        let mut byte = [1u8];
+                        if libc::write(ready[1], byte.as_ptr().cast(), 1) != 1
+                            || libc::read(release[0], byte.as_mut_ptr().cast(), 1) != 1
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                command.spawn().unwrap().wait().unwrap()
+            });
+            let mut byte = [0u8];
+            unsafe {
+                assert_eq!(libc::read(ready[0], byte.as_mut_ptr().cast(), 1), 1);
+            }
+            writer.wait_merging_threads().unwrap();
+            assert!(matches!(
+                index.directory().acquire_lock(&INDEX_WRITER_LOCK),
+                Err(LockError::LockBusy)
+            ));
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                unsafe {
+                    assert_eq!(libc::write(release[1], [1u8].as_ptr().cast(), 1), 1);
+                }
+            });
+            let result = run();
+            releaser.join().unwrap();
+            assert!(child.join().unwrap().success());
+            unsafe {
+                for fd in ready.into_iter().chain(release) {
+                    libc::close(fd);
+                }
+            }
+            result
+        }
+
+        let (_dir, config, path) = crate::test_support::history_file("input.jsonl");
+        input(&path, "old history");
+        let source = source(Provider::Codex, &path);
+        update(&config, std::slice::from_ref(&source), false).unwrap();
+        let index_path = config.directories.data.join("index");
+        let index = Index::open_in_dir(&index_path).unwrap();
+        held_through_exec(&index, Duration::from_millis(150), || {
+            open_searcher_and_reclaim(&index, &index_path).unwrap();
+        });
+        let started = Instant::now();
+        held_through_exec(&index, Duration::from_millis(1300), || {
+            let error = open_searcher_and_reclaim(&index, &index_path)
+                .err()
+                .unwrap();
+            assert!(matches!(
+                error.downcast_ref::<LockError>(),
+                Some(LockError::LockBusy)
+            ));
+            assert!(started.elapsed() < Duration::from_secs(3));
+        });
+        assert_eq!(
+            records(&config.directories.data).unwrap()[0].text,
+            "old history"
+        );
+
+        for (delay, success) in [(150, true), (1300, false)] {
+            input(
+                &path,
+                if success {
+                    "new history"
+                } else {
+                    "third history"
+                },
+            );
+            let guard = lock(&config.directories.data, "update.lock").unwrap();
+            let staged = match stage_index(
+                &config,
+                std::slice::from_ref(&source),
+                &index_path,
+                false,
+                &mut |provider, path, checkpoint, emit| {
+                    providers::parse(provider, path, checkpoint, emit)
+                },
+            )
+            .unwrap()
+            {
+                StagedImport::Ready(staged) => staged,
+                StagedImport::Unchanged(_) => panic!("expected staged changes"),
+            };
+            let started = Instant::now();
+            held_through_exec(&index, Duration::from_millis(delay), || {
+                match staged.publish(&guard) {
+                    Ok(published) if success => {
+                        published.shutdown().unwrap();
+                    }
+                    Err(error) if !success => {
+                        assert!(matches!(
+                            error.downcast_ref::<tantivy::TantivyError>(),
+                            Some(tantivy::TantivyError::LockFailure(LockError::LockBusy, _))
+                        ));
+                        assert!(started.elapsed() < Duration::from_secs(3));
+                    }
+                    _ => panic!("unexpected publication result"),
+                }
+            });
+        }
+        assert_eq!(
+            records(&config.directories.data).unwrap()[0].text,
+            "new history"
+        );
+    }
 
     fn source_stats(report: &ImportReport) -> (usize, usize, usize) {
         match &report.sources[0] {
