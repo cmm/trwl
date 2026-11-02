@@ -519,9 +519,13 @@ struct SegmentWinners {
     id: tantivy::columnar::StrColumn,
     session: tantivy::columnar::StrColumn,
     sequence: tantivy::columnar::Column<u64>,
-    candidates: Candidates<u64>,
-    error: Option<anyhow::Error>,
+    state: SegmentWinnersState,
     chronological: bool,
+}
+
+enum SegmentWinnersState {
+    Collecting(Candidates<u64>),
+    Failed(anyhow::Error),
 }
 
 fn string(column: &tantivy::columnar::StrColumn, doc: u32) -> Result<String> {
@@ -606,8 +610,7 @@ impl Collector for Winners {
             id: field("id")?,
             session: field("session")?,
             sequence: reader.fast_fields().u64("sequence")?,
-            candidates: Candidates::new(self.mode),
-            error: None,
+            state: SegmentWinnersState::Collecting(Candidates::new(self.mode)),
             chronological: self.chronological,
         })
     }
@@ -628,22 +631,27 @@ impl Collector for Winners {
 impl SegmentCollector for SegmentWinners {
     type Fruit = Result<Vec<Candidate>>;
     fn collect(&mut self, doc: u32, score: f32) {
-        if self.error.is_some() {
+        if matches!(self.state, SegmentWinnersState::Failed(_)) {
             return;
         }
         let row = self.candidate(doc, score);
         match row {
-            Err(error) => self.error = Some(error),
-            Ok(row) => self.candidates.push(row),
+            Err(error) => self.state = SegmentWinnersState::Failed(error),
+            Ok(row) => {
+                if let SegmentWinnersState::Collecting(candidates) = &mut self.state {
+                    candidates.push(row);
+                }
+            }
         }
     }
     fn harvest(self) -> Result<Vec<Candidate>> {
-        if let Some(error) = self.error {
-            return Err(error);
-        }
+        let candidates = match self.state {
+            SegmentWinnersState::Collecting(candidates) => candidates,
+            SegmentWinnersState::Failed(error) => return Err(error),
+        };
         // Dictionary ordinals preserve string order within this segment. Decode
         // only its winners before comparing values from different dictionaries.
-        self.candidates
+        candidates
             .finish()
             .into_iter()
             .map(|row| {
