@@ -491,11 +491,6 @@ enum Materialization {
     Materialized(ChunkInputs),
 }
 
-enum VectorCoverage {
-    Complete,
-    Missing,
-}
-
 struct DocumentPlan<'a> {
     selection: &'a Selection,
     index: &'a ReadIndex,
@@ -601,19 +596,6 @@ impl<'query> Scores<'query> {
 }
 
 impl DocumentPlan<'_> {
-    fn vector_coverage(&self, cache: &Cache) -> VectorCoverage {
-        if self
-            .documents
-            .iter()
-            .flat_map(|document| &document.keys)
-            .all(|key| cache.vectors.contains_key(key))
-        {
-            VectorCoverage::Complete
-        } else {
-            VectorCoverage::Missing
-        }
-    }
-
     fn take_inputs(
         &mut self,
         config: &Config,
@@ -1299,7 +1281,8 @@ fn fill(
     plan: &mut DocumentPlan<'_>,
     tokenizer: &mut PlanningTokenizer,
     executor: &mut Option<Executor>,
-) -> Result<Cache> {
+    target: &mut FillTarget<'_>,
+) -> Result<()> {
     let _lock = lock(&config.directories.cache, "semantic.lock")?;
     // A query can wait behind a newer fill. Its pinned inputs still need
     // embeddings, but must not replace the newer persistent snapshot.
@@ -1309,14 +1292,7 @@ fn fill(
         } else {
             Publication::Local
         };
-    fill_locked(
-        config,
-        plan,
-        tokenizer,
-        executor,
-        FillMode::Query,
-        publication,
-    )
+    fill_locked(config, plan, tokenizer, executor, target, publication)
 }
 
 #[derive(PartialEq, Eq)]
@@ -1325,10 +1301,28 @@ enum Publication {
     Local,
 }
 
-#[derive(PartialEq, Eq)]
-enum FillMode {
-    Query,
-    Update,
+enum FillTarget<'query> {
+    Query(Scores<'query>),
+    Update(KeyCoverage),
+}
+
+impl FillTarget<'_> {
+    fn coverage(&self) -> &KeyCoverage {
+        match self {
+            Self::Query(scores) => &scores.coverage,
+            Self::Update(coverage) => coverage,
+        }
+    }
+
+    fn observe(&mut self, key: &str, vector: &[f32]) -> Result<()> {
+        match self {
+            Self::Query(scores) => scores.observe(key, vector),
+            Self::Update(coverage) => {
+                coverage.observe(key);
+                Ok(())
+            }
+        }
+    }
 }
 
 enum FillBackend {
@@ -1360,27 +1354,37 @@ fn fill_locked(
     plan: &mut DocumentPlan<'_>,
     tokenizer: &mut PlanningTokenizer,
     executor: &mut Option<Executor>,
-    mode: FillMode,
+    target: &mut FillTarget<'_>,
     publication: Publication,
-) -> Result<Cache> {
+) -> Result<()> {
     let selection = plan.selection;
     if publication == Publication::Current {
         index::publish_mapping(config, plan)?;
     }
-    let mut cache = index::load(config, &selection.key)?;
-    if matches!(plan.vector_coverage(&cache), VectorCoverage::Complete) {
+    match target {
+        FillTarget::Query(scores) => index::scan_vectors(config, &selection.key, |key, vector| {
+            scores.observe(key, vector)
+        })?,
+        FillTarget::Update(coverage) => index::scan_keys(config, &selection.key, |key| {
+            coverage.observe(key);
+            Ok(())
+        })?,
+    }
+    if target.coverage().complete() {
         if publication == Publication::Current {
             index::mark_build_complete(config, plan)?;
         }
-        return Ok(cache);
+        return Ok(());
     }
     let inputs = plan.take_inputs(config, tokenizer)?;
     let missing = inputs
         .into_iter()
-        .filter(|(key, _)| !cache.vectors.contains_key(key))
+        .filter(|(key, _)| {
+            target.coverage().keys.contains_key(key) && !target.coverage().available(key)
+        })
         .collect();
     let missing = ordered_inputs(missing);
-    let worker = if mode == FillMode::Update
+    let worker = if matches!(target, FillTarget::Update(_))
         && selection.directory.is_some()
         && (index::build_history(config, &selection.key)?.needs_full_build()
             || heavy_incremental(&missing))
@@ -1443,19 +1447,21 @@ fn fill_locked(
             Some(batch) => backend.submit(batch),
             None => FillProgress::Finished(backend),
         };
+        for (key, vector) in &completed.vectors {
+            target.observe(key, vector)?;
+        }
         if publication == Publication::Current {
             index::publish_batch(config, plan, &completed)?;
         }
-        cache.vectors.extend(completed.vectors);
     };
     ensure!(
-        matches!(plan.vector_coverage(&cache), VectorCoverage::Complete),
+        target.coverage().complete(),
         "semantic fill is missing required embeddings"
     );
     if publication == Publication::Current {
         index::mark_build_complete(config, plan)?;
     }
-    Ok(cache)
+    Ok(())
 }
 
 pub fn refresh(config: &Config) -> Result<()> {
@@ -1509,12 +1515,13 @@ fn refresh_inner(config: &Config, rebuild: bool, tokenizer: &mut PlanningTokeniz
     }
     // Chunking and batch ordering share a vocabulary, loaded only on a cache miss.
     let mut plan = document_plan(config, &selection, &index, tokenizer)?;
+    let mut target = FillTarget::Update(KeyCoverage::new(&plan.documents));
     fill_locked(
         config,
         &mut plan,
         tokenizer,
         &mut None,
-        FillMode::Update,
+        &mut target,
         Publication::Current,
     )?;
     Ok(())
@@ -1649,17 +1656,23 @@ pub fn search(
         PlanningTokenizer::default()
     };
     let mut plan = document_plan(config, &selection, index, &mut tokenizer)?;
-    let mut scores = Scores::new(&plan.documents, &queries);
+    let mut target = FillTarget::Query(Scores::new(&plan.documents, &queries));
     if fill_missing {
-        let cache = fill(config, &mut plan, &mut tokenizer, &mut executor)?;
-        for (key, vector) in &cache.vectors {
-            scores.observe(key, vector)?;
-        }
+        fill(
+            config,
+            &mut plan,
+            &mut tokenizer,
+            &mut executor,
+            &mut target,
+        )?;
     } else {
         index::scan_vectors(config, &selection.key, |key, vector| {
-            scores.observe(key, vector)
+            target.observe(key, vector)
         })?;
     }
+    let FillTarget::Query(scores) = target else {
+        unreachable!()
+    };
     scores.finish(&plan.documents)
 }
 
@@ -1786,12 +1799,13 @@ pub(crate) mod tests {
                 &mut PlanningTokenizer::default(),
             )
             .unwrap();
+            let mut target = FillTarget::Update(KeyCoverage::new(&plan.documents));
             fill_locked(
                 &config,
                 &mut plan,
                 &mut PlanningTokenizer::default(),
                 &mut None,
-                FillMode::Update,
+                &mut target,
                 Publication::Current,
             )
             .unwrap();
@@ -1822,8 +1836,13 @@ pub(crate) mod tests {
                     .iter()
                     .all(|(_, record)| !record.text.contains("edited"))
             );
-            let disk = index::load(&config, &selected.key).unwrap();
-            assert_eq!(disk.vectors.len(), 4);
+            let mut count = 0;
+            index::scan_keys(&config, &selected.key, |_| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(count, 4);
             assert!(Planner::covered(&config, &selected.key, &current.version()).unwrap());
             let complete: bool = observer
                 .query_row("SELECT complete FROM builds", [], |r| r.get(0))
@@ -2093,14 +2112,16 @@ pub(crate) mod tests {
             vectors: [(documents[0].keys[0].clone(), vec![1.0, 0.0])].into(),
         };
         index::publish_batch(&config, &plan, &vectors).unwrap();
-        let cached = fill(
+        let mut target = FillTarget::Update(KeyCoverage::new(&cached.documents));
+        fill(
             &config,
             &mut cached,
             &mut PlanningTokenizer::default(),
             &mut None,
+            &mut target,
         )
         .unwrap();
-        assert_eq!(cached.vectors, vectors.vectors);
+        assert!(target.coverage().complete());
 
         // A different commit map forces planning, but unchanged composed input
         // is reusable even by a fresh planner with no tokenizer file available.

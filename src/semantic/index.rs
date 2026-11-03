@@ -265,30 +265,6 @@ impl Database {
         Ok(self.connection.transaction()?)
     }
 
-    fn vectors(&mut self, selection: &SelectionIdentity) -> Result<Cache> {
-        let tx = &self.connection;
-        let mut vectors = HashMap::new();
-        {
-            let mut query = tx.prepare("SELECT key,vector FROM vectors WHERE selection=?")?;
-            let mut rows = query.query([selection.as_str()])?;
-            while let Some(row) = rows.next()? {
-                let bytes: Vec<u8> = row.get(1)?;
-                ensure!(
-                    bytes.len().is_multiple_of(4),
-                    "invalid semantic index embedding length"
-                );
-                let vector = bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from_le_bytes(*b))
-                    .collect();
-                vectors.insert(row.get(0)?, vector);
-            }
-        }
-        Ok(Cache { vectors })
-    }
-
     fn scan_vectors(
         &self,
         selection: &SelectionIdentity,
@@ -644,10 +620,6 @@ fn read_snapshot<T>(path: &Path, operation: impl FnOnce(&mut Database) -> Result
     .with_context(|| format!("reading semantic index {}", path.display()))
 }
 
-pub(super) fn load(config: &Config, selection: &SelectionIdentity) -> Result<Cache> {
-    with_read(config, selection, |db| db.vectors(selection))
-}
-
 pub(super) fn has_vectors(config: &Config, selection: &SelectionIdentity) -> Result<bool> {
     with_read(config, selection, |db| {
         Ok(db.connection.query_row(
@@ -870,6 +842,15 @@ pub(super) fn publish_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn load(config: &Config, selection: &SelectionIdentity) -> Result<Cache> {
+        let mut vectors = HashMap::new();
+        scan_vectors(config, selection, |key, vector| {
+            vectors.insert(key.to_owned(), vector.to_vec());
+            Ok(())
+        })?;
+        Ok(Cache { vectors })
+    }
     use crate::record::{EventType, Provider, Record};
 
     fn selection(value: &str) -> SelectionIdentity {
@@ -1258,7 +1239,12 @@ mod tests {
                 .keys,
             ["next"]
         );
-        let vectors = db.vectors(&selection("model")).unwrap().vectors;
+        let mut vectors = HashMap::new();
+        db.scan_vectors(&selection("model"), |key, vector| {
+            vectors.insert(key.to_owned(), vector.to_vec());
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(vectors.len(), 1);
         assert!(vectors.contains_key("next"));
     }
