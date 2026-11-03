@@ -48,7 +48,7 @@ repository fixtures. The trwl executable discovers roots without invoking Git.
 | --- | --- |
 | `xdg-storage` | Independent XDG directories and home defaults; runtime permissions and fallback, cache regeneration from imported history, data isolation, and daemon coordination across runtime directories |
 | `hybrid-grouping` | Controlled HTTP vectors and 120 strong matches in one session; grouped retrieval still returns the ten other matching sessions; different event anchors reinforce session scores but remain separate in event mode |
-| `semantic-cache` | Controlled HTTP vectors; unchanged fills reuse embeddings, inference holds no SQLite transaction, eviction reports partial/unavailable coverage without losing history, and waited queries refill |
+| `semantic-cache` | Controlled HTTP vectors; unchanged fills reuse embeddings, inference holds no SQLite transaction, missing vectors report partial/unavailable coverage without losing history, and waited queries refill |
 | `benchmark-restore` | Prepared benchmark history survives restoration and its next import reports unchanged sources |
 | `discovery` | Setup discovers OpenCode, Codex, Pi, Claude Code and Copilot CLI histories; repeating setup preserves content and references |
 | `retrieval` | OpenCode SQLite messages, tool input/output, parent/child sessions, windows, list, locate, text and Markdown transcripts |

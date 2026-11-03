@@ -4,7 +4,7 @@
 
 The first fill of a model selection embeds all history — whether
 started by `semantic rebuild`, `setup --wait` or the background
-updater, including after a model change or cache eviction. An
+updater, including after a model change. An
 interrupted build resumes its completed batches when repeated.
 `import --full` reparses history; it does not request a rebuild.
 
