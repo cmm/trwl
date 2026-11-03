@@ -312,7 +312,8 @@ impl Database {
                 let event: String = row.get(0)?;
                 let bytes: Vec<u8> = row.get(1)?;
                 documents.push(EmbeddingDocument {
-                    record: rmp_serde::from_slice(&bytes).context("invalid cached document")?,
+                    record: rmp_serde::from_slice(&bytes)
+                        .context("invalid semantic index document")?,
                     keys: keys
                         .query_map(params![selection, event], |r| r.get(0))?
                         .collect::<rusqlite::Result<Vec<_>>>()?,
@@ -419,19 +420,7 @@ impl Database {
                 )?;
             }
         }
-        {
-            // Keys identify model and input content; a stored vector is reusable.
-            let mut insert = tx.prepare("INSERT OR IGNORE INTO vectors VALUES (?,?,?)")?;
-            let mut exists = tx.prepare("SELECT 1 FROM vectors WHERE selection=? AND key=?")?;
-            for (key, vector) in &vectors.vectors {
-                // Immutable content keys need no rewrite or serialization on a hit.
-                if exists.exists(params![selection, key])? {
-                    continue;
-                }
-                let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
-                insert.execute(params![selection, key, bytes])?;
-            }
-        }
+        Self::insert_vectors(&tx, selection, vectors)?;
         // A vector-only legacy cache has no mapping yet. Its first mapping
         // publication removes unused keys just like any subsequent replacement.
         if !version.is_empty() {
@@ -439,6 +428,21 @@ impl Database {
                 (SELECT 1 FROM chunks WHERE chunks.selection=vectors.selection AND chunks.key=vectors.key)", [selection])?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    fn insert_vectors(tx: &Transaction<'_>, selection: &str, vectors: &Cache) -> Result<()> {
+        // Keys identify model and input content; a stored vector is reusable.
+        let mut insert = tx.prepare("INSERT OR IGNORE INTO vectors VALUES (?,?,?)")?;
+        let mut exists = tx.prepare("SELECT 1 FROM vectors WHERE selection=? AND key=?")?;
+        for (key, vector) in &vectors.vectors {
+            // Immutable content keys need no rewrite or serialization on a hit.
+            if exists.exists(params![selection, key])? {
+                continue;
+            }
+            let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+            insert.execute(params![selection, key, bytes])?;
+        }
         Ok(())
     }
 }
@@ -723,7 +727,7 @@ pub(super) fn build_history(
 
 pub(super) fn mark_build_complete(config: &Config, plan: &DocumentPlan<'_>) -> Result<()> {
     let selection = &plan.selection.key;
-    with_database(config, selection, |db| {
+    with_writer(config, |db, _| {
         let tx = db.begin_write()?;
         ensure!(
             Mapping::read(&tx, selection)?.matches(&plan.version),
@@ -778,27 +782,22 @@ pub(super) fn publish_batch(
     plan: &DocumentPlan<'_>,
     vectors: &Cache,
 ) -> Result<()> {
-    with_database(config, &plan.selection.key, |db| {
+    with_writer(config, |db, _| {
         let tx = db.begin_write()?;
         let selection = plan.selection.key.as_str();
         ensure!(
             Mapping::read(&tx, &plan.selection.key)?.matches(&plan.version),
             "semantic index mapping changed before batch publication"
         );
-        let mut insert = tx.prepare("INSERT OR IGNORE INTO vectors VALUES (?,?,?)")?;
-        let mut exists = tx.prepare("SELECT 1 FROM vectors WHERE selection=? AND key=?")?;
         let mut required = tx.prepare("SELECT 1 FROM chunks WHERE selection=? AND key=?")?;
-        for (key, vector) in &vectors.vectors {
+        for key in vectors.vectors.keys() {
             ensure!(
                 required.exists(params![selection, key])?,
                 "embedding {key} is not in the published semantic mapping"
             );
-            if !exists.exists(params![selection, key])? {
-                let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
-                insert.execute(params![selection, key, bytes])?;
-            }
         }
-        drop((insert, exists, required));
+        drop(required);
+        Database::insert_vectors(&tx, selection, vectors)?;
         tx.commit()?;
         Ok(())
     })
@@ -818,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_an_initialized_cache_does_not_write_it() {
+    fn opening_an_initialized_index_does_not_write_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DATABASE);
         drop(Database::open(&path).unwrap());
@@ -986,7 +985,28 @@ mod tests {
         let (documents, vectors) = fixture("first", 2);
         let snapshot = SnapshotFixture::new(&config, "first");
         let plan = snapshot.plan(documents);
+        let directory = config.directories.cache.join("semantic");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("documents-model.msgpack"),
+            rmp_serde::to_vec_named(&DocumentCache {
+                version: plan.version.clone(),
+                documents: fixture("first", 2).0,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("model.msgpack"),
+            rmp_serde::to_vec(&vectors).unwrap(),
+        )
+        .unwrap();
+        assert!(mark_build_complete(&config, &plan).is_err());
         assert!(publish_batch(&config, &plan, &vectors).is_err());
+        assert!(directory.join("model.msgpack").exists());
+        assert!(directory.join("documents-model.msgpack").exists());
+        fs::remove_file(directory.join("model.msgpack")).unwrap();
+        fs::remove_file(directory.join("documents-model.msgpack")).unwrap();
         publish_mapping(&config, &plan).unwrap();
         assert!(mark_build_complete(&config, &plan).is_err());
         assert!(matches!(

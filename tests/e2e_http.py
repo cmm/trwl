@@ -626,7 +626,7 @@ def semantic_cache(case):
             "hybrid snippets exposed thinking",
         )
     case.check(
-        "cache eviction reports partial/unavailable coverage and preserves history; waited fill recovers"
+        "missing vectors report partial/unavailable coverage and preserve history; waited fill recovers"
     )
     case.check("cached fills reuse vectors and inference holds no SQLite transaction")
 
