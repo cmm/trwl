@@ -3522,7 +3522,7 @@ pub(crate) mod tests {
         hybrid_fallback_before_record_decoding(
             true,
             Some(b"invalid cache"),
-            "invalid semantic cache",
+            "invalid legacy semantic vectors",
         );
     }
 
