@@ -1,31 +1,22 @@
 //! SQLite storage for vectors, prepared inputs, document records and chunk mappings.
 //!
 //! Each executor/model/input-version selection keeps one index-commit mapping.
-//! Replacing it removes unreferenced vectors. Retention is limited to four
-//! selections and 128 MiB of encoded row data plus per-row overhead. The least
-//! recently used selections are evicted first; a selection larger than the budget fails
-//! publication. Access times have daily resolution and expire after 30 days.
-//! Maintenance runs on every cache access, including hits and status checks.
+//! Replacing it removes unreferenced vectors; other selections remain intact.
 //!
-//! The database has a 256 MiB page limit. FULL auto-vacuum reclaims freed pages;
-//! checkpoints truncate the WAL before and after writes. Disabling page spilling
-//! limits one transaction's WAL to less than 258 MiB. A pinned external reader
-//! blocks subsequent writes rather than allowing WAL accumulation.
+//! Read-only operation snapshots permit WAL writers to commit during a scan.
+//! SQLite manages checkpointing; checkpoint completion is not publication.
 //!
-//! Operations hold semantic-cache.lock and close their connections before
-//! returning; callers never wait for inference with a transaction open. On
-//! SQLITE_FULL the database can be removed without leaving a trwl reader on an
-//! unlinked file.
-//! History remains in Tantivy, outside this cache.
+//! Writers hold semantic-cache.lock. All operations close their connections
+//! before returning; callers never wait for inference with a transaction open.
+//! Write failures preserve earlier commits. History remains in Tantivy.
 //!
-//! MessagePack migration reads the selected vectors and document mapping into
-//! memory, then removes file caches and abandoned temporary files before SQLite
-//! publication. Cleanup does not need space for another complete cache file.
+//! MessagePack migration imports only an absent SQL selection, atomically.
+//! Its selected source files are removed only after commit.
 use super::{Cache, DocumentCache, DocumentPlan, EmbeddingDocument, SelectionIdentity};
 use crate::config::{Config, lock};
 use crate::store::ConversationRevision;
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use std::{
     collections::HashMap,
     fs,
@@ -34,47 +25,62 @@ use std::{
 };
 
 const DATABASE: &str = "cache.sqlite3";
-const MAX_BYTES: i64 = 128 * 1024 * 1024;
-const MAX_PAGES: i64 = 65536; // 256 MiB, including SQLite indexes and free pages.
-const MAX_SELECTIONS: i64 = 4;
-const MAX_AGE: i64 = 30 * 24 * 60 * 60;
+
+const SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS selections (
+        selection TEXT PRIMARY KEY, version TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS documents (
+        selection TEXT NOT NULL REFERENCES selections ON DELETE CASCADE,
+        event TEXT NOT NULL, record BLOB NOT NULL, PRIMARY KEY(selection,event));
+    CREATE TABLE IF NOT EXISTS chunks (
+        selection TEXT NOT NULL, event TEXT NOT NULL,
+        ordinal INTEGER NOT NULL, key TEXT NOT NULL,
+        PRIMARY KEY(selection,event,ordinal),
+        FOREIGN KEY(selection,event) REFERENCES documents ON DELETE CASCADE);
+    CREATE INDEX IF NOT EXISTS chunk_keys ON chunks(selection,key);
+    CREATE TABLE IF NOT EXISTS vectors (
+        selection TEXT NOT NULL REFERENCES selections ON DELETE CASCADE,
+        key TEXT NOT NULL, vector BLOB NOT NULL, PRIMARY KEY(selection,key));
+    CREATE TABLE IF NOT EXISTS builds (
+        selection TEXT PRIMARY KEY REFERENCES selections ON DELETE CASCADE,
+        complete INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS prepared (
+        selection TEXT NOT NULL, event TEXT NOT NULL,
+        input TEXT NOT NULL, chunks BLOB NOT NULL, PRIMARY KEY(selection,event),
+        FOREIGN KEY(selection,event) REFERENCES documents ON DELETE CASCADE);";
 
 struct Database {
     connection: Connection,
-    budget: i64,
 }
 
-enum Eviction<'a> {
-    AnySelection,
-    ProtectPublication(&'a SelectionIdentity),
+#[derive(PartialEq, Eq)]
+struct Column {
+    name: String,
+    kind: String,
+    required: bool,
+    default: Option<String>,
+    primary_key: i64,
+}
+
+#[derive(PartialEq, Eq)]
+struct ForeignKey {
+    table: String,
+    from: String,
+    to: Option<String>,
+    on_update: String,
+    on_delete: String,
+    matching: String,
 }
 
 struct LegacyMigration {
     vectors: Cache,
     documents: Option<DocumentCache>,
+    sources: Vec<PathBuf>,
 }
 
-struct LockedCache {
+struct LockedIndex {
     directory: PathBuf,
     _lock: fs::File,
-}
-
-// A successful commit does not imply that its WAL could be checkpointed.
-// Keep that outcome separate from errors before commit, while returning the
-// original checkpoint error to callers that require the whole write to finish.
-#[must_use]
-enum CommitOutcome {
-    Checkpointed,
-    CommittedButNotCheckpointed(anyhow::Error),
-}
-
-impl CommitOutcome {
-    fn into_result(self) -> Result<()> {
-        match self {
-            Self::Checkpointed => Ok(()),
-            Self::CommittedButNotCheckpointed(error) => Err(error),
-        }
-    }
 }
 
 enum Mapping {
@@ -123,140 +129,144 @@ impl BuildHistory {
 }
 
 impl Database {
-    fn open(path: &Path, budget: i64, pages: i64) -> Result<Self> {
-        let connection = Connection::open(path)?;
+    fn open(path: &Path) -> Result<Self> {
+        let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        connection.pragma_update(None, "page_size", 4096)?;
-        let auto_vacuum: i64 = connection.pragma_query_value(None, "auto_vacuum", |r| r.get(0))?;
-        if auto_vacuum != 1 {
-            // Setting FULL even when it is already enabled writes the database
-            // header and forces a durable commit on every cache open.
-            connection.pragma_update(None, "auto_vacuum", "FULL")?;
-        }
+        Self::validate_version(&connection)?;
         connection.execute_batch(
             "PRAGMA foreign_keys=ON;
              PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=FULL;
-             PRAGMA cache_spill=OFF;
-             PRAGMA journal_size_limit=0;",
+             PRAGMA synchronous=FULL;",
         )?;
-        connection.pragma_update(None, "max_page_count", pages)?;
-        let mut db = Self { connection, budget };
-        // No spilling: a transaction writes each dirty page once, bounding its
-        // WAL to max_page_count frames (page bytes plus 24 bytes per frame).
-        let schema = db.begin_write()?;
-        schema.execute_batch(
-            "CREATE TABLE IF NOT EXISTS selections (
-                 selection TEXT PRIMARY KEY, version TEXT NOT NULL,
-                 touched INTEGER NOT NULL, bytes INTEGER NOT NULL DEFAULT 0);
-             CREATE TABLE IF NOT EXISTS documents (
-                 selection TEXT NOT NULL REFERENCES selections ON DELETE CASCADE,
-                 event TEXT NOT NULL, record BLOB NOT NULL,
-                 PRIMARY KEY(selection,event));
-             CREATE TABLE IF NOT EXISTS chunks (
-                 selection TEXT NOT NULL, event TEXT NOT NULL,
-                 ordinal INTEGER NOT NULL, key TEXT NOT NULL,
-                 PRIMARY KEY(selection,event,ordinal),
-                 FOREIGN KEY(selection,event) REFERENCES documents ON DELETE CASCADE);
-             CREATE INDEX IF NOT EXISTS chunk_keys ON chunks(selection,key);
-             CREATE TABLE IF NOT EXISTS vectors (
-                 selection TEXT NOT NULL REFERENCES selections ON DELETE CASCADE,
-                 key TEXT NOT NULL, vector BLOB NOT NULL,
-                 PRIMARY KEY(selection,key));
-             CREATE TABLE IF NOT EXISTS builds (
-                 selection TEXT PRIMARY KEY REFERENCES selections ON DELETE CASCADE,
-                 complete INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS prepared (
-                 selection TEXT NOT NULL, event TEXT NOT NULL,
-                 input TEXT NOT NULL, chunks BLOB NOT NULL,
-                 PRIMARY KEY(selection,event),
-                 FOREIGN KEY(selection,event) REFERENCES documents ON DELETE CASCADE);",
-        )?;
-        schema.commit()?;
-        db.checkpoint_committed().into_result()?;
-        Ok(db)
+        // The caller holds the application writer lock. Recheck here, rather
+        // than trusting the pre-lock reader's initialization decision.
+        if Self::validate_version(&connection)? == 0 {
+            let tx = connection.transaction()?;
+            Self::validate_schema(&tx, true)?;
+            let columns = Self::columns(&tx, "selections")?;
+            if columns.iter().any(|column| column.name == "touched") {
+                tx.execute_batch(
+                    "ALTER TABLE selections DROP COLUMN touched;
+                                  ALTER TABLE selections DROP COLUMN bytes;",
+                )?;
+            }
+            tx.execute_batch(SCHEMA)?;
+            tx.pragma_update(None, "user_version", 1)?;
+            tx.commit()?;
+        } else {
+            Self::validate_schema(&connection, false)?;
+        }
+        Ok(Self { connection })
+    }
+
+    fn validate_version(connection: &Connection) -> Result<i64> {
+        let version = connection.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        ensure!(
+            matches!(version, 0 | 1),
+            "unsupported semantic index schema version {version}"
+        );
+        Ok(version)
+    }
+
+    fn columns(connection: &Connection, table: &str) -> Result<Vec<Column>> {
+        Ok(connection
+            .prepare(&format!("PRAGMA table_info({table})"))?
+            .query_map([], |r| {
+                Ok(Column {
+                    name: r.get(1)?,
+                    kind: r.get(2)?,
+                    required: r.get(3)?,
+                    default: r.get(4)?,
+                    primary_key: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn validate_schema(connection: &Connection, upgrading: bool) -> Result<()> {
+        // Derive expected columns and foreign keys from the one current-schema
+        // declaration. Never interpret an unknown layout as an empty index.
+        let expected = Connection::open_in_memory()?;
+        expected.execute_batch(SCHEMA)?;
+        let mut recognized = false;
+        for table in [
+            "selections",
+            "documents",
+            "chunks",
+            "vectors",
+            "builds",
+            "prepared",
+        ] {
+            let mut actual = Self::columns(connection, table)?;
+            if actual.is_empty() && upgrading {
+                continue;
+            }
+            recognized = true;
+            if upgrading && table == "selections" {
+                let old = actual.split_off(actual.len().min(2));
+                ensure!(
+                    old == vec![
+                        Column {
+                            name: "touched".into(),
+                            kind: "INTEGER".into(),
+                            required: true,
+                            default: None,
+                            primary_key: 0
+                        },
+                        Column {
+                            name: "bytes".into(),
+                            kind: "INTEGER".into(),
+                            required: true,
+                            default: Some("0".into()),
+                            primary_key: 0
+                        },
+                    ],
+                    "unrecognized semantic index schema: {table}"
+                );
+            }
+            ensure!(
+                actual == Self::columns(&expected, table)?,
+                "unrecognized semantic index schema: {table}"
+            );
+            let foreign_keys = |db: &Connection| -> Result<Vec<ForeignKey>> {
+                Ok(db
+                    .prepare(&format!("PRAGMA foreign_key_list({table})"))?
+                    .query_map([], |r| {
+                        Ok(ForeignKey {
+                            table: r.get(2)?,
+                            from: r.get(3)?,
+                            to: r.get(4)?,
+                            on_update: r.get(5)?,
+                            on_delete: r.get(6)?,
+                            matching: r.get(7)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<_>>()?)
+            };
+            ensure!(
+                foreign_keys(connection)? == foreign_keys(&expected)?,
+                "unrecognized semantic index foreign keys: {table}"
+            );
+        }
+        if upgrading && !recognized {
+            let tables: i64 = connection.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], |r| r.get(0))?;
+            ensure!(tables == 0, "unrecognized semantic index schema");
+        }
+        Ok(())
+    }
+
+    fn read(path: &Path) -> Result<Self> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self { connection })
     }
 
     fn begin_write(&mut self) -> Result<Transaction<'_>> {
-        // Do not append another transaction behind a pinned WAL. With trwl's
-        // short, serialized snapshots this only fails for an external reader.
-        self.checkpoint()?;
         Ok(self.connection.transaction()?)
     }
 
-    fn checkpoint(&self) -> Result<()> {
-        let busy: i64 = self
-            .connection
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
-        ensure!(
-            busy == 0,
-            "semantic cache has a pinned reader; retry after it closes"
-        );
-        Ok(())
-    }
-
-    fn checkpoint_committed(&self) -> CommitOutcome {
-        match self.checkpoint() {
-            Ok(()) => CommitOutcome::Checkpointed,
-            Err(error) => CommitOutcome::CommittedButNotCheckpointed(error),
-        }
-    }
-
-    fn expire_and_evict(&mut self) -> Result<CommitOutcome> {
-        let budget = self.budget;
-        let tx = self.begin_write()?;
-        tx.execute(
-            "DELETE FROM selections WHERE touched < unixepoch() - ?",
-            [MAX_AGE],
-        )?;
-        Self::evict_to_limits(&tx, budget, Eviction::AnySelection)?;
-        tx.commit()?;
-        // FULL auto-vacuum truncates freed tail pages at commit; checkpointing
-        // transfers that truncation to the database and removes the WAL bytes.
-        Ok(self.checkpoint_committed())
-    }
-
-    fn touch(&self, selection: &SelectionIdentity) -> Result<CommitOutcome> {
-        // Avoid a metadata write for every query.
-        self.connection.execute(
-            "UPDATE selections SET touched=unixepoch() WHERE selection=? AND touched < unixepoch()-86400",
-            [selection.as_str()],
-        )?;
-        Ok(self.checkpoint_committed())
-    }
-
-    fn evict_to_limits(tx: &Connection, budget: i64, eviction: Eviction<'_>) -> Result<()> {
-        let keep = match eviction {
-            Eviction::AnySelection => None,
-            Eviction::ProtectPublication(selection) => Some(selection.as_str()),
-        };
-        loop {
-            let (bytes, count): (i64, i64) = tx.query_row(
-                "SELECT coalesce(sum(bytes),0), count(*) FROM selections",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            if bytes <= budget && count <= MAX_SELECTIONS {
-                break;
-            }
-            let victim: Option<String> = tx
-                .query_row(
-                    "SELECT selection FROM selections WHERE ? IS NULL OR selection != ?
-                 ORDER BY touched, selection LIMIT 1",
-                    params![keep, keep],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            let victim = victim.with_context(|| {
-                format!("semantic cache selection exceeds its {budget}-byte budget")
-            })?;
-            tx.execute("DELETE FROM selections WHERE selection=?", [victim])?;
-        }
-        Ok(())
-    }
-
     fn vectors(&mut self, selection: &SelectionIdentity) -> Result<Cache> {
-        let tx = self.connection.transaction()?;
+        let tx = &self.connection;
         let mut vectors = HashMap::new();
         {
             let mut query = tx.prepare("SELECT key,vector FROM vectors WHERE selection=?")?;
@@ -265,7 +275,7 @@ impl Database {
                 let bytes: Vec<u8> = row.get(1)?;
                 ensure!(
                     bytes.len().is_multiple_of(4),
-                    "invalid cached embedding length"
+                    "invalid semantic index embedding length"
                 );
                 let vector = bytes
                     .as_chunks::<4>()
@@ -276,7 +286,6 @@ impl Database {
                 vectors.insert(row.get(0)?, vector);
             }
         }
-        tx.commit()?;
         Ok(Cache { vectors })
     }
 
@@ -285,8 +294,8 @@ impl Database {
         selection: &SelectionIdentity,
         version: &ConversationRevision,
     ) -> Result<Option<Vec<EmbeddingDocument>>> {
-        let tx = self.connection.transaction()?;
-        if !Mapping::read(&tx, selection)?.matches(version) {
+        let tx = &self.connection;
+        if !Mapping::read(tx, selection)?.matches(version) {
             return Ok(None);
         }
         let selection = selection.as_str();
@@ -322,23 +331,7 @@ impl Database {
                 });
             }
         }
-        tx.commit()?;
         Ok(Some(documents))
-    }
-
-    fn publish_snapshot(
-        &mut self,
-        plan: &DocumentPlan<'_>,
-        vectors: &Cache,
-    ) -> Result<CommitOutcome> {
-        let selection = &plan.selection.key;
-        let mapping = Mapping::read(&self.connection, selection)?;
-        self.publish(
-            selection,
-            &plan.version,
-            (!mapping.matches(&plan.version)).then_some(plan.documents.as_slice()),
-            vectors,
-        )
     }
 
     fn publish(
@@ -347,22 +340,19 @@ impl Database {
         version: &ConversationRevision,
         documents: Option<&[EmbeddingDocument]>,
         vectors: &Cache,
-    ) -> Result<CommitOutcome> {
-        let budget = self.budget;
+    ) -> Result<()> {
         let tx = self.begin_write()?;
-        let eviction = Eviction::ProtectPublication(selection);
         let selection = selection.as_str();
         let version = version.as_str();
         let inserted = tx.execute(
-            "INSERT OR IGNORE INTO selections(selection,version,touched) VALUES (?,?,unixepoch())",
+            "INSERT OR IGNORE INTO selections(selection,version) VALUES (?,?)",
             params![selection, version],
         )?;
         if inserted > 0 {
             tx.execute("INSERT INTO builds VALUES (?,0)", [selection])?;
         }
         tx.execute(
-            "UPDATE selections SET version=?2,touched=unixepoch() WHERE selection=?1
-             AND (version!=?2 OR touched<unixepoch()-86400)",
+            "UPDATE selections SET version=?2 WHERE selection=?1 AND version!=?2",
             params![selection, version],
         )?;
         if let Some(documents) = documents {
@@ -434,8 +424,7 @@ impl Database {
             let mut insert = tx.prepare("INSERT OR IGNORE INTO vectors VALUES (?,?,?)")?;
             let mut exists = tx.prepare("SELECT 1 FROM vectors WHERE selection=? AND key=?")?;
             for (key, vector) in &vectors.vectors {
-                // Final pinned-reader repair must restore evicted batches, but
-                // need not serialize vectors still present in this transaction.
+                // Immutable content keys need no rewrite or serialization on a hit.
                 if exists.exists(params![selection, key])? {
                     continue;
                 }
@@ -449,15 +438,8 @@ impl Database {
             tx.execute("DELETE FROM vectors WHERE selection=? AND NOT EXISTS
                 (SELECT 1 FROM chunks WHERE chunks.selection=vectors.selection AND chunks.key=vectors.key)", [selection])?;
         }
-        tx.execute("UPDATE selections SET bytes=
-            (SELECT coalesce(sum(length(record)+length(event)+128),0) FROM documents WHERE selection=?1) +
-            (SELECT coalesce(sum(length(key)+length(event)+128),0) FROM chunks WHERE selection=?1) +
-            (SELECT coalesce(sum(length(input)+length(event)+length(chunks)+128),0) FROM prepared WHERE selection=?1) +
-            (SELECT coalesce(sum(length(key)+length(vector)+128),0) FROM vectors WHERE selection=?1)
-            WHERE selection=?1", [selection])?;
-        Self::evict_to_limits(&tx, budget, eviction)?;
         tx.commit()?;
-        Ok(self.checkpoint_committed())
+        Ok(())
     }
 }
 
@@ -470,76 +452,71 @@ fn remove(path: &Path) -> Result<()> {
     }
 }
 
-// Import only the selected legacy cache. Drop other selections, old per-commit
-// maps and abandoned atomic-write files before any SQLite allocation. Useful
-// vectors stay in memory during migration, so cleanup needs no second full copy.
+// Only the exact selected paths belong to this conversion. SQL existence is
+// checked under the writer lock before decoding either file.
 impl LegacyMigration {
-    fn read_and_remove(directory: &Path, selection: &SelectionIdentity) -> Result<Option<Self>> {
+    fn read(directory: &Path, selection: &SelectionIdentity) -> Result<Option<Self>> {
         let selection = selection.as_str();
-        let vector_name = format!("{selection}.msgpack");
-        let document_name = format!("documents-{selection}.msgpack");
-        let mut vector_path = None;
-        let mut document_path = None;
-        for entry in fs::read_dir(directory)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name == vector_name {
-                vector_path = Some(entry.path());
-            } else if name == document_name {
-                document_path = Some(entry.path());
-            } else if name.ends_with(".msgpack") || name.contains(".tmp-") {
-                remove(&entry.path())?;
-            }
-        }
-        if vector_path.is_none() && document_path.is_none() {
-            return Ok(None);
-        }
-        let decoded: Result<Self> = (|| {
-            let vectors = match &vector_path {
-                Some(path) => {
-                    rmp_serde::from_slice(&fs::read(path)?).context("invalid semantic cache")?
+        let mut sources = Vec::new();
+        let mut read = |path: PathBuf| -> Result<Option<Vec<u8>>> {
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    sources.push(path);
+                    Ok(Some(bytes))
                 }
-                None => Cache::default(),
-            };
-            let documents = document_path
-                .as_ref()
-                .map(|path| -> Result<DocumentCache> {
-                    rmp_serde::from_slice(&fs::read(path)?)
-                        .context("invalid semantic document cache")
-                })
-                .transpose()?;
-            Ok(Self { vectors, documents })
-        })();
-        for path in [vector_path, document_path].into_iter().flatten() {
-            if let Err(cleanup) = remove(&path) {
-                return match decoded {
-                    Err(original) => Err(original.context(format!(
-                        "legacy cache cleanup failed (files may be partially cleared): {cleanup:#}"
-                    ))),
-                    Ok(_) => Err(cleanup
-                        .context("legacy cache cleanup failed (files may be partially cleared)")),
-                };
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error)
+                    .with_context(|| format!("reading legacy semantic index {}", path.display())),
             }
-        }
-        decoded.map(Some)
+        };
+        let vector_path = directory.join(format!("{selection}.msgpack"));
+        let vectors = read(vector_path.clone())?
+            .map(|bytes| {
+                rmp_serde::from_slice(&bytes).with_context(|| {
+                    format!("invalid legacy semantic vectors {}", vector_path.display())
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let document_path = directory.join(format!("documents-{selection}.msgpack"));
+        let documents = read(document_path.clone())?
+            .map(|bytes| {
+                rmp_serde::from_slice(&bytes).with_context(|| {
+                    format!(
+                        "invalid legacy semantic documents {}",
+                        document_path.display()
+                    )
+                })
+            })
+            .transpose()?;
+        Ok((!sources.is_empty()).then_some(Self {
+            vectors,
+            documents,
+            sources,
+        }))
     }
 
-    fn publish(self, db: &mut Database, selection: &SelectionIdentity) -> Result<CommitOutcome> {
+    fn publish(self, db: &mut Database, selection: &SelectionIdentity) -> Result<()> {
         let vector_only = ConversationRevision::from_storage(String::new());
         db.publish(
             selection,
             self.documents.as_ref().map_or(&vector_only, |d| &d.version),
             self.documents.as_ref().map(|d| d.documents.as_slice()),
             &self.vectors,
-        )
+        )?;
+        for path in self.sources {
+            if let Err(error) = remove(&path) {
+                eprintln!(
+                    "warning: legacy semantic index import committed; cleanup failed for {}: {error:#}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
     }
 }
 
-impl LockedCache {
+impl LockedIndex {
     fn acquire(config: &Config) -> Result<Self> {
         let lock = lock(&config.directories.cache, "semantic-cache.lock")?;
         let directory = config.directories.cache.join("semantic");
@@ -549,55 +526,6 @@ impl LockedCache {
             _lock: lock,
         })
     }
-
-    // Own the operation connection here so every return closes it before the
-    // caller classifies failures or removes files under the same cache lock.
-    fn run_connected<T>(
-        &self,
-        selection: &SelectionIdentity,
-        migration: Option<LegacyMigration>,
-        operation: impl FnOnce(&mut Database) -> Result<T>,
-    ) -> Result<T> {
-        let mut db = Database::open(&self.directory.join(DATABASE), MAX_BYTES, MAX_PAGES)?;
-        db.expire_and_evict()?.into_result()?;
-        if let Some(migration) = migration {
-            migration.publish(&mut db, selection)?.into_result()?;
-        }
-        // Metadata operations and touch share this access's preflight and final
-        // checkpoint, but retain their separate autocommits. An external reader
-        // can pin the WAL between them; the next access must pass preflight again.
-        let value = operation(&mut db)?;
-        db.touch(selection)?.into_result()?;
-        Ok(value)
-    }
-
-    fn reset_if_disk_full<T>(&self, result: Result<T>) -> Result<T> {
-        if result.as_ref().err().is_some_and(|e| {
-            e.chain().any(|e| {
-                matches!(
-                    e.downcast_ref::<rusqlite::Error>(),
-                    Some(rusqlite::Error::SqliteFailure(code, _))
-                        if code.code == rusqlite::ErrorCode::DiskFull
-                )
-            })
-        }) {
-            // The connection has closed and semantic-cache.lock excludes all trwl readers.
-            // Unlinking needs no new database/WAL pages, even on a full filesystem.
-            for name in [
-                DATABASE.to_owned(),
-                format!("{DATABASE}-wal"),
-                format!("{DATABASE}-shm"),
-            ] {
-                if let Err(cleanup) = remove(&self.directory.join(name)) {
-                    return result.context(format!(
-                        "semantic cache cleanup failed (files may be partially cleared): {cleanup:#}"
-                    ));
-                }
-            }
-            return result.context("semantic cache exhausted disk space or its page limit; cache cleared, history unchanged; retry --refresh wait");
-        }
-        result
-    }
 }
 
 fn with_database<T>(
@@ -605,14 +533,88 @@ fn with_database<T>(
     selection: &SelectionIdentity,
     operation: impl FnOnce(&mut Database) -> Result<T>,
 ) -> Result<T> {
-    let cache = LockedCache::acquire(config)?;
-    let migration = LegacyMigration::read_and_remove(&cache.directory, selection)?;
-    let result = cache.run_connected(selection, migration, operation);
-    cache.reset_if_disk_full(result)
+    with_writer(config, |db, directory| {
+        import_legacy(db, directory, selection)?;
+        operation(db)
+    })
+}
+
+fn import_legacy(db: &mut Database, directory: &Path, selection: &SelectionIdentity) -> Result<()> {
+    if matches!(Mapping::read(&db.connection, selection)?, Mapping::Absent)
+        && let Some(migration) = LegacyMigration::read(directory, selection)?
+    {
+        migration.publish(db, selection)?;
+    }
+    Ok(())
+}
+
+fn with_writer<T>(
+    config: &Config,
+    operation: impl FnOnce(&mut Database, &Path) -> Result<T>,
+) -> Result<T> {
+    let index = LockedIndex::acquire(config)?;
+    let path = index.directory.join(DATABASE);
+    (|| {
+        let mut db = Database::open(&path)?;
+        operation(&mut db, &index.directory)
+    })()
+    .with_context(|| format!("writing semantic index {}", path.display()))
+}
+
+fn with_read<T>(
+    config: &Config,
+    selection: &SelectionIdentity,
+    operation: impl FnOnce(&mut Database) -> Result<T>,
+) -> Result<T> {
+    let directory = config.directories.cache.join("semantic");
+    let path = directory.join(DATABASE);
+    // Initialization and conversion are completed before the operation snapshot.
+    // No application writer lock is acquired by an initialized SQL read.
+    let ready = if path.exists() {
+        let db = Database::read(&path)
+            .with_context(|| format!("opening semantic index {}", path.display()))?;
+        (|| -> Result<bool> {
+            if Database::validate_version(&db.connection)? != 1 {
+                return Ok(false);
+            }
+            Database::validate_schema(&db.connection, false)?;
+            Ok(
+                !matches!(Mapping::read(&db.connection, selection)?, Mapping::Absent)
+                    || (!directory
+                        .join(format!("{}.msgpack", selection.as_str()))
+                        .try_exists()?
+                        && !directory
+                            .join(format!("documents-{}.msgpack", selection.as_str()))
+                            .try_exists()?),
+            )
+        })()
+        .with_context(|| format!("opening semantic index {}", path.display()))?
+    } else {
+        false
+    };
+    if !ready {
+        with_database(config, selection, |_| Ok(()))?;
+    }
+    read_snapshot(&path, operation)
+}
+
+fn read_snapshot<T>(path: &Path, operation: impl FnOnce(&mut Database) -> Result<T>) -> Result<T> {
+    (|| {
+        let mut db = Database::read(path)?;
+        db.connection.execute_batch("BEGIN")?;
+        ensure!(
+            Database::validate_version(&db.connection)? == 1,
+            "semantic index requires initialization"
+        );
+        Database::validate_schema(&db.connection, false)?;
+        operation(&mut db)
+        // Dropping the connection ends this read transaction on every exit.
+    })()
+    .with_context(|| format!("reading semantic index {}", path.display()))
 }
 
 pub(super) fn load(config: &Config, selection: &SelectionIdentity) -> Result<Cache> {
-    with_database(config, selection, |db| db.vectors(selection))
+    with_read(config, selection, |db| db.vectors(selection))
 }
 
 pub(super) fn documents(
@@ -620,7 +622,7 @@ pub(super) fn documents(
     selection: &SelectionIdentity,
     version: &ConversationRevision,
 ) -> Result<Option<Vec<EmbeddingDocument>>> {
-    with_database(config, selection, |db| db.documents(selection, version))
+    with_read(config, selection, |db| db.documents(selection, version))
 }
 
 pub(super) fn covered(
@@ -628,8 +630,21 @@ pub(super) fn covered(
     selection: &SelectionIdentity,
     version: &ConversationRevision,
 ) -> Result<bool> {
-    let cache = LockedCache::acquire(config)?;
-    let result = cache.run_connected(selection, None, |db| {
+    let path = config.directories.cache.join("semantic").join(DATABASE);
+    if !path.exists() {
+        return Ok(false);
+    }
+    // Scheduling never imports MessagePack or creates a store on an absent path.
+    let version_number = {
+        let db = Database::read(&path)
+            .with_context(|| format!("opening semantic index {}", path.display()))?;
+        Database::validate_version(&db.connection)
+            .with_context(|| format!("opening semantic index {}", path.display()))?
+    };
+    if version_number == 0 {
+        with_writer(config, |_, _| Ok(()))?;
+    }
+    read_snapshot(&path, |db| {
         if !Mapping::read(&db.connection, selection)?.matches(version) {
             return Ok(false);
         }
@@ -640,15 +655,14 @@ pub(super) fn covered(
             |row| row.get(0),
         )?;
         Ok(!missing)
-    });
-    cache.reset_if_disk_full(result)
+    })
 }
 
 pub(super) fn prepared(
     config: &Config,
     selection: &SelectionIdentity,
 ) -> Result<HashMap<String, super::PreparedDocument>> {
-    with_database(config, selection, |db| {
+    with_read(config, selection, |db| {
         let mut query = db
             .connection
             .prepare("SELECT input,chunks FROM prepared WHERE selection=?")?;
@@ -680,8 +694,7 @@ pub(super) fn publish_mapping(config: &Config, plan: &DocumentPlan<'_>) -> Resul
             &plan.version,
             Some(&plan.documents),
             &Cache::default(),
-        )?
-        .into_result()
+        )
     })
 }
 
@@ -689,7 +702,7 @@ pub(super) fn build_history(
     config: &Config,
     selection: &SelectionIdentity,
 ) -> Result<BuildHistory> {
-    with_database(config, selection, |db| {
+    with_read(config, selection, |db| {
         let complete: Option<Option<bool>> = db
             .connection
             .query_row(
@@ -711,21 +724,51 @@ pub(super) fn build_history(
 pub(super) fn mark_build_complete(config: &Config, plan: &DocumentPlan<'_>) -> Result<()> {
     let selection = &plan.selection.key;
     with_database(config, selection, |db| {
-        // Completion records build history, not current mapping/vector coverage.
-        db.connection.execute(
+        let tx = db.begin_write()?;
+        ensure!(
+            Mapping::read(&tx, selection)?.matches(&plan.version),
+            "semantic index mapping changed before completion"
+        );
+        let mut exists = tx.prepare("SELECT 1 FROM vectors WHERE selection=? AND key=?")?;
+        for document in &plan.documents {
+            for key in &document.keys {
+                ensure!(
+                    exists.exists(params![selection.as_str(), key])?,
+                    "semantic index missing required embedding {key} before completion"
+                );
+            }
+        }
+        drop(exists);
+        // History still controls full-build scheduling, not query readiness.
+        tx.execute(
             "UPDATE builds SET complete=1 WHERE selection=? AND complete=0",
             [selection.as_str()],
         )?;
+        tx.commit()?;
         Ok(())
     })
 }
 
-pub(super) fn reset(config: &Config, selection: &SelectionIdentity) -> Result<()> {
-    with_database(config, selection, |db| {
-        db.connection.execute(
+pub(super) fn begin_rebuild(config: &Config, selection: &SelectionIdentity) -> Result<()> {
+    // Bypass legacy decoding even before history/plan reads. An unfinished SQL
+    // build resumes; a replacement row suppresses replay across crashes/retries.
+    with_writer(config, |db, _| {
+        let tx = db.begin_write()?;
+        let unfinished: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM builds WHERE selection=? AND complete=0)",
+            [selection.as_str()],
+            |r| r.get(0),
+        )?;
+        if unfinished {
+            return Ok(());
+        }
+        tx.execute(
             "DELETE FROM selections WHERE selection=?",
             [selection.as_str()],
         )?;
+        tx.execute("INSERT INTO selections VALUES (?,'')", [selection.as_str()])?;
+        tx.execute("INSERT INTO builds VALUES (?,0)", [selection.as_str()])?;
+        tx.commit()?;
         Ok(())
     })
 }
@@ -736,23 +779,33 @@ pub(super) fn publish_batch(
     vectors: &Cache,
 ) -> Result<()> {
     with_database(config, &plan.selection.key, |db| {
-        db.publish_snapshot(plan, vectors)?.into_result()
-    })
-}
-
-pub(super) fn repair_snapshot(
-    config: &Config,
-    plan: &DocumentPlan<'_>,
-    vectors: &Cache,
-) -> Result<()> {
-    with_database(config, &plan.selection.key, |db| {
-        db.publish_snapshot(plan, vectors)?.into_result()
+        let tx = db.begin_write()?;
+        let selection = plan.selection.key.as_str();
+        ensure!(
+            Mapping::read(&tx, &plan.selection.key)?.matches(&plan.version),
+            "semantic index mapping changed before batch publication"
+        );
+        let mut insert = tx.prepare("INSERT OR IGNORE INTO vectors VALUES (?,?,?)")?;
+        let mut exists = tx.prepare("SELECT 1 FROM vectors WHERE selection=? AND key=?")?;
+        let mut required = tx.prepare("SELECT 1 FROM chunks WHERE selection=? AND key=?")?;
+        for (key, vector) in &vectors.vectors {
+            ensure!(
+                required.exists(params![selection, key])?,
+                "embedding {key} is not in the published semantic mapping"
+            );
+            if !exists.exists(params![selection, key])? {
+                let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+                insert.execute(params![selection, key, bytes])?;
+            }
+        }
+        drop((insert, exists, required));
+        tx.commit()?;
+        Ok(())
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::VectorCoverage;
     use super::*;
     use crate::record::{EventType, Provider, Record};
 
@@ -768,7 +821,7 @@ mod tests {
     fn opening_an_initialized_cache_does_not_write_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DATABASE);
-        drop(Database::open(&path, MAX_BYTES, MAX_PAGES).unwrap());
+        drop(Database::open(&path).unwrap());
         // Separate the timestamps even on filesystems with coarse resolution.
         fs::File::options()
             .write(true)
@@ -777,7 +830,7 @@ mod tests {
             .set_modified(std::time::SystemTime::UNIX_EPOCH)
             .unwrap();
         let before = fs::metadata(&path).unwrap().modified().unwrap();
-        drop(Database::open(&path, MAX_BYTES, MAX_PAGES).unwrap());
+        drop(Database::open(&path).unwrap());
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
     }
 
@@ -850,8 +903,7 @@ mod tests {
         let selection = SelectionIdentity(selection.to_owned());
         let version = ConversationRevision::from_storage(version.to_owned());
         with_database(config, &selection, |db| {
-            db.publish(&selection, &version, Some(documents), vectors)?
-                .into_result()
+            db.publish(&selection, &version, Some(documents), vectors)
         })
         .unwrap();
     }
@@ -863,6 +915,7 @@ mod tests {
         let (documents, vectors) = fixture("first", 2);
         let snapshot = SnapshotFixture::new(&config, "first");
         let plan = snapshot.plan(documents);
+        publish_mapping(&config, &plan).unwrap();
         publish_batch(&config, &plan, &vectors).unwrap();
         mark_build_complete(&config, &plan).unwrap();
         let observer =
@@ -881,12 +934,118 @@ mod tests {
     }
 
     #[test]
+    fn operation_snapshot_allows_writes_without_observing_half_a_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
+        let (first, vectors) = fixture("first", 2);
+        seed(&config, "model", "old", &first, &vectors);
+        with_read(&config, &selection("model"), |db| {
+            assert!(Mapping::read(&db.connection, &selection("model"))?.matches(&revision("old")));
+            // Use the application writer path while its reader is paused.
+            let writer_config = config.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                let (next, vectors) = fixture("next", 2);
+                seed(&writer_config, "model", "new", &next, &vectors);
+                seed(&writer_config, "another", "new", &next, &vectors);
+                send.send(()).unwrap();
+            });
+            receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            writer.join().unwrap();
+            assert_eq!(
+                db.documents(&selection("model"), &revision("old"))?
+                    .unwrap()[0]
+                    .keys,
+                ["first"]
+            );
+            assert!(
+                db.vectors(&selection("model"))?
+                    .vectors
+                    .contains_key("first")
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            documents(&config, &selection("model"), &revision("old"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            load(&config, &selection("model"))
+                .unwrap()
+                .vectors
+                .contains_key("next")
+        );
+    }
+
+    #[test]
+    fn batches_and_completion_require_the_published_mapping_and_persistent_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
+        let (documents, vectors) = fixture("first", 2);
+        let snapshot = SnapshotFixture::new(&config, "first");
+        let plan = snapshot.plan(documents);
+        assert!(publish_batch(&config, &plan, &vectors).is_err());
+        publish_mapping(&config, &plan).unwrap();
+        assert!(mark_build_complete(&config, &plan).is_err());
+        assert!(matches!(
+            build_history(&config, &selection("model")).unwrap(),
+            BuildHistory::Unfinished
+        ));
+        publish_batch(&config, &plan, &vectors).unwrap();
+        let other = SnapshotFixture::new(&config, "next");
+        let (documents, other_vectors) = fixture("next", 2);
+        let other_plan = other.plan(documents);
+        publish_mapping(&config, &other_plan).unwrap();
+        assert!(publish_batch(&config, &plan, &vectors).is_err());
+        assert!(mark_build_complete(&config, &plan).is_err());
+        assert!(
+            load(&config, &selection("model"))
+                .unwrap()
+                .vectors
+                .is_empty()
+        );
+        publish_batch(&config, &other_plan, &other_vectors).unwrap();
+        mark_build_complete(&config, &other_plan).unwrap();
+        assert!(covered(&config, &selection("model"), &other_plan.version).unwrap());
+    }
+
+    #[test]
+    fn concurrent_first_access_rechecks_initialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            for n in 0..4 {
+                let config = &config;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let (documents, vectors) = fixture("first", 2);
+                    barrier.wait();
+                    seed(config, &format!("model{n}"), "first", &documents, &vectors);
+                });
+            }
+        });
+        for n in 0..4 {
+            assert_eq!(
+                load(&config, &selection(&format!("model{n}")))
+                    .unwrap()
+                    .vectors
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn publishing_a_snapshot_does_not_rewrite_existing_vectors() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let (documents, vectors) = fixture("first", 2);
         let snapshot = SnapshotFixture::new(&config, "first");
         let plan = snapshot.plan(documents);
+        publish_mapping(&config, &plan).unwrap();
         publish_batch(&config, &plan, &vectors).unwrap();
         let observer =
             Connection::open(config.directories.cache.join("semantic").join(DATABASE)).unwrap();
@@ -900,101 +1059,6 @@ mod tests {
         assert_eq!(
             load(&config, &selection("model")).unwrap().vectors,
             vectors.vectors
-        );
-    }
-
-    #[test]
-    fn final_snapshot_restores_vectors_evicted_by_another_mapping() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
-        let (mut first_documents, first) = fixture("first", 2);
-        first_documents[0].prepared = Some(super::super::PreparedDocument {
-            input: "first-input".into(),
-            chunks: vec![(
-                "first".into(),
-                super::super::ChunkInput {
-                    text: "first".into(),
-                    tokens: 1,
-                },
-            )],
-        });
-        let (second_documents, second) = fixture("second", 2);
-        let first_snapshot = SnapshotFixture::new(&config, "first");
-        let first_plan = first_snapshot.plan(first_documents);
-        let second_snapshot = SnapshotFixture::new(&config, "second");
-        let second_plan = second_snapshot.plan(second_documents);
-        publish_batch(&config, &first_plan, &first).unwrap();
-        publish_batch(&config, &second_plan, &second).unwrap();
-        assert!(prepared(&config, &selection("model")).unwrap().is_empty());
-        assert!(
-            !load(&config, &selection("model"))
-                .unwrap()
-                .vectors
-                .contains_key("first")
-        );
-        // A batch restores its own map after inference, but does not mark the
-        // build complete, even when its vectors happen to cover that map.
-        publish_batch(&config, &first_plan, &first).unwrap();
-        assert!(
-            documents(&config, &selection("model"), &first_plan.version)
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(
-            load(&config, &selection("model")).unwrap().vectors,
-            first.vectors
-        );
-        assert!(
-            build_history(&config, &selection("model"))
-                .unwrap()
-                .needs_full_build()
-        );
-        publish_batch(&config, &second_plan, &second).unwrap();
-        let observer =
-            Connection::open(config.directories.cache.join("semantic").join(DATABASE)).unwrap();
-        observer
-            .execute_batch(
-                "CREATE TRIGGER complete_only_after_repair BEFORE UPDATE OF complete ON builds
-                 WHEN new.complete=1 AND NOT EXISTS
-                 (SELECT 1 FROM vectors WHERE selection=new.selection AND key='first')
-                 BEGIN SELECT RAISE(ABORT, 'completed before pinned snapshot repair'); END;",
-            )
-            .unwrap();
-        repair_snapshot(&config, &first_plan, &first).unwrap();
-        mark_build_complete(&config, &first_plan).unwrap();
-        assert_eq!(
-            load(&config, &selection("model")).unwrap().vectors,
-            first.vectors
-        );
-        assert_eq!(
-            documents(&config, &selection("model"), &first_plan.version)
-                .unwrap()
-                .unwrap()[0]
-                .keys,
-            ["first"]
-        );
-        assert!(
-            documents(&config, &selection("model"), &second_plan.version)
-                .unwrap()
-                .is_none()
-        );
-        let restored = prepared(&config, &selection("model")).unwrap();
-        assert_eq!(restored["first-input"].chunks[0].1.text, "first");
-        assert!(matches!(
-            build_history(&config, &selection("model")).unwrap(),
-            BuildHistory::Completed
-        ));
-        // Completed history does not imply coverage, even for the same map.
-        observer.execute("DELETE FROM vectors", []).unwrap();
-        assert!(matches!(
-            first_plan.vector_coverage(&load(&config, &selection("model")).unwrap()),
-            VectorCoverage::Missing
-        ));
-        repair_snapshot(&config, &first_plan, &first).unwrap();
-        mark_build_complete(&config, &first_plan).unwrap();
-        assert_eq!(
-            load(&config, &selection("model")).unwrap().vectors,
-            first.vectors
         );
     }
 
@@ -1019,7 +1083,6 @@ mod tests {
         ));
         assert_eq!(load(&config, &selection("model")).unwrap().vectors.len(), 1);
         publish_batch(&config, &plan, &second).unwrap();
-        repair_snapshot(&config, &plan, &load(&config, &selection("model")).unwrap()).unwrap();
         mark_build_complete(&config, &plan).unwrap();
         assert!(
             !build_history(&config, &selection("model"))
@@ -1040,7 +1103,7 @@ mod tests {
                 .unwrap()
                 .needs_full_build()
         );
-        reset(&config, &selection("model")).unwrap();
+        begin_rebuild(&config, &selection("model")).unwrap();
         assert!(
             build_history(&config, &selection("model"))
                 .unwrap()
@@ -1061,6 +1124,7 @@ mod tests {
         let (documents, vectors) = fixture("first", 2);
         let snapshot = SnapshotFixture::new(&config, "first");
         let plan = snapshot.plan(documents);
+        publish_mapping(&config, &plan).unwrap();
         publish_batch(&config, &plan, &vectors).unwrap();
         with_database(&config, &selection("model"), |db| {
             db.connection.execute("DELETE FROM builds", [])?;
@@ -1072,7 +1136,9 @@ mod tests {
             BuildHistory::LegacyCompleted
         ));
         let next = SnapshotFixture::new(&config, "next");
-        publish_batch(&config, &next.plan(plan.documents), &vectors).unwrap();
+        let plan = next.plan(plan.documents);
+        publish_mapping(&config, &plan).unwrap();
+        publish_batch(&config, &plan, &vectors).unwrap();
         assert!(
             !build_history(&config, &selection("model"))
                 .unwrap()
@@ -1083,7 +1149,7 @@ mod tests {
     #[test]
     fn replacement_drops_old_versions_and_unreferenced_vectors() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Database::open(&dir.path().join(DATABASE), MAX_BYTES, MAX_PAGES).unwrap();
+        let mut db = Database::open(&dir.path().join(DATABASE)).unwrap();
         let (first, vectors) = fixture("first", 2);
         db.publish(
             &selection("model"),
@@ -1091,7 +1157,6 @@ mod tests {
             Some(&first),
             &vectors,
         )
-        .and_then(CommitOutcome::into_result)
         .unwrap();
         let (next, vectors) = fixture("next", 2);
         db.publish(
@@ -1100,7 +1165,6 @@ mod tests {
             Some(&next),
             &vectors,
         )
-        .and_then(CommitOutcome::into_result)
         .unwrap();
         assert!(
             db.documents(&selection("model"), &revision("commit1"))
@@ -1120,190 +1184,7 @@ mod tests {
     }
 
     #[test]
-    fn global_budget_expiry_and_selection_count_reclaim_physical_storage() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(DATABASE);
-        let mut db = Database::open(&path, 180_000, MAX_PAGES).unwrap();
-        let (documents, vectors) = fixture("large", 32_000);
-        for n in 0..8 {
-            let selection = format!("model{n}");
-            db.publish(
-                &SelectionIdentity(selection),
-                &revision("commit"),
-                Some(&documents),
-                &vectors,
-            )
-            .and_then(CommitOutcome::into_result)
-            .unwrap();
-            let count: i64 = db
-                .connection
-                .query_row("SELECT count(*) FROM selections", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(count, 1, "budget is global, not per selection");
-            assert!(fs::metadata(&path).unwrap().len() < 220_000);
-            assert_eq!(
-                fs::metadata(path.with_file_name(format!("{DATABASE}-wal")))
-                    .unwrap()
-                    .len(),
-                0
-            );
-        }
-        let grown = fs::metadata(&path).unwrap().len();
-        db.connection
-            .execute("UPDATE selections SET touched=0", [])
-            .unwrap();
-        db.expire_and_evict()
-            .and_then(CommitOutcome::into_result)
-            .unwrap();
-        assert!(db.vectors(&selection("model7")).unwrap().vectors.is_empty());
-        assert!(fs::metadata(&path).unwrap().len() < grown / 2);
-        let (documents, vectors) = fixture("small", 2);
-        for n in 0..8 {
-            db.publish(
-                &selection(&format!("model{n}")),
-                &revision("commit"),
-                Some(&documents),
-                &vectors,
-            )
-            .and_then(CommitOutcome::into_result)
-            .unwrap();
-        }
-        let count: i64 = db
-            .connection
-            .query_row("SELECT count(*) FROM selections", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, MAX_SELECTIONS);
-        // Prepared text shares the vector budget, even when vectors are tiny.
-        let (mut documents, vectors) = fixture("oversized", 2);
-        documents[0].prepared = Some(super::super::PreparedDocument {
-            input: "oversized-input".into(),
-            chunks: vec![(
-                "oversized".into(),
-                super::super::ChunkInput {
-                    text: "x".repeat(180_000),
-                    tokens: 1,
-                },
-            )],
-        });
-        assert!(
-            db.publish(
-                &selection("oversized"),
-                &revision("commit"),
-                Some(&documents),
-                &vectors
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn failed_publication_rolls_back_and_a_pinned_reader_stops_wal_growth() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(DATABASE);
-        let mut db = Database::open(&path, 10_000, MAX_PAGES).unwrap();
-        let (first, vectors) = fixture("first", 2);
-        db.publish(
-            &selection("model"),
-            &revision("old"),
-            Some(&first),
-            &vectors,
-        )
-        .and_then(CommitOutcome::into_result)
-        .unwrap();
-        let (large, vectors) = fixture("large", 10_000);
-        assert!(
-            db.publish(
-                &selection("model"),
-                &revision("new"),
-                Some(&large),
-                &vectors
-            )
-            .is_err()
-        );
-        assert!(
-            db.documents(&selection("model"), &revision("old"))
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            db.documents(&selection("model"), &revision("new"))
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(db.vectors(&selection("model")).unwrap().vectors.len(), 1);
-
-        let reader = Connection::open(&path).unwrap();
-        reader
-            .execute_batch("BEGIN; SELECT * FROM selections;")
-            .unwrap();
-        db.connection.busy_timeout(Duration::ZERO).unwrap();
-        let (next, vectors) = fixture("next", 2);
-        // Publication is atomic even if an external snapshot prevents its final
-        // checkpoint. The next writer must not append behind that snapshot.
-        let outcome = db
-            .publish(&selection("model"), &revision("new"), Some(&next), &vectors)
-            .unwrap();
-        assert!(matches!(
-            &outcome,
-            CommitOutcome::CommittedButNotCheckpointed(_)
-        ));
-        assert!(
-            outcome
-                .into_result()
-                .unwrap_err()
-                .to_string()
-                .contains("pinned reader")
-        );
-        let version: String = reader
-            .query_row("SELECT version FROM selections", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(version, "old");
-        let wal = path.with_file_name(format!("{DATABASE}-wal"));
-        let size = fs::metadata(&wal).unwrap().len();
-        assert!(size > 0);
-        for _ in 0..3 {
-            assert!(
-                db.publish(
-                    &selection("model"),
-                    &revision("newer"),
-                    Some(&first),
-                    &Cache::default()
-                )
-                .is_err()
-            );
-            assert_eq!(fs::metadata(&wal).unwrap().len(), size);
-        }
-        reader.execute_batch("COMMIT").unwrap();
-        db.checkpoint().unwrap();
-        assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
-        assert!(
-            db.documents(&selection("model"), &revision("new"))
-                .unwrap()
-                .is_some()
-        );
-        let (repaired, vectors) = fixture("repaired", 2);
-        db.publish(
-            &selection("model"),
-            &revision("repaired"),
-            Some(&repaired),
-            &vectors,
-        )
-        .and_then(CommitOutcome::into_result)
-        .unwrap();
-        assert_eq!(
-            db.vectors(&selection("model")).unwrap().vectors,
-            vectors.vectors
-        );
-        assert!(
-            db.documents(&selection("model"), &revision("repaired"))
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(fs::metadata(&wal).unwrap().len(), 0);
-    }
-
-    #[test]
-    fn sqlite_full_clears_only_cache_and_next_publication_recovers() {
+    fn sqlite_full_preserves_commits_and_next_publication_recovers() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let history = dir.path().join("history.jsonl");
@@ -1345,11 +1226,11 @@ mod tests {
                 &revision("new"),
                 Some(&large),
                 &vectors,
-            )?
-            .into_result()
+            )
         })
         .unwrap_err();
-        assert!(format!("{error:#}").contains("cache cleared"), "{error:#}");
+        assert!(error.chain().any(|cause| matches!(cause.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(code, _)) if code.code == rusqlite::ErrorCode::DiskFull)), "{error:#}");
+        assert!(format!("{error:#}").contains("cache.sqlite3"), "{error:#}");
         let stored = crate::query::resolve(
             &config.directories.data,
             crate::cli::Entity::Event,
@@ -1357,38 +1238,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stored.text, event.text);
-        for name in [
-            DATABASE.to_owned(),
-            format!("{DATABASE}-wal"),
-            format!("{DATABASE}-shm"),
-        ] {
-            assert!(
-                !config
-                    .directories
-                    .cache
-                    .join("semantic")
-                    .join(name)
-                    .exists()
+        assert!(matches!(
+            build_history(&config, &selection("model")).unwrap(),
+            BuildHistory::Unfinished
+        ));
+        assert!(matches!(
+            build_history(&config, &selection("other")).unwrap(),
+            BuildHistory::Completed
+        ));
+        for model in ["model", "other"] {
+            assert_eq!(
+                load(&config, &selection(model)).unwrap().vectors,
+                vectors.vectors
             );
-        }
-        for selection in ["model", "other"] {
-            assert!(matches!(
-                build_history(&config, &SelectionIdentity(selection.to_owned())).unwrap(),
-                BuildHistory::Absent
-            ));
             assert!(
-                load(&config, &SelectionIdentity(selection.to_owned()))
+                super::documents(&config, &selection(model), &revision("old"))
                     .unwrap()
-                    .vectors
-                    .is_empty()
+                    .is_some()
             );
         }
-        assert!(
-            load(&config, &selection("model"))
-                .unwrap()
-                .vectors
-                .is_empty()
-        );
         seed(&config, "model", "recovered", &documents, &vectors);
         assert_eq!(
             load(&config, &selection("model")).unwrap().vectors["first"],
@@ -1397,7 +1265,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_preserves_current_vectors_and_cleans_before_a_failed_write() {
+    fn migration_retries_publication_and_never_replays_over_sql() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
         let directory = config.directories.cache.join("semantic");
@@ -1425,6 +1293,22 @@ mod tests {
         ] {
             fs::write(directory.join(name), b"obsolete").unwrap();
         }
+        with_writer(&config, |db, _| {
+            db.connection.execute_batch("CREATE TRIGGER fail_import BEFORE INSERT ON vectors BEGIN SELECT RAISE(ABORT, 'injected import failure'); END;")?;
+            Ok(())
+        }).unwrap();
+        assert!(load(&config, &selection("model")).is_err());
+        assert!(directory.join("model.msgpack").exists());
+        assert!(directory.join("documents-model.msgpack").exists());
+        with_writer(&config, |db, _| {
+            assert!(matches!(
+                Mapping::read(&db.connection, &selection("model"))?,
+                Mapping::Absent
+            ));
+            db.connection.execute_batch("DROP TRIGGER fail_import")?;
+            Ok(())
+        })
+        .unwrap();
         let cached = load(&config, &selection("model")).unwrap();
         assert_eq!(cached.vectors.len(), 1);
         assert_eq!(cached.vectors["useful"], [1.0, 1.0]);
@@ -1436,30 +1320,24 @@ mod tests {
             ["useful"]
         );
         assert!(!directory.join("model.msgpack").exists());
-        assert!(!directory.join("model.tmp-123").exists());
-        assert!(!directory.join("other.msgpack").exists());
-
-        fs::write(directory.join("other.msgpack"), b"obsolete").unwrap();
-        fs::write(directory.join("model.tmp-123"), b"abandoned").unwrap();
-        let failed = with_database(&config, &selection("model"), |db| {
-            db.budget = 1;
-            let (documents, vectors) = fixture("replacement", 2);
-            db.publish(
-                &selection("model"),
-                &revision("replacement"),
-                Some(&documents),
-                &vectors,
-            )?
-            .into_result()
-        })
-        .unwrap_err();
-        assert!(failed.to_string().contains("budget"), "{failed:#}");
-        assert!(!directory.join("other.msgpack").exists());
-        assert!(!directory.join("model.tmp-123").exists());
-        assert_eq!(
-            load(&config, &selection("model")).unwrap().vectors["useful"],
-            [1.0, 1.0]
+        assert!(directory.join("model.tmp-123").exists());
+        assert!(directory.join("other.msgpack").exists());
+        assert!(directory.join("documents-model-old.msgpack").exists());
+        // Leftovers, including corrupt files, cannot replace a later SQL map.
+        fs::write(directory.join("model.msgpack"), [0xc1]).unwrap();
+        let (replacement, replacement_vectors) = fixture("replacement", 2);
+        seed(
+            &config,
+            "model",
+            "replacement",
+            &replacement,
+            &replacement_vectors,
         );
+        assert_eq!(
+            load(&config, &selection("model")).unwrap().vectors,
+            replacement_vectors.vectors
+        );
+        assert!(directory.join("model.msgpack").exists());
     }
 
     #[test]
@@ -1500,7 +1378,6 @@ mod tests {
                 .unwrap()
                 .needs_full_build()
         );
-        repair_snapshot(&config, &plan, &cached).unwrap();
         mark_build_complete(&config, &plan).unwrap();
         assert!(
             !build_history(&config, &selection("model"))
@@ -1548,7 +1425,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_legacy_data_is_removed_before_returning_the_decode_error() {
+    fn rebuild_bypasses_invalid_legacy_and_resumes_its_durable_selection() {
         for corrupt in ["model.msgpack", "documents-model.msgpack"] {
             let dir = tempfile::tempdir().unwrap();
             let config =
@@ -1575,72 +1452,43 @@ mod tests {
             fs::write(directory.join("model.tmp-123"), b"abandoned").unwrap();
             let error = load(&config, &selection("model")).err().unwrap();
             let expected = if corrupt == "model.msgpack" {
-                "invalid semantic cache"
+                "invalid legacy semantic vectors"
             } else {
-                "invalid semantic document cache"
+                "invalid legacy semantic documents"
             };
-            assert!(error.to_string().contains(expected), "{error:#}");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
             for name in [
                 "model.msgpack",
                 "documents-model.msgpack",
                 "other.msgpack",
                 "model.tmp-123",
-                DATABASE,
             ] {
-                assert!(!directory.join(name).exists(), "{name}");
+                assert!(directory.join(name).exists(), "{name}");
             }
+            begin_rebuild(&config, &selection("model")).unwrap();
             assert!(
                 load(&config, &selection("model"))
                     .unwrap()
                     .vectors
                     .is_empty()
             );
-        }
-    }
-
-    #[test]
-    fn recently_used_selection_survives_count_eviction() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = Database::open(&dir.path().join(DATABASE), MAX_BYTES, MAX_PAGES).unwrap();
-        let (documents, vectors) = fixture("chunk", 2);
-        for n in 0..4 {
-            db.publish(
-                &selection(&format!("model{n}")),
-                &revision("commit"),
-                Some(&documents),
-                &vectors,
-            )
-            .and_then(CommitOutcome::into_result)
-            .unwrap();
-            db.connection
-                .execute(
-                    "UPDATE selections SET touched=unixepoch()-172800+? WHERE selection=?",
-                    params![n, format!("model{n}")],
-                )
-                .unwrap();
-        }
-        db.touch(&selection("model0"))
-            .and_then(CommitOutcome::into_result)
-            .unwrap();
-        db.publish(
-            &selection("model4"),
-            &revision("commit"),
-            Some(&documents),
-            &vectors,
-        )
-        .and_then(CommitOutcome::into_result)
-        .unwrap();
-        assert!(
-            db.documents(&selection("model1"), &revision("commit"))
-                .unwrap()
-                .is_none()
-        );
-        for model in ["model0", "model2", "model3", "model4"] {
+            let snapshot = SnapshotFixture::new(&config, "rebuilt");
+            let (documents, vectors) = fixture("new", 2);
+            let plan = snapshot.plan(documents);
+            publish_mapping(&config, &plan).unwrap();
+            publish_batch(&config, &plan, &vectors).unwrap();
+            begin_rebuild(&config, &selection("model")).unwrap();
+            assert_eq!(
+                load(&config, &selection("model")).unwrap().vectors,
+                vectors.vectors
+            );
+            mark_build_complete(&config, &plan).unwrap();
+            begin_rebuild(&config, &selection("model")).unwrap();
             assert!(
-                db.documents(&selection(model), &revision("commit"))
+                load(&config, &selection("model"))
                     .unwrap()
-                    .is_some(),
-                "evicted {model}"
+                    .vectors
+                    .is_empty()
             );
         }
     }

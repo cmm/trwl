@@ -14,8 +14,8 @@
 //! version and executor/model; built-in selection includes a hash of the model
 //! files. File hashes are cached by path, inode, size, mtime and ctime.
 //! Unchanged chunks reuse vectors. Obsolete mappings and unreferenced vectors
-//! expire; older pinned readers report missing coverage if vectors were evicted.
-//! Storage limits, transactions and file-cache migration live in `cache`.
+//! are removed on replacement; older pinned readers can report missing coverage.
+//! Transactions and legacy-file migration live in `index`.
 //!
 //! The built-in executor uses masked mean pooling and E5's `passage: ` and
 //! `query: ` prefixes
@@ -1268,13 +1268,12 @@ fn fill_locked(
     publication: Publication,
 ) -> Result<Cache> {
     let selection = plan.selection;
-    let mut cache = index::load(config, &selection.key)?;
     if publication == Publication::Current {
         index::publish_mapping(config, plan)?;
     }
+    let mut cache = index::load(config, &selection.key)?;
     if matches!(plan.vector_coverage(&cache), VectorCoverage::Complete) {
         if publication == Publication::Current {
-            index::repair_snapshot(config, plan, &cache)?;
             index::mark_build_complete(config, plan)?;
         }
         return Ok(cache);
@@ -1353,9 +1352,11 @@ fn fill_locked(
         }
         cache.vectors.extend(completed.vectors);
     };
+    ensure!(
+        matches!(plan.vector_coverage(&cache), VectorCoverage::Complete),
+        "semantic fill is missing required embeddings"
+    );
     if publication == Publication::Current {
-        // Retention may evict earlier batches while inference runs.
-        index::repair_snapshot(config, plan, &cache)?;
         index::mark_build_complete(config, plan)?;
     }
     Ok(cache)
@@ -1368,7 +1369,7 @@ pub fn refresh(config: &Config) -> Result<()> {
     Planner::default().refresh(config)
 }
 
-/// One vocabulary per updater; prepared history remains in the bounded cache.
+/// One vocabulary per updater; prepared history remains in the semantic index.
 #[derive(Default)]
 pub struct Planner {
     tokenizer: PlanningTokenizer,
@@ -1407,8 +1408,8 @@ fn refresh_inner(config: &Config, rebuild: bool, tokenizer: &mut PlanningTokeniz
     };
     let selection = Selection::from_config(config)?;
     // Repeating an interrupted rebuild resumes its committed batches.
-    if rebuild && !index::build_history(config, &selection.key)?.needs_full_build() {
-        index::reset(config, &selection.key)?;
+    if rebuild {
+        index::begin_rebuild(config, &selection.key)?;
     }
     // Chunking and batch ordering share a vocabulary, loaded only on a cache miss.
     let mut plan = document_plan(config, &selection, &index, tokenizer)?;
@@ -1616,6 +1617,43 @@ pub(crate) mod tests {
     };
 
     #[test]
+    fn empty_refresh_publishes_and_completes_without_inference() {
+        let api = crate::test_support::EmbeddingServer::start(|_| true);
+        let dir = tempfile::tempdir().unwrap();
+        let mut config =
+            Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
+        config.document = format!(
+            "[search]\nsemantic=true\n[semantic]\nexecutor='{}'\nmodel='test'\n",
+            api.url
+        )
+        .parse()
+        .unwrap();
+        let path = dir.path().join("empty.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"empty\"}}\n",
+        )
+        .unwrap();
+        let main = import(&config, Provider::Codex, &path);
+        let selection = Selection::from_config(&config).unwrap();
+        let mut planner = Planner::default();
+        planner.refresh(&config).unwrap();
+        assert!(Planner::covered(&config, &selection.key, &main.version()).unwrap());
+        assert!(matches!(
+            index::build_history(&config, &selection.key).unwrap(),
+            index::BuildHistory::Completed
+        ));
+        assert!(
+            index::documents(&config, &selection.key, &main.version())
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        planner.refresh(&config).unwrap();
+        assert!(api.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn pinned_search_and_waited_fill_preserve_the_newer_snapshot() {
         use crate::test_support::EmbeddingServer;
         use std::{sync::mpsc, thread};
@@ -1704,8 +1742,8 @@ pub(crate) mod tests {
             .unwrap();
             let database = config.directories.cache.join("semantic/cache.sqlite3");
             let observer = rusqlite::Connection::open(&database).unwrap();
-            // Make every publication stage observable, including a redundant warm
-            // repair and a completion update that would otherwise change nothing.
+            // Make every publication stage observable, including warm mapping
+            // publication and completion updates that would change nothing.
             observer.execute_batch("UPDATE builds SET complete=0;
                 CREATE TRIGGER no_mapping BEFORE INSERT ON selections BEGIN SELECT RAISE(ABORT, 'stale mapping'); END;
                 CREATE TRIGGER no_vectors BEFORE INSERT ON vectors BEGIN SELECT RAISE(ABORT, 'stale vectors'); END;
@@ -2023,6 +2061,7 @@ pub(crate) mod tests {
             &mut PlanningTokenizer::default(),
         )
         .unwrap();
+        index::publish_mapping(&config, &other).unwrap();
         index::publish_batch(&config, &other, &vectors).unwrap();
         let reused = document_plan(
             &config,
@@ -2174,17 +2213,10 @@ pub(crate) mod tests {
         let mut expected = assistant["message"].clone();
         expected["content"].as_array_mut().unwrap().remove(0);
         assert_eq!(latest[0].structured_content, expected);
-        let legacy = config
-            .directories
-            .cache
-            .join("semantic")
-            .join(format!("documents-{}-old.msgpack", selection.key.as_str()));
-        fs::write(&legacy, b"obsolete mapping").unwrap();
         let (cached, inputs) = plan(&irrelevant);
         assert!(matches!(inputs, Materialization::Deferred));
         assert_eq!(cached[0].keys, first[0].keys);
         assert_eq!(irrelevant.record_decodes.get(), 0);
-        assert!(!legacy.exists());
 
         assistant["message"]["content"][1]["text"] = json!("edited answer");
         let visible = write(&user, Some(&assistant));

@@ -302,7 +302,10 @@ def semantic_cache(case):
             if database.exists():
                 with closing(sqlite3.connect(database, timeout=0)) as db, db:
                     db.execute("BEGIN IMMEDIATE")
-                    db.execute("UPDATE selections SET touched=touched+1")
+                    db.execute(
+                        "CREATE TABLE IF NOT EXISTS inference_probe (value INTEGER)"
+                    )
+                    db.execute("INSERT INTO inference_probe VALUES (1)")
                     db.commit()
                     busy, _, _ = db.execute(
                         "PRAGMA wal_checkpoint(TRUNCATE)"
@@ -339,16 +342,16 @@ def semantic_cache(case):
             "missing vector coverage was hidden",
         )
         with closing(sqlite3.connect(database)) as db, db:
-            db.execute("UPDATE selections SET touched=0")
+            db.execute("DELETE FROM vectors")
         fallback = case.search(
             "cachebeacon", "--events", backend="hybrid", refresh="off"
         )
         require(
             fallback["retrieval"]["effective_mode"] == "lexical"
             and fallback["retrieval"]["reason"],
-            "expired selection did not report fallback",
+            "missing vectors did not report fallback",
         )
-        require(len(fallback["results"]) == 2, "cache eviction removed history")
+        require(len(fallback["results"]) == 2, "vector loss removed history")
         case.command(
             "search",
             "cachebeacon",
@@ -359,7 +362,7 @@ def semantic_cache(case):
             expect_failure=True,
         )
         status = case.json_command("semantic", "status")
-        require(status["state"] == "pending", "expired cache reported ready")
+        require(status["state"] == "pending", "missing vectors reported ready")
         ready = case.search(
             "cachebeacon", "--events", backend="semantic", refresh="wait"
         )
@@ -529,19 +532,8 @@ def semantic_cache(case):
                 db.execute("SELECT count(*) FROM vectors").fetchone()[0] == 1,
                 "deleted message retained unreferenced vectors",
             )
-            db.execute("DELETE FROM test_plan_writes")
-            db.execute("UPDATE selections SET touched=0")
-        case.json_command("semantic", "status")
-        with closing(sqlite3.connect(database)) as db, db:
-            require(
-                db.execute(
-                    "SELECT count(*) FROM test_plan_writes WHERE kind='prepared_DELETE'"
-                ).fetchone()[0]
-                == 1,
-                "selection eviction retained prepared input",
-            )
         case.check(
-            "prepared plans reuse unchanged inputs while replies, metadata, deletions and eviction stay fresh"
+            "prepared plans reuse unchanged inputs while replies, metadata and deletions stay fresh"
         )
         # Copilot SDK AssistantMessageData has scalar ordinary content beside
         # selected sidecars; only the scalar content belongs in conversation input.
