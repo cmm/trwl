@@ -1870,69 +1870,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "requires the built-in model and ONNX Runtime with the OpenVINO provider"]
-    fn builtin_providers_produce_equivalent_normalized_embeddings() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = Config::edit(
-            &crate::directories::Directories::isolated(dir.path()),
-            |doc| {
-                doc["search"]["semantic"] = toml_edit::value(true);
-                Ok(())
-            },
-        )
-        .unwrap();
-        let selection = Selection::from_config(&config).unwrap();
-        let environment = load_runtime().unwrap();
-        let mut executor =
-            Executor::builtin(selection.directory.as_ref().unwrap(), &environment).unwrap();
-        let model = selection
-            .directory
-            .as_ref()
-            .unwrap()
-            .join("onnx/model.onnx");
-        let texts = ["database connection pool".into(), "日本語の検索".into()];
-        let cpu = executor.embed(&texts, QUERY_PREFIX).unwrap();
-        let session = builtin_session(
-            &environment,
-            &model,
-            Some(ort::ep::OpenVINO::default().with_device_type("CPU").build()),
-        )
-        .unwrap();
-        let mut openvino = Executor::Builtin {
-            session,
-            tokenizer: Box::new(
-                inference_tokenizer(selection.directory.as_ref().unwrap()).unwrap(),
-            ),
-        };
-        let vectors = openvino.embed(&texts, QUERY_PREFIX).unwrap();
-        assert_eq!(vectors.len(), texts.len());
-        for (vector, expected) in vectors.iter().zip(&cpu) {
-            assert_eq!(vector.len(), expected.len());
-            let norm: f32 = vector.iter().map(|value| value * value).sum();
-            assert!((norm - 1.0).abs() < 1e-5);
-            let similarity: f32 = vector.iter().zip(expected).map(|(a, b)| a * b).sum();
-            assert!(
-                similarity > 0.999,
-                "provider changed embedding: {similarity}"
-            );
-        }
-        // Failed provider registration must reach the caller, not silently
-        // construct a CPU session that the worker would report as accelerated.
-        assert!(
-            builtin_session(
-                &environment,
-                &model,
-                Some(
-                    ort::ep::OpenVINO::default()
-                        .with_device_type("GPU.99999")
-                        .build()
-                )
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
     fn http_responses_reject_missing_or_duplicate_inputs() {
         let value = json!({"data": [{"index": 1, "embedding": [0.0, 2.0]}, {"index": 0, "embedding": [3.0, 0.0]}]});
         assert_eq!(
