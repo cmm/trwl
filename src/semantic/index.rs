@@ -289,6 +289,33 @@ impl Database {
         Ok(Cache { vectors })
     }
 
+    fn scan_vectors(
+        &self,
+        selection: &SelectionIdentity,
+        mut consume: impl FnMut(&str, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        let mut query = self
+            .connection
+            .prepare("SELECT key,vector FROM vectors WHERE selection=?")?;
+        let mut rows = query.query([selection.as_str()])?;
+        while let Some(row) = rows.next()? {
+            let key = row.get_ref(0)?.as_str()?;
+            let bytes = row.get_ref(1)?.as_blob()?;
+            ensure!(
+                bytes.len().is_multiple_of(4),
+                "invalid semantic index embedding length"
+            );
+            let vector: Vec<f32> = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect();
+            consume(key, &vector)?;
+        }
+        Ok(())
+    }
+
     fn documents(
         &mut self,
         selection: &SelectionIdentity,
@@ -621,6 +648,43 @@ pub(super) fn load(config: &Config, selection: &SelectionIdentity) -> Result<Cac
     with_read(config, selection, |db| db.vectors(selection))
 }
 
+pub(super) fn has_vectors(config: &Config, selection: &SelectionIdentity) -> Result<bool> {
+    with_read(config, selection, |db| {
+        Ok(db.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM vectors WHERE selection=?)",
+            [selection.as_str()],
+            |row| row.get(0),
+        )?)
+    })
+}
+
+// Consumers update owned accounting only. Inference, locks and writes must wait
+// until this operation returns and its read snapshot has closed.
+pub(super) fn scan_vectors(
+    config: &Config,
+    selection: &SelectionIdentity,
+    consume: impl FnMut(&str, &[f32]) -> Result<()>,
+) -> Result<()> {
+    with_read(config, selection, |db| db.scan_vectors(selection, consume))
+}
+
+pub(super) fn scan_keys(
+    config: &Config,
+    selection: &SelectionIdentity,
+    mut consume: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    with_read(config, selection, |db| {
+        let mut query = db
+            .connection
+            .prepare("SELECT key FROM vectors WHERE selection=?")?;
+        let mut rows = query.query([selection.as_str()])?;
+        while let Some(row) = rows.next()? {
+            consume(row.get_ref(0)?.as_str()?)?;
+        }
+        Ok(())
+    })
+}
+
 pub(super) fn documents(
     config: &Config,
     selection: &SelectionIdentity,
@@ -936,46 +1000,42 @@ mod tests {
     fn operation_snapshot_allows_writes_without_observing_half_a_mapping() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config::load(&crate::directories::Directories::isolated(dir.path())).unwrap();
-        let (first, vectors) = fixture("first", 2);
+        let (mut first, mut vectors) = fixture("first", 2);
+        first[0].keys.push("tail".into());
+        vectors.vectors.insert("tail".into(), vec![0.0, 1.0]);
         seed(&config, "model", "old", &first, &vectors);
-        with_read(&config, &selection("model"), |db| {
-            assert!(Mapping::read(&db.connection, &selection("model"))?.matches(&revision("old")));
-            // Use the application writer path while its reader is paused.
-            let writer_config = config.clone();
-            let (send, receive) = std::sync::mpsc::channel();
-            let writer = std::thread::spawn(move || {
-                let (next, vectors) = fixture("next", 2);
-                seed(&writer_config, "model", "new", &next, &vectors);
-                seed(&writer_config, "another", "new", &next, &vectors);
-                send.send(()).unwrap();
-            });
-            receive.recv_timeout(Duration::from_secs(5)).unwrap();
-            writer.join().unwrap();
-            assert_eq!(
-                db.documents(&selection("model"), &revision("old"))?
-                    .unwrap()[0]
-                    .keys,
-                ["first"]
-            );
-            assert!(
-                db.vectors(&selection("model"))?
-                    .vectors
-                    .contains_key("first")
-            );
+        let mut observed = HashMap::new();
+        scan_vectors(&config, &selection("model"), |key, vector| {
+            if observed.is_empty() {
+                // Test-only pause after the scan has established its snapshot.
+                let writer_config = config.clone();
+                let (send, receive) = std::sync::mpsc::channel();
+                let writer = std::thread::spawn(move || {
+                    let (next, vectors) = fixture("next", 2);
+                    seed(&writer_config, "model", "new", &next, &vectors);
+                    seed(&writer_config, "another", "new", &next, &vectors);
+                    send.send(()).unwrap();
+                });
+                receive.recv_timeout(Duration::from_secs(5)).unwrap();
+                writer.join().unwrap();
+            }
+            observed.insert(key.to_owned(), vector.to_vec());
             Ok(())
         })
         .unwrap();
+        assert_eq!(observed, vectors.vectors);
         assert!(
             documents(&config, &selection("model"), &revision("old"))
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            load(&config, &selection("model"))
-                .unwrap()
-                .vectors
-                .contains_key("next")
-        );
+        let mut later = Vec::new();
+        scan_vectors(&config, &selection("model"), |key, _| {
+            later.push(key.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(later, ["next"]);
     }
 
     #[test]

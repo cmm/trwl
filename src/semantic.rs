@@ -1,4 +1,4 @@
-//! Embedding documents, the vector cache and semantic search.
+//! Embedding documents, the semantic index and semantic search.
 //!
 //! A document pairs a user message with the last nonempty assistant reply
 //! before the next user message in the same session, using visible message
@@ -502,6 +502,102 @@ struct DocumentPlan<'a> {
     version: crate::store::ConversationRevision,
     documents: Vec<EmbeddingDocument>,
     materialization: Materialization,
+}
+
+// Availability is independent of scores and of the query's later filters.
+// Own the keys so input materialization can mutate the pinned plan during fill.
+struct KeyCoverage {
+    keys: HashMap<String, bool>,
+}
+
+impl KeyCoverage {
+    fn new(documents: &[EmbeddingDocument]) -> Self {
+        Self {
+            keys: documents
+                .iter()
+                .flat_map(|document| &document.keys)
+                .map(|key| (key.clone(), false))
+                .collect(),
+        }
+    }
+
+    fn observe(&mut self, key: &str) {
+        if let Some(available) = self.keys.get_mut(key) {
+            *available = true;
+        }
+    }
+
+    fn available(&self, key: &str) -> bool {
+        self.keys.get(key).copied().unwrap_or(false)
+    }
+
+    fn complete(&self) -> bool {
+        self.keys.values().all(|available| *available)
+    }
+}
+
+struct Scores<'query> {
+    coverage: KeyCoverage,
+    owners: HashMap<String, Vec<usize>>,
+    best: Vec<Option<f32>>,
+    queries: &'query [Vec<f32>],
+}
+
+impl<'query> Scores<'query> {
+    fn new(documents: &[EmbeddingDocument], queries: &'query [Vec<f32>]) -> Self {
+        let mut owners: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, document) in documents.iter().enumerate() {
+            for key in &document.keys {
+                let entries = owners.entry(key.clone()).or_default();
+                if entries.last() != Some(&i) {
+                    entries.push(i);
+                }
+            }
+        }
+        Self {
+            coverage: KeyCoverage::new(documents),
+            owners,
+            best: vec![None; documents.len()],
+            queries,
+        }
+    }
+
+    fn observe(&mut self, key: &str, vector: &[f32]) -> Result<()> {
+        let Some(owners) = self.owners.get(key) else {
+            return Ok(());
+        };
+        let mut best = f32::NEG_INFINITY;
+        for query in self.queries {
+            ensure!(
+                vector.len() == query.len() && vector.iter().all(|x| x.is_finite()),
+                "semantic index embedding is incompatible with selected model"
+            );
+            let score = vector.iter().zip(query).map(|(a, b)| a * b).sum::<f32>();
+            best = best.max(score);
+        }
+        for &owner in owners {
+            let previous = self.best[owner].unwrap_or(f32::NEG_INFINITY);
+            self.best[owner] = Some(previous.max(best));
+        }
+        self.coverage.observe(key);
+        Ok(())
+    }
+
+    fn finish(self, documents: &[EmbeddingDocument]) -> Result<SearchResult> {
+        let complete = self.coverage.complete();
+        // Preserve plan order; query.rs owns filtering, ranking and grouping.
+        let hits: Vec<_> = self
+            .best
+            .into_iter()
+            .zip(documents)
+            .filter_map(|(score, document)| score.map(|score| (score, document.record.clone())))
+            .collect();
+        ensure!(
+            complete || !hits.is_empty(),
+            "semantic index has no embeddings for current history; use --refresh wait"
+        );
+        Ok(SearchResult { hits, complete })
+    }
 }
 
 impl DocumentPlan<'_> {
@@ -1458,32 +1554,36 @@ fn coverage(config: &Config, report: &mut SemanticStatus) -> Result<()> {
         return Ok(());
     };
     let selection = Selection::from_config(config)?;
-    let cache = index::load(config, &selection.key)?;
     let plan = document_plan(
         config,
         &selection,
         &index,
         &mut PlanningTokenizer::default(),
     )?;
-    let mut keys = HashSet::new();
+    let mut coverage = KeyCoverage::new(&plan.documents);
+    index::scan_keys(config, &selection.key, |key| {
+        coverage.observe(key);
+        Ok(())
+    })?;
     let mut ready_documents = 0;
     let mut searchable_documents = 0;
     for document in &plan.documents {
         let document_keys = &document.keys;
         let ready = document_keys
             .iter()
-            .filter(|key| cache.vectors.contains_key(*key))
+            .filter(|key| coverage.available(key))
             .count();
         ready_documents += usize::from(ready == document_keys.len());
         searchable_documents += usize::from(ready > 0);
-        keys.extend(document_keys.iter().cloned());
     }
     // Old content and other model selections do not count toward coverage.
-    let ready_chunks = keys
-        .iter()
-        .filter(|key| cache.vectors.contains_key(*key))
+    let ready_chunks = coverage
+        .keys
+        .values()
+        .filter(|available| **available)
         .count();
-    let pending = keys.len() - ready_chunks;
+    let total_chunks = coverage.keys.len();
+    let pending = total_chunks - ready_chunks;
     report.state = if pending == 0 {
         State::Ready
     } else if report.active {
@@ -1498,7 +1598,7 @@ fn coverage(config: &Config, report: &mut SemanticStatus) -> Result<()> {
         pending: plan.documents.len() - ready_documents,
     });
     report.chunks = Some(Coverage {
-        total: keys.len(),
+        total: total_chunks,
         ready: ready_chunks,
         pending,
         searchable: None,
@@ -1528,11 +1628,7 @@ pub fn search(
         bail!("semantic index has no embeddings for current history; use --refresh wait");
     }
     let selection = Selection::from_config(config)?;
-    let cached = if fill_missing {
-        None
-    } else {
-        Some(index::load(config, &selection.key)?)
-    };
+    let reusable = fill_missing || index::has_vectors(config, &selection.key)?;
     if empty {
         return Ok(SearchResult {
             hits: Vec::new(),
@@ -1540,12 +1636,10 @@ pub fn search(
         });
     }
     ensure!(
-        cached
-            .as_ref()
-            .is_none_or(|cache| !cache.vectors.is_empty()),
+        reusable,
         "semantic index has no embeddings for current history; use --refresh wait"
     );
-    // Detect cache and query-executor failures before loading transcript payloads.
+    // Detect an unavailable index and query-executor failures before loading transcript payloads.
     // A failed semantic attempt must leave lexical fallback independent of their size.
     let mut executor = Some(Executor::shared(config, &selection)?);
     let queries = executor.as_mut().unwrap().embed(terms, QUERY_PREFIX)?;
@@ -1555,57 +1649,18 @@ pub fn search(
         PlanningTokenizer::default()
     };
     let mut plan = document_plan(config, &selection, index, &mut tokenizer)?;
-    let cache = match cached {
-        Some(cache) => cache,
-        None => fill(config, &mut plan, &mut tokenizer, &mut executor)?,
-    };
-    let mut available = Vec::new();
-    let mut complete = true;
-    for document in &plan.documents {
-        let record = &document.record;
-        let keys = &document.keys;
-        if keys.is_empty() {
-            continue;
+    let mut scores = Scores::new(&plan.documents, &queries);
+    if fill_missing {
+        let cache = fill(config, &mut plan, &mut tokenizer, &mut executor)?;
+        for (key, vector) in &cache.vectors {
+            scores.observe(key, vector)?;
         }
-        let vectors: Vec<_> = keys
-            .iter()
-            .filter_map(|key| cache.vectors.get(key))
-            .collect();
-        if vectors.len() != keys.len() {
-            complete = false;
-        }
-        if !vectors.is_empty() {
-            available.push((record, vectors));
-        }
+    } else {
+        index::scan_vectors(config, &selection.key, |key, vector| {
+            scores.observe(key, vector)
+        })?;
     }
-    if available.is_empty() {
-        if complete {
-            return Ok(SearchResult {
-                hits: Vec::new(),
-                complete: true,
-            });
-        }
-        bail!("semantic index has no embeddings for current history; use --refresh wait");
-    }
-    let mut results = Vec::with_capacity(available.len());
-    for (record, vectors) in available {
-        let mut best = f32::NEG_INFINITY;
-        for vector in vectors {
-            for query in &queries {
-                ensure!(
-                    vector.len() == query.len() && vector.iter().all(|x| x.is_finite()),
-                    "cached embedding is incompatible with selected model"
-                );
-                let score = vector.iter().zip(query).map(|(a, b)| a * b).sum::<f32>();
-                best = best.max(score);
-            }
-        }
-        results.push((best, record.clone()));
-    }
-    Ok(SearchResult {
-        hits: results,
-        complete,
-    })
+    scores.finish(&plan.documents)
 }
 
 #[cfg(test)]
