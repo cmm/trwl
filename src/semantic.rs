@@ -57,7 +57,7 @@ use std::{
 };
 use tokenizers::{PaddingParams, Tokenizer, TruncationParams};
 
-mod cache;
+mod index;
 pub(crate) mod server;
 pub(crate) mod worker;
 
@@ -348,7 +348,7 @@ impl PlanningTokenizer {
         selection: &Selection,
         index: &ReadIndex,
     ) -> Result<(Vec<EmbeddingDocument>, ChunkInputs)> {
-        let reusable = cache::prepared(config, &selection.key)?;
+        let reusable = index::prepared(config, &selection.key)?;
         plan_records(&index.messages()?, &reusable, |texts| match self {
             Self::Owned(state) => state.prepare(selection, texts),
             Self::Shared {
@@ -542,7 +542,7 @@ fn document_plan<'a>(
 ) -> Result<DocumentPlan<'a>> {
     let version = index.version();
     let (documents, materialization) =
-        if let Some(documents) = cache::documents(config, &selection.key, &version)? {
+        if let Some(documents) = index::documents(config, &selection.key, &version)? {
             (documents, Materialization::Deferred)
         } else {
             let (documents, inputs) = tokenizer.materialize(config, selection, index)?;
@@ -1268,14 +1268,14 @@ fn fill_locked(
     publication: Publication,
 ) -> Result<Cache> {
     let selection = plan.selection;
-    let mut cache = cache::load(config, &selection.key)?;
+    let mut cache = index::load(config, &selection.key)?;
     if publication == Publication::Current {
-        cache::publish_mapping(config, plan)?;
+        index::publish_mapping(config, plan)?;
     }
     if matches!(plan.vector_coverage(&cache), VectorCoverage::Complete) {
         if publication == Publication::Current {
-            cache::repair_snapshot(config, plan, &cache)?;
-            cache::mark_build_complete(config, plan)?;
+            index::repair_snapshot(config, plan, &cache)?;
+            index::mark_build_complete(config, plan)?;
         }
         return Ok(cache);
     }
@@ -1287,7 +1287,7 @@ fn fill_locked(
     let missing = ordered_inputs(missing);
     let worker = if mode == FillMode::Update
         && selection.directory.is_some()
-        && (cache::build_history(config, &selection.key)?.needs_full_build()
+        && (index::build_history(config, &selection.key)?.needs_full_build()
             || heavy_incremental(&missing))
         && std::env::var_os("TRWL_SEMANTIC_CPU_ONLY").is_none_or(|v| v != "1")
     {
@@ -1349,14 +1349,14 @@ fn fill_locked(
             None => FillProgress::Finished(backend),
         };
         if publication == Publication::Current {
-            cache::publish_batch(config, plan, &completed)?;
+            index::publish_batch(config, plan, &completed)?;
         }
         cache.vectors.extend(completed.vectors);
     };
     if publication == Publication::Current {
         // Retention may evict earlier batches while inference runs.
-        cache::repair_snapshot(config, plan, &cache)?;
-        cache::mark_build_complete(config, plan)?;
+        index::repair_snapshot(config, plan, &cache)?;
+        index::mark_build_complete(config, plan)?;
     }
     Ok(cache)
 }
@@ -1384,7 +1384,7 @@ impl Planner {
         selection: &SelectionIdentity,
         version: &store::ConversationRevision,
     ) -> Result<bool> {
-        cache::covered(config, selection, version)
+        index::covered(config, selection, version)
     }
 
     pub fn refresh(&mut self, config: &Config) -> Result<()> {
@@ -1407,8 +1407,8 @@ fn refresh_inner(config: &Config, rebuild: bool, tokenizer: &mut PlanningTokeniz
     };
     let selection = Selection::from_config(config)?;
     // Repeating an interrupted rebuild resumes its committed batches.
-    if rebuild && !cache::build_history(config, &selection.key)?.needs_full_build() {
-        cache::reset(config, &selection.key)?;
+    if rebuild && !index::build_history(config, &selection.key)?.needs_full_build() {
+        index::reset(config, &selection.key)?;
     }
     // Chunking and batch ordering share a vocabulary, loaded only on a cache miss.
     let mut plan = document_plan(config, &selection, &index, tokenizer)?;
@@ -1457,7 +1457,7 @@ fn coverage(config: &Config, report: &mut SemanticStatus) -> Result<()> {
         return Ok(());
     };
     let selection = Selection::from_config(config)?;
-    let cache = cache::load(config, &selection.key)?;
+    let cache = index::load(config, &selection.key)?;
     let plan = document_plan(
         config,
         &selection,
@@ -1530,7 +1530,7 @@ pub fn search(
     let cached = if fill_missing {
         None
     } else {
-        Some(cache::load(config, &selection.key)?)
+        Some(index::load(config, &selection.key)?)
     };
     if empty {
         return Ok(SearchResult {
@@ -1729,7 +1729,7 @@ pub(crate) mod tests {
                     .iter()
                     .all(|(_, record)| !record.text.contains("edited"))
             );
-            let disk = cache::load(&config, &selected.key).unwrap();
+            let disk = index::load(&config, &selected.key).unwrap();
             assert_eq!(disk.vectors.len(), 4);
             assert!(Planner::covered(&config, &selected.key, &current.version()).unwrap());
             let complete: bool = observer
@@ -1982,7 +1982,7 @@ pub(crate) mod tests {
         };
         let mut vocabulary = PlanningTokenizer::default();
         let mut plan = document_plan(&config, &selection, &index, &mut vocabulary).unwrap();
-        cache::publish_mapping(&config, &plan).unwrap();
+        index::publish_mapping(&config, &plan).unwrap();
         fs::remove_file(&tokenizer_path).unwrap();
         let inputs = ordered_inputs(plan.take_inputs(&config, &mut vocabulary).unwrap());
         let documents = &plan.documents;
@@ -1999,7 +1999,7 @@ pub(crate) mod tests {
         let vectors = Cache {
             vectors: [(documents[0].keys[0].clone(), vec![1.0, 0.0])].into(),
         };
-        cache::publish_batch(&config, &plan, &vectors).unwrap();
+        index::publish_batch(&config, &plan, &vectors).unwrap();
         let cached = fill(
             &config,
             &mut cached,
@@ -2023,7 +2023,7 @@ pub(crate) mod tests {
             &mut PlanningTokenizer::default(),
         )
         .unwrap();
-        cache::publish_batch(&config, &other, &vectors).unwrap();
+        index::publish_batch(&config, &other, &vectors).unwrap();
         let reused = document_plan(
             &config,
             &selection,
@@ -2160,7 +2160,7 @@ pub(crate) mod tests {
             &mut PlanningTokenizer::default(),
         )
         .unwrap();
-        cache::publish_mapping(&config, &initial).unwrap();
+        index::publish_mapping(&config, &initial).unwrap();
 
         assistant["message"]["content"][0]["thinking"] = json!("revised private reasoning");
         user["message"]["content"][0]["thinking"] = json!("revised selected user prefix");
