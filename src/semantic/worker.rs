@@ -511,28 +511,42 @@ mod tests {
 
     #[test]
     fn prefetch_to_an_exited_worker_requests_cpu_recovery() {
-        let dir = tempfile::tempdir().unwrap();
-        let client = start("success", dir.path()).unwrap().unwrap();
-        let BatchOutcome::Completed {
-            mut client,
-            batch: completed,
-            vectors,
-        } = client.submit(batch(&["text"])).receive().unwrap()
-        else {
-            panic!("successful worker requested CPU recovery");
-        };
-        client.process.child.kill().unwrap();
-        client.process.child.wait().unwrap();
-        let pending = client.submit(batch(&["next"]));
-        assert!(matches!(pending.submission, Submission::DeferredFailure(_)));
-        // Submission failure leaves the preceding result available to commit.
-        assert_eq!(completed.texts, ["text"]);
-        assert_eq!(vectors, [vec![4.0, 1.0]]);
-        let BatchOutcome::CpuRecovery(batch) = pending.receive().unwrap() else {
-            panic!("exited worker did not request CPU recovery");
-        };
-        assert_eq!(batch.texts, ["next"]);
-        assert!(!is_locked(dir.path(), "gpu.lock").unwrap());
+        for shutdown_write in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let client = start("success", dir.path()).unwrap().unwrap();
+            let BatchOutcome::Completed {
+                mut client,
+                batch: completed,
+                vectors,
+            } = client.submit(batch(&["text"])).receive().unwrap()
+            else {
+                panic!("successful worker requested CPU recovery");
+            };
+            client.process.child.kill().unwrap();
+            client.process.child.wait().unwrap();
+            if shutdown_write {
+                // Process exit need not make the next socket write fail. Force
+                // the send-error path independently of socket teardown timing.
+                client
+                    .process
+                    .stream
+                    .get_ref()
+                    .shutdown(std::net::Shutdown::Write)
+                    .unwrap();
+            }
+            let pending = client.submit(batch(&["next"]));
+            if shutdown_write {
+                assert!(matches!(pending.submission, Submission::DeferredFailure(_)));
+            }
+            // Submission failure leaves the preceding result available to commit.
+            assert_eq!(completed.texts, ["text"]);
+            assert_eq!(vectors, [vec![4.0, 1.0]]);
+            let BatchOutcome::CpuRecovery(batch) = pending.receive().unwrap() else {
+                panic!("exited worker did not request CPU recovery");
+            };
+            assert_eq!(batch.texts, ["next"]);
+            assert!(!is_locked(dir.path(), "gpu.lock").unwrap());
+        }
     }
 
     #[test]
