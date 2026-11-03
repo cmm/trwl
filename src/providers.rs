@@ -267,7 +267,8 @@ pub fn parse(
 pub fn parser_revision(provider: Provider) -> u32 {
     match provider {
         Provider::Opencode => 6,
-        Provider::Pi | Provider::Claude => 4,
+        Provider::Claude => 5,
+        Provider::Pi => 4,
         Provider::CopilotCli => 3,
         Provider::Codex => 2,
     }
@@ -1363,6 +1364,9 @@ fn jsonl(
             }
             (Provider::Claude, _) => {
                 if let Some(id) = value["sessionId"].as_str() {
+                    if state.context.session.ready() != Some(id) {
+                        state.context.workspace.clear();
+                    }
                     state.context.session.set(id);
                 }
                 if let Some(cwd) = value["cwd"].as_str() {
