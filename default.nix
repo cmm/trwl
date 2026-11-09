@@ -3,6 +3,9 @@
   onnxruntime,
   lib,
   rustPlatform,
+  pkg-config,
+  oniguruma,
+  sqlite,
   versionCheckHook,
   python3,
   intel-compute-runtime,
@@ -42,7 +45,12 @@ let
 
     # The ignored provider-equivalence test needs OpenVINO, which the ONNX
     # Runtime package in stable nixpkgs does not include.
-    buildInputs = [ onnxruntime ];
+    nativeBuildInputs = [ pkg-config ];
+    buildInputs = [
+      onnxruntime
+      oniguruma
+      sqlite
+    ];
     env.ORT_LIB_PATH = "${onnxruntime}/lib";
     env.TRWL_SEMANTIC_MODEL_DIR = model;
     inherit meta;
