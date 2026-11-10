@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     embedding-model = {
-      url = "git+https://huggingface.co/intfloat/multilingual-e5-small?ref=main";
+      url = "git+https://huggingface.co/intfloat/multilingual-e5-small?ref=main&shallow=1";
       flake = false;
     };
   };

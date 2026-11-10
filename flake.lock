@@ -7,12 +7,13 @@
         "narHash": "sha256-KtI3FS1mp/I9WJTR59cNkO+tA+gWoqQymDj6zExfkwI=",
         "ref": "main",
         "rev": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
-        "revCount": 16,
+        "shallow": true,
         "type": "git",
         "url": "https://huggingface.co/intfloat/multilingual-e5-small"
       },
       "original": {
         "ref": "main",
+        "shallow": true,
         "type": "git",
         "url": "https://huggingface.co/intfloat/multilingual-e5-small"
       }
