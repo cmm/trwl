@@ -193,7 +193,7 @@ impl SourceSpans {
         Ok(projected)
     }
 
-    fn validate(&self, record: &Record) -> Result<()> {
+    pub(crate) fn validate(&self, record: &Record) -> Result<()> {
         let original = &record.structured_content;
         let mut paths = Vec::new();
         for selection in &self.selections {
@@ -271,18 +271,14 @@ impl SourceSpans {
         Ok(())
     }
 
-    pub fn project_native(&self, record: &Record) -> Result<NativeProjection> {
-        self.validate(record)?;
-        let mut value = record.structured_content.clone();
+    pub fn project_native(&self, mut value: Value) -> Result<NativeProjection> {
         self.remove_selected(&mut value)?;
         let mut details = Vec::new();
         // Child nodes are removed before their native envelope is relocated.
         for collection in &self.collections {
-            let mut envelope = value
-                .pointer(&collection.pointer)
-                .and_then(Value::as_object)
-                .context("content container missing")?
-                .clone();
+            let Value::Object(mut envelope) = remove_node(&mut value, &collection.pointer)? else {
+                anyhow::bail!("content container missing");
+            };
             let non_selected = envelope.iter().any(|(key, value)| {
                 if collection.arrays.iter().any(|array| array.name() == key) {
                     value.as_array().is_some_and(|array| !array.is_empty())
@@ -290,7 +286,6 @@ impl SourceSpans {
                     key != "provider"
                 }
             });
-            remove_node(&mut value, &collection.pointer)?;
             if non_selected {
                 envelope.insert("type".into(), "archive".into());
                 details.push(Value::Object(envelope));
@@ -338,10 +333,9 @@ impl SourceSpans {
     }
 }
 
-fn remove_node(value: &mut Value, pointer: &str) -> Result<()> {
+fn remove_node(value: &mut Value, pointer: &str) -> Result<Value> {
     if pointer.is_empty() {
-        *value = Value::Null;
-        return Ok(());
+        return Ok(value.take());
     }
     let (parent, member) = pointer.rsplit_once('/').context("invalid content path")?;
     let parent = value
@@ -351,15 +345,14 @@ fn remove_node(value: &mut Value, pointer: &str) -> Result<()> {
         Value::Array(array) => {
             let position: usize = member.parse().context("invalid content position")?;
             ensure!(position < array.len(), "content position missing");
-            array.remove(position);
+            Ok(array.remove(position))
         }
         Value::Object(object) => {
             let key = member.replace("~1", "/").replace("~0", "~");
-            object.remove(&key).context("content member missing")?;
+            object.remove(&key).context("content member missing")
         }
         _ => anyhow::bail!("invalid content container"),
     }
-    Ok(())
 }
 
 pub fn neutral_metadata(provider: Provider, kind: Option<NativeEventKind>, value: &mut Value) {

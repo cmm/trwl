@@ -76,8 +76,8 @@ pub(super) struct Client {
     process: Process,
 }
 
-pub(super) struct Batch<T> {
-    pub(super) texts: Vec<String>,
+pub(super) struct Batch<'a, T> {
+    pub(super) texts: Vec<&'a str>,
     pub(super) association: T,
 }
 
@@ -86,19 +86,19 @@ enum Submission {
     DeferredFailure(anyhow::Error),
 }
 
-pub(super) struct Pending<T> {
+pub(super) struct Pending<'a, T> {
     process: Process,
-    batch: Batch<T>,
+    batch: Batch<'a, T>,
     submission: Submission,
 }
 
-pub(super) enum BatchOutcome<T> {
+pub(super) enum BatchOutcome<'a, T> {
     Completed {
         client: Client,
-        batch: Batch<T>,
+        batch: Batch<'a, T>,
         vectors: Vec<Vec<f32>>,
     },
-    CpuRecovery(Batch<T>),
+    CpuRecovery(Batch<'a, T>),
 }
 
 enum Recovery {
@@ -177,14 +177,14 @@ impl Client {
                 Ok(None)
             }
             Ok(Initialization::Failed(message)) => bail!("embedding initialization: {message}"),
-            Err(error) => match process.recover(error) {
+            Err(error) => match process.recover(&error) {
                 Recovery::Cpu => Ok(None),
                 Recovery::Cancelled(error) | Recovery::Fatal(error) => Err(error),
             },
         }
     }
 
-    pub(super) fn submit<T>(mut self, batch: Batch<T>) -> Pending<T> {
+    pub(super) fn submit<T>(mut self, batch: Batch<'_, T>) -> Pending<'_, T> {
         // Defer a submission error until the pending operation is received, so
         // the caller still commits the successful batch it has already received.
         let submission = match send(self.process.stream.get_mut(), &batch.texts) {
@@ -200,7 +200,7 @@ impl Client {
 }
 
 impl Process {
-    fn recover(mut self, error: anyhow::Error) -> Recovery {
+    fn recover(mut self, error: &anyhow::Error) -> Recovery {
         let _ = self.child.kill();
         let outcome = match self.child.wait() {
             Ok(status)
@@ -224,8 +224,8 @@ impl Process {
     }
 }
 
-impl<T> Pending<T> {
-    pub(super) fn receive(self) -> Result<BatchOutcome<T>> {
+impl<'a, T> Pending<'a, T> {
+    pub(super) fn receive(self) -> Result<BatchOutcome<'a, T>> {
         let Self {
             mut process,
             batch,
@@ -250,7 +250,7 @@ impl<T> Pending<T> {
             Ok(Reply::Failed(message)) => anyhow::anyhow!(message),
             Err(error) => error,
         };
-        match process.recover(error) {
+        match process.recover(&error) {
             Recovery::Cpu => Ok(BatchOutcome::CpuRecovery(batch)),
             Recovery::Cancelled(error) | Recovery::Fatal(error) => Err(error),
         }
@@ -282,7 +282,12 @@ pub(crate) fn run() -> Result<()> {
         Ok(
             Executor::accelerated(selection)?.map(|(mut executor, device)| {
                 (
-                    move |texts: &[String]| executor.embed(texts, DOCUMENT_PREFIX),
+                    move |texts: &[String]| {
+                        executor.embed(
+                            &texts.iter().map(String::as_str).collect::<Vec<_>>(),
+                            DOCUMENT_PREFIX,
+                        )
+                    },
                     device,
                 )
             }),
@@ -373,9 +378,9 @@ mod tests {
         )
     }
 
-    fn batch(texts: &[&str]) -> Batch<()> {
+    fn batch<'a>(texts: &[&'a str]) -> Batch<'a, ()> {
         Batch {
-            texts: texts.iter().map(|text| (*text).to_owned()).collect(),
+            texts: texts.to_vec(),
             association: (),
         }
     }

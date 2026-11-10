@@ -28,6 +28,7 @@ use serde_json::Value;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap},
     fs::File,
     io::{BufRead, BufReader, Read, Seek},
@@ -555,11 +556,11 @@ fn strings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
     }
 }
 
-fn arguments(value: &Value) -> String {
+fn arguments(value: &Value) -> Cow<'_, str> {
     value
         .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| value.to_string())
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| Cow::Owned(value.to_string()))
 }
 
 fn file_paths(tool: &str, args: &Value) -> Vec<String> {
@@ -828,9 +829,9 @@ fn opencode_part(
     emit: &mut impl FnMut(&Record) -> Result<()>,
 ) -> Result<()> {
     let id: String = row.get(0)?;
-    let data: String = row.get(1)?;
-    let message: String = row.get(3)?;
-    let value: Value = match serde_json::from_str(&data) {
+    let data = row.get_ref(1)?.as_str()?;
+    let message = row.get_ref(3)?.as_str()?;
+    let value: Value = match serde_json::from_str(data) {
         Ok(value) => value,
         Err(error) => {
             session
@@ -839,7 +840,7 @@ fn opencode_part(
             return Ok(());
         }
     };
-    let message: Value = serde_json::from_str(&message)?;
+    let message: Value = serde_json::from_str(message)?;
     let kind = match value["type"].as_str().unwrap_or("") {
         "text" | "reasoning" => EventType::Message,
         "tool" => EventType::ToolCall,
@@ -913,14 +914,14 @@ fn opencode_v2_message(
     sink: &mut impl FnMut(&Record) -> Result<()>,
 ) -> Result<()> {
     let id: String = row.get(0)?;
-    let data: String = row.get(1)?;
-    let kind: String = row.get(3)?;
-    let parts: String = row.get(8)?;
+    let data = row.get_ref(1)?.as_str()?;
+    let kind = row.get_ref(3)?.as_str()?;
+    let parts = row.get_ref(8)?.as_str()?;
     // The discriminator lives in its own column, outside the JSON payload.
     let value =
-        serde_json::from_str::<serde_json::Map<String, Value>>(&data).and_then(|mut value| {
+        serde_json::from_str::<serde_json::Map<String, Value>>(data).and_then(|mut value| {
             if kind == "assistant" && value.contains_key("content") {
-                let parts: Vec<String> = serde_json::from_str(&parts)?;
+                let parts: Vec<String> = serde_json::from_str(parts)?;
                 if !parts.is_empty() {
                     let content = parts
                         .iter()
@@ -940,7 +941,7 @@ fn opencode_v2_message(
             return Ok(());
         }
     };
-    value["type"] = kind.clone().into();
+    value["type"] = kind.into();
     let mut base = Record::new(
         Provider::Opencode,
         native_session,
@@ -948,14 +949,14 @@ fn opencode_v2_message(
         EventType::Message,
         path,
     );
-    base.provider_message_id = Some(id.clone());
+    base.provider_message_id = Some(id);
     base.occurred_at = millis(row.get(2)?)?;
     base.workspace = row.get::<_, Option<String>>(4)?.unwrap_or_default();
     base.parent_session_id = row
         .get::<_, Option<String>>(5)?
         .map(|p| session_id(Provider::Opencode, &p));
     base.is_subagent = base.parent_session_id.is_some();
-    base.role = match kind.as_str() {
+    base.role = match kind {
         "user" => Some(Role::User),
         "assistant" => Some(Role::Assistant),
         "system" | "synthetic" | "skill" => Some(Role::System),
@@ -971,7 +972,7 @@ fn opencode_v2_message(
         record.event_id = digest(&[
             "event",
             &record.session_id,
-            &id,
+            base.provider_message_id.as_deref().unwrap(),
             event_type.as_str(),
             selector,
         ]);
@@ -982,7 +983,7 @@ fn opencode_v2_message(
         record.files = files;
         session.records.emit(&mut record, sink)
     };
-    match kind.as_str() {
+    match kind {
         "compaction" if value["status"] == "completed" => {
             emit(
                 "",
@@ -1005,22 +1006,23 @@ fn opencode_v2_message(
             let visible = text(&value["content"]);
             let mut body = vec![visible.as_str()];
             strings(&value["error"], &mut body);
-            emit(
-                "",
-                EventType::Message,
-                body.into_iter()
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                value.clone(),
-                Vec::new(),
-            )?;
-            for (index, part) in value["content"]
-                .as_array()
+            let body = body
                 .into_iter()
-                .flatten()
-                .enumerate()
-            {
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let tools = value["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| part["type"] == "tool"));
+            if !tools {
+                return emit("", EventType::Message, body, value, Vec::new());
+            }
+            emit("", EventType::Message, body, value.clone(), Vec::new())?;
+            let content = value.as_object_mut().unwrap().remove("content");
+            let Some(Value::Array(parts)) = content else {
+                unreachable!("assistant tool content is an array")
+            };
+            for (index, part) in parts.into_iter().enumerate() {
                 if part["type"] != "tool" {
                     continue;
                 }
@@ -1031,13 +1033,8 @@ fn opencode_v2_message(
                     .as_str()
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("index:{index}"));
-                emit(
-                    &selector,
-                    EventType::ToolCall,
-                    format!("{tool} {}", arguments(args)),
-                    part.clone(),
-                    file_paths(tool, args),
-                )?;
+                let body = format!("{tool} {}", arguments(args));
+                let files = file_paths(tool, args);
                 let content = text(&part["state"]["content"]);
                 let mut output = vec![content.as_str()];
                 strings(&part["state"]["error"], &mut output);
@@ -1046,33 +1043,30 @@ fn opencode_v2_message(
                     .filter(|s| !s.is_empty())
                     .collect::<Vec<_>>()
                     .join("\n");
+                let output_files = (!output.is_empty()).then(|| file_paths(tool, args));
+                emit(&selector, EventType::ToolCall, body, part, files)?;
                 if !output.is_empty() {
                     emit(
                         &selector,
                         EventType::ToolOutput,
                         output,
                         Value::Null,
-                        file_paths(tool, args),
+                        output_files.unwrap(),
                     )?;
                 }
             }
         }
         "shell" => {
+            let output = value["output"]["output"].as_str().map(str::to_owned);
             emit(
                 "",
                 EventType::ToolCall,
                 text(&value["command"]),
-                value.clone(),
+                value,
                 Vec::new(),
             )?;
-            if let Some(output) = value["output"]["output"].as_str() {
-                emit(
-                    "",
-                    EventType::ToolOutput,
-                    output.into(),
-                    Value::Null,
-                    Vec::new(),
-                )?;
+            if let Some(output) = output {
+                emit("", EventType::ToolOutput, output, Value::Null, Vec::new())?;
             }
         }
         _ => {
@@ -1318,7 +1312,7 @@ fn jsonl(
         if bytes.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let value: Value = match serde_json::from_slice(bytes) {
+        let mut value: Value = match serde_json::from_slice(bytes) {
             Ok(value) => value,
             Err(error) => {
                 state
@@ -1382,13 +1376,13 @@ fn jsonl(
             Provider::CopilotCli => kind == "session.compaction_complete",
             Provider::Opencode => false,
         };
-        let message = if compaction {
-            &value
+        let message_field = if compaction {
+            None
         } else {
-            match provider {
-                Provider::Codex if kind == "response_item" => &value["payload"],
-                Provider::Pi if kind == "message" => &value["message"],
-                Provider::Claude if matches!(kind, "user" | "assistant") => &value["message"],
+            Some(match provider {
+                Provider::Codex if kind == "response_item" => "payload",
+                Provider::Pi if kind == "message" => "message",
+                Provider::Claude if matches!(kind, "user" | "assistant") => "message",
                 Provider::CopilotCli
                     if matches!(
                         kind,
@@ -1399,11 +1393,12 @@ fn jsonl(
                             | "tool.execution_complete"
                     ) =>
                 {
-                    &value["data"]
+                    "data"
                 }
                 _ => continue,
-            }
+            })
         };
+        let message = message_field.map_or(&value, |field| &value[field]);
         let Some(session) = state.context.session.ready() else {
             state.diagnostics.push(Diagnostic::new(
                 path,
@@ -1434,44 +1429,50 @@ fn jsonl(
             } else {
                 "assistant"
             });
-        let mut emit = |selector: &str,
+        let tool_result = role == "toolResult";
+        let mut base = Record::new(provider, session, native, EventType::Message, path);
+        base.parent_session_id = state.context.parent.clone();
+        base.is_subagent =
+            state.context.parent.is_some() || value["isSidechain"].as_bool().unwrap_or(false);
+        base.workspace = state.context.workspace.clone();
+        base.role = if compaction {
+            (provider == Provider::Claude).then_some(Role::System)
+        } else {
+            Some(role.into())
+        };
+        base.occurred_at = time;
+        base.native_kind = if provider == Provider::CopilotCli {
+            match kind {
+                "assistant.message" => Some(NativeEventKind::CopilotAssistantMessage),
+                "assistant.reasoning" => Some(NativeEventKind::CopilotAssistantDetail),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut emit = |mut record: Record,
+                        selector: &str,
                         event_type: EventType,
                         body: String,
                         structured: Value,
                         files: Vec<String>|
          -> Result<()> {
-            let mut record = Record::new(
-                provider,
-                session,
-                &format!("{native}:{selector}"),
-                event_type,
-                path,
-            );
-            record.provider_event_id = native.into();
-            record.parent_session_id = state.context.parent.clone();
-            record.is_subagent =
-                state.context.parent.is_some() || value["isSidechain"].as_bool().unwrap_or(false);
-            record.workspace = state.context.workspace.clone();
-            record.role = if compaction {
-                (provider == Provider::Claude).then_some(Role::System)
-            } else {
-                Some(role.into())
-            };
-            record.occurred_at = time.clone();
+            record.event_id = digest(&[
+                "event",
+                &record.session_id,
+                &format!("{}:{selector}", record.provider_event_id),
+                event_type.as_str(),
+            ]);
+            record.event_type = event_type;
+            if event_type != EventType::Message {
+                record.native_kind = None;
+            }
             record.text = body;
             record.structured_content = structured;
-            if provider == Provider::CopilotCli && event_type == EventType::Message {
-                record.native_kind = match kind {
-                    "assistant.message" => Some(NativeEventKind::CopilotAssistantMessage),
-                    "assistant.reasoning" => Some(NativeEventKind::CopilotAssistantDetail),
-                    _ => None,
-                };
-            }
             compose_message(&mut record)?;
             record.files = files;
             state.emitted_records.emit(&mut record, sink)
         };
-        let message_kind = message["type"].as_str().unwrap_or("");
         if compaction {
             let summary = match provider {
                 Provider::Codex => &value["payload"]["message"],
@@ -1494,13 +1495,25 @@ fn jsonl(
             } else {
                 text(summary)
             };
-            emit("compaction", event_type, body, value.clone(), Vec::new())?;
-        } else if provider == Provider::CopilotCli && kind == "assistant.reasoning" {
+            emit(base, "compaction", event_type, body, value, Vec::new())?;
+            continue;
+        }
+        let copilot_reasoning = provider == Provider::CopilotCli && kind == "assistant.reasoning";
+        let copilot_call = provider == Provider::CopilotCli && kind == "tool.execution_start";
+        let copilot_output = provider == Provider::CopilotCli && kind == "tool.execution_complete";
+        let copilot_message = provider == Provider::CopilotCli && kind == "assistant.message";
+        let mut message = value
+            .as_object_mut()
+            .and_then(|envelope| envelope.remove(message_field.unwrap()))
+            .unwrap_or(Value::Null);
+        let message_kind = message["type"].as_str().unwrap_or("");
+        if copilot_reasoning {
             emit(
+                base,
                 "message",
                 EventType::Message,
                 text(&message["content"]),
-                message.clone(),
+                message,
                 Vec::new(),
             )?;
         } else if provider == Provider::Codex && message_kind == "reasoning" {
@@ -1510,10 +1523,11 @@ fn jsonl(
                 .collect::<Vec<_>>()
                 .join("\n");
             emit(
+                base,
                 "message",
                 EventType::Message,
                 body,
-                message.clone(),
+                message,
                 Vec::new(),
             )?;
         } else if provider == Provider::Codex
@@ -1527,13 +1541,9 @@ fn jsonl(
             let decoded = args
                 .as_str()
                 .and_then(|s| serde_json::from_str::<Value>(s).ok());
-            emit(
-                "call",
-                EventType::ToolCall,
-                format!("{tool} {}", arguments(args)),
-                message.clone(),
-                file_paths(tool, decoded.as_ref().unwrap_or(args)),
-            )?;
+            let body = format!("{tool} {}", arguments(args));
+            let files = file_paths(tool, decoded.as_ref().unwrap_or(args));
+            emit(base, "call", EventType::ToolCall, body, message, files)?;
         } else if provider == Provider::Codex
             && matches!(
                 message_kind,
@@ -1541,35 +1551,34 @@ fn jsonl(
             )
         {
             emit(
+                base,
                 "output",
                 EventType::ToolOutput,
                 text(&message["output"]),
-                message.clone(),
+                message,
                 Vec::new(),
             )?;
-        } else if role == "toolResult" {
+        } else if tool_result {
             emit(
+                base,
                 "output",
                 EventType::ToolOutput,
                 text(&message["content"]),
-                message.clone(),
+                message,
                 Vec::new(),
             )?;
-        } else if provider == Provider::CopilotCli && kind == "tool.execution_start" {
+        } else if copilot_call {
             let tool = message["toolName"].as_str().unwrap_or("tool");
+            let body = format!("{tool} {}", arguments(&message["arguments"]));
+            let files = file_paths(tool, &message["arguments"]);
+            emit(base, "call", EventType::ToolCall, body, message, files)?;
+        } else if copilot_output {
             emit(
-                "call",
-                EventType::ToolCall,
-                format!("{tool} {}", arguments(&message["arguments"])),
-                message.clone(),
-                file_paths(tool, &message["arguments"]),
-            )?;
-        } else if provider == Provider::CopilotCli && kind == "tool.execution_complete" {
-            emit(
+                base,
                 "output",
                 EventType::ToolOutput,
                 text(&message["result"]["content"]),
-                message.clone(),
+                message,
                 Vec::new(),
             )?;
         } else {
@@ -1591,12 +1600,31 @@ fn jsonl(
             let marked = content
                 .as_array()
                 .is_some_and(|parts| parts.iter().any(|part| selected_part(provider, part)));
-            if !body.is_empty()
-                || visible
-                || marked
-                || (provider == Provider::CopilotCli && kind == "assistant.message")
-            {
+            let visible = !body.is_empty() || visible || marked || copilot_message;
+            let tools = content.as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    matches!(
+                        part["type"].as_str(),
+                        Some("toolCall" | "tool_use" | "tool_result")
+                    )
+                })
+            });
+            if !tools {
+                if visible {
+                    emit(
+                        base,
+                        "message",
+                        EventType::Message,
+                        body,
+                        message,
+                        Vec::new(),
+                    )?;
+                }
+                continue;
+            }
+            if visible {
                 emit(
+                    base.clone(),
                     "message",
                     EventType::Message,
                     body,
@@ -1604,8 +1632,11 @@ fn jsonl(
                     Vec::new(),
                 )?;
             }
-            if let Some(parts) = content.as_array() {
-                for (i, part) in parts.iter().enumerate() {
+            let content = message
+                .as_object_mut()
+                .and_then(|message| message.remove("content"));
+            if let Some(Value::Array(parts)) = content {
+                for (i, part) in parts.into_iter().enumerate() {
                     match part["type"].as_str().unwrap_or("") {
                         "toolCall" | "tool_use" => {
                             let tool = part["name"].as_str().unwrap_or("tool");
@@ -1613,19 +1644,23 @@ fn jsonl(
                                 .get("arguments")
                                 .or(part.get("input"))
                                 .unwrap_or(&Value::Null);
+                            let body = format!("{tool} {}", arguments(args));
+                            let files = file_paths(tool, args);
                             emit(
+                                base.clone(),
                                 &format!("call:{i}"),
                                 EventType::ToolCall,
-                                format!("{tool} {}", arguments(args)),
-                                part.clone(),
-                                file_paths(tool, args),
+                                body,
+                                part,
+                                files,
                             )?;
                         }
                         "tool_result" => emit(
+                            base.clone(),
                             &format!("output:{i}"),
                             EventType::ToolOutput,
                             text(&part["content"]),
-                            part.clone(),
+                            part,
                             Vec::new(),
                         )?,
                         _ => {}

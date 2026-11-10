@@ -185,12 +185,15 @@ pub struct OutputRecord {
 impl Record {
     pub fn project(self) -> anyhow::Result<OutputRecord> {
         anyhow::ensure!(self.has_ordinary_content(), "record reference not found");
-        let text = self.source_spans.as_ref().map_or_else(
-            || Ok(self.text.clone()),
-            |spans| spans.project_text(&self.text),
-        )?;
+        let text = match &self.source_spans {
+            Some(spans) => {
+                spans.validate(&self)?;
+                spans.project_text(&self.text)?
+            }
+            None => self.text,
+        };
         let projection = match &self.source_spans {
-            Some(spans) => spans.project_native(&self)?,
+            Some(spans) => spans.project_native(self.structured_content)?,
             None => crate::redaction::NativeProjection {
                 value: self.structured_content,
                 details: Vec::new(),

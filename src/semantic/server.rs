@@ -33,17 +33,17 @@ const REQUEST: Duration = Duration::from_secs(60);
 const IDLE: Duration = Duration::from_secs(30);
 const FRAME_LIMIT: usize = 64 * 1024 * 1024;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 enum InputKind {
     Query,
     Document,
 }
 
 #[derive(Serialize, Deserialize)]
-enum Request {
-    Select(Selection),
-    Embed { texts: Vec<String>, kind: InputKind },
-    Prepare { texts: Vec<String> },
+enum Request<S = Selection, T = Vec<String>> {
+    Select(S),
+    Embed { texts: T, kind: InputKind },
+    Prepare { texts: T },
     Stop,
 }
 
@@ -284,7 +284,7 @@ impl Client {
     ) -> Result<SelectedConnection> {
         for attempt in 0..2 {
             let mut stream = Self::connect_or_start(directories)?;
-            let reply = send(&mut stream, &Request::Select(selection.clone()))
+            let reply = send(&mut stream, &Request::<_, &[&str]>::Select(selection))
                 .and_then(|()| receive(&mut stream));
             match reply {
                 Ok(Reply::Ready) => {
@@ -320,31 +320,26 @@ impl Client {
         }
     }
 
-    fn request(&self, request: &Request) -> Result<Reply> {
+    fn request(&self, request: &Request<&Selection, &[&str]>) -> Result<Reply> {
         // Do not hold a server connection while acquiring an index/cache lock.
         // Updaters can hold that lock while waiting for their own inference.
         Self::connection(&self.directories, &self.selection)?.request(request)
     }
 
-    pub(super) fn prepare(&mut self, texts: &[String]) -> Result<Vec<Vec<ChunkInput>>> {
-        match self.request(&Request::Prepare {
-            texts: texts.to_vec(),
-        })? {
+    pub(super) fn prepare(&mut self, texts: &[&str]) -> Result<Vec<Vec<ChunkInput>>> {
+        match self.request(&Request::Prepare { texts })? {
             Reply::Chunks(chunks) => Ok(chunks),
             _ => bail!("unexpected planning response"),
         }
     }
 
-    pub(super) fn embed(&mut self, texts: &[String], prefix: &str) -> Result<Vec<Vec<f32>>> {
+    pub(super) fn embed(&mut self, texts: &[&str], prefix: &str) -> Result<Vec<Vec<f32>>> {
         let kind = match prefix {
             QUERY_PREFIX => InputKind::Query,
             DOCUMENT_PREFIX => InputKind::Document,
             _ => bail!("unknown embedding prefix"),
         };
-        match self.request(&Request::Embed {
-            texts: texts.to_vec(),
-            kind,
-        })? {
+        match self.request(&Request::Embed { texts, kind })? {
             Reply::Vectors(vectors) => {
                 ensure!(vectors.len() == texts.len(), "inference batch size differs");
                 Ok(vectors)
@@ -356,7 +351,7 @@ impl Client {
 
 struct SelectedConnection(UnixStream);
 impl SelectedConnection {
-    fn request(mut self, request: &Request) -> Result<Reply> {
+    fn request(mut self, request: &impl Serialize) -> Result<Reply> {
         send(&mut self.0, request)?;
         match receive(&mut self.0)? {
             Reply::Failed(message) => bail!("inference failed: {message}"),
@@ -390,7 +385,7 @@ struct StopAcknowledged<'a> {
 }
 impl<'a> StopAcknowledged<'a> {
     fn request(directory: &'a Directory, mut stream: UnixStream) -> Result<Self> {
-        send(&mut stream, &Request::Stop)?;
+        send(&mut stream, &Request::<Selection, Vec<String>>::Stop)?;
         let _: Reply = receive(&mut stream)?;
         Ok(Self {
             directory,
@@ -573,18 +568,20 @@ impl ConnectionSelection<'_> {
 
 impl LoadedModel {
     fn prepare(&mut self, texts: &[String]) -> Result<Vec<Vec<ChunkInput>>> {
+        let texts: Vec<_> = texts.iter().map(String::as_str).collect();
         ensure!(texts.len() <= BATCH_SIZE, "planning batch is too large");
         let Executor::Builtin { tokenizer, .. } = &mut self.executor else {
             bail!("planning requires a built-in model")
         };
         DocumentTokenizer::prepare(tokenizer, |tokenizer| {
-            prepare_chunks(texts, Some(tokenizer))
+            prepare_chunks(&texts, Some(tokenizer))
         })
     }
 
     fn embed(&mut self, texts: &[String], kind: InputKind) -> Result<Vec<Vec<f32>>> {
+        let texts: Vec<_> = texts.iter().map(String::as_str).collect();
         self.executor.embed(
-            texts,
+            &texts,
             match kind {
                 InputKind::Query => QUERY_PREFIX,
                 InputKind::Document => DOCUMENT_PREFIX,
@@ -629,7 +626,7 @@ pub(crate) fn run(directories: &crate::directories::Directories) -> Result<()> {
         stream.set_read_timeout(Some(REQUEST))?;
         stream.set_write_timeout(Some(REQUEST))?;
         let mut selected = ConnectionSelection::Unselected;
-        while let Ok(request) = receive(&mut stream) {
+        while let Ok(request) = receive::<Request>(&mut stream) {
             let reply = match request {
                 Request::Stop => {
                     send(&mut stream, &Reply::Ready)?;

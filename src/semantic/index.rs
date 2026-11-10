@@ -12,13 +12,15 @@
 //!
 //! MessagePack migration imports only an absent SQL selection, atomically.
 //! Its selected source files are removed only after commit.
-use super::{Cache, DocumentCache, DocumentPlan, EmbeddingDocument, SelectionIdentity};
+use super::{
+    Cache, DocumentCache, DocumentMetadata, EmbeddingDocument, PreparationRegistry,
+    SelectionIdentity,
+};
 use crate::config::{Config, lock};
 use crate::store::ConversationRevision;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use std::{
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -296,13 +298,14 @@ impl Database {
         &mut self,
         selection: &SelectionIdentity,
         version: &ConversationRevision,
-    ) -> Result<Option<Vec<EmbeddingDocument>>> {
+    ) -> Result<Option<(Vec<EmbeddingDocument>, PreparationRegistry)>> {
         let tx = &self.connection;
         if !Mapping::read(tx, selection)?.matches(version) {
             return Ok(None);
         }
         let selection = selection.as_str();
         let mut documents = Vec::new();
+        let mut registry = PreparationRegistry::default();
         {
             let mut query =
                 tx.prepare("SELECT event,record FROM documents WHERE selection=? ORDER BY event")?;
@@ -326,23 +329,23 @@ impl Database {
                         })
                         .optional()?
                         .map(|(input, chunks)| -> Result<_> {
-                            Ok(super::PreparedDocument {
+                            Ok(registry.register(super::PreparedDocument {
                                 input,
                                 chunks: rmp_serde::from_slice(&chunks)?,
-                            })
+                            }))
                         })
                         .transpose()?,
                 });
             }
         }
-        Ok(Some(documents))
+        Ok(Some((documents, registry)))
     }
 
     fn publish(
         &mut self,
         selection: &SelectionIdentity,
         version: &ConversationRevision,
-        documents: Option<&[EmbeddingDocument]>,
+        documents: Option<(&[EmbeddingDocument], &PreparationRegistry)>,
         vectors: &Cache,
     ) -> Result<()> {
         let tx = self.begin_write()?;
@@ -359,7 +362,7 @@ impl Database {
             "UPDATE selections SET version=?2 WHERE selection=?1 AND version!=?2",
             params![selection, version],
         )?;
-        if let Some(documents) = documents {
+        if let Some((documents, registry)) = documents {
             // Keep unchanged rows in place, including their prepared chunks.
             // The current pinned snapshot still decides metadata and deletions.
             let mut stale: std::collections::HashSet<String> = tx
@@ -404,10 +407,10 @@ impl Database {
                     let previous: Option<String> = old_input
                         .query_row(params![selection, document.record.event_id], |r| r.get(0))
                         .optional()?;
-                    if previous.as_ref() != Some(&prepared.input) {
+                    if previous.as_ref() != Some(prepared) {
                         tx.execute("INSERT INTO prepared VALUES (?,?,?,?)
                             ON CONFLICT(selection,event) DO UPDATE SET input=excluded.input,chunks=excluded.chunks",
-                            params![selection, document.record.event_id, prepared.input, rmp_serde::to_vec(&prepared.chunks)?])?;
+                            params![selection, document.record.event_id, prepared, rmp_serde::to_vec(&registry.chunks(prepared))?])?;
                     }
                 } else {
                     tx.execute(
@@ -505,10 +508,21 @@ impl LegacyMigration {
 
     fn publish(self, db: &mut Database, selection: &SelectionIdentity) -> Result<()> {
         let vector_only = ConversationRevision::from_storage(String::new());
+        let mut registry = PreparationRegistry::default();
+        let documents = self.documents.map(|cache| {
+            (
+                cache.version,
+                cache
+                    .documents
+                    .into_iter()
+                    .map(|document| document.register(&mut registry))
+                    .collect::<Vec<_>>(),
+            )
+        });
         db.publish(
             selection,
-            self.documents.as_ref().map_or(&vector_only, |d| &d.version),
-            self.documents.as_ref().map(|d| d.documents.as_slice()),
+            documents.as_ref().map_or(&vector_only, |d| &d.0),
+            documents.as_ref().map(|d| (d.1.as_slice(), &registry)),
             &self.vectors,
         )?;
         for path in self.sources {
@@ -661,7 +675,7 @@ pub(super) fn documents(
     config: &Config,
     selection: &SelectionIdentity,
     version: &ConversationRevision,
-) -> Result<Option<Vec<EmbeddingDocument>>> {
+) -> Result<Option<(Vec<EmbeddingDocument>, PreparationRegistry)>> {
     with_read(config, selection, |db| db.documents(selection, version))
 }
 
@@ -701,38 +715,38 @@ pub(super) fn covered(
 pub(super) fn prepared(
     config: &Config,
     selection: &SelectionIdentity,
-) -> Result<HashMap<String, super::PreparedDocument>> {
+) -> Result<PreparationRegistry> {
     with_read(config, selection, |db| {
         let mut query = db
             .connection
             .prepare("SELECT input,chunks FROM prepared WHERE selection=?")?;
         let mut rows = query.query([selection.as_str()])?;
-        let mut prepared = HashMap::new();
+        let mut prepared = PreparationRegistry::default();
         while let Some(row) = rows.next()? {
             let input: String = row.get(0)?;
-            if !prepared.contains_key(&input) {
+            if !prepared.preparations.contains_key(&input) {
                 let bytes: Vec<u8> = row.get(1)?;
-                prepared.insert(
-                    input.clone(),
-                    super::PreparedDocument {
-                        input,
-                        chunks: rmp_serde::from_slice(&bytes)
-                            .context("invalid prepared document")?,
-                    },
-                );
+                prepared.register(super::PreparedDocument {
+                    input,
+                    chunks: rmp_serde::from_slice(&bytes).context("invalid prepared document")?,
+                });
             }
         }
         Ok(prepared)
     })
 }
 
-pub(super) fn publish_mapping(config: &Config, plan: &DocumentPlan<'_>) -> Result<()> {
+pub(super) fn publish_mapping(
+    config: &Config,
+    plan: DocumentMetadata<'_>,
+    registry: &PreparationRegistry,
+) -> Result<()> {
     let selection = &plan.selection.key;
     with_database(config, selection, |db| {
         db.publish(
             selection,
-            &plan.version,
-            Some(&plan.documents),
+            plan.version,
+            Some((plan.documents, registry)),
             &Cache::default(),
         )
     })
@@ -761,16 +775,16 @@ pub(super) fn build_history(
     })
 }
 
-pub(super) fn mark_build_complete(config: &Config, plan: &DocumentPlan<'_>) -> Result<()> {
+pub(super) fn mark_build_complete(config: &Config, plan: DocumentMetadata<'_>) -> Result<()> {
     let selection = &plan.selection.key;
     with_writer(config, |db, _| {
         let tx = db.begin_write()?;
         ensure!(
-            Mapping::read(&tx, selection)?.matches(&plan.version),
+            Mapping::read(&tx, selection)?.matches(plan.version),
             "semantic index mapping changed before completion"
         );
         let mut exists = tx.prepare("SELECT 1 FROM vectors WHERE selection=? AND key=?")?;
-        for document in &plan.documents {
+        for document in plan.documents {
             for key in &document.keys {
                 ensure!(
                     exists.exists(params![selection.as_str(), key])?,
@@ -815,14 +829,14 @@ pub(super) fn begin_rebuild(config: &Config, selection: &SelectionIdentity) -> R
 
 pub(super) fn publish_batch(
     config: &Config,
-    plan: &DocumentPlan<'_>,
+    plan: DocumentMetadata<'_>,
     vectors: &Cache,
 ) -> Result<()> {
     with_writer(config, |db, _| {
         let tx = db.begin_write()?;
         let selection = plan.selection.key.as_str();
         ensure!(
-            Mapping::read(&tx, &plan.selection.key)?.matches(&plan.version),
+            Mapping::read(&tx, &plan.selection.key)?.matches(plan.version),
             "semantic index mapping changed before batch publication"
         );
         let mut required = tx.prepare("SELECT 1 FROM chunks WHERE selection=? AND key=?")?;
@@ -841,7 +855,9 @@ pub(super) fn publish_batch(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{DocumentPlan, Materialization, StoredDocument};
     use super::*;
+    use std::collections::HashMap;
 
     fn load(config: &Config, selection: &SelectionIdentity) -> Result<Cache> {
         let mut vectors = HashMap::new();
@@ -876,6 +892,17 @@ mod tests {
         let before = fs::metadata(&path).unwrap().modified().unwrap();
         drop(Database::open(&path).unwrap());
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), before);
+    }
+
+    fn legacy_documents(documents: Vec<EmbeddingDocument>) -> Vec<StoredDocument> {
+        documents
+            .into_iter()
+            .map(|document| StoredDocument {
+                record: document.record,
+                keys: document.keys,
+                prepared: None,
+            })
+            .collect()
     }
 
     fn fixture(key: &str, dimensions: usize) -> (Vec<EmbeddingDocument>, Cache) {
@@ -932,7 +959,10 @@ mod tests {
                 index: &self.index,
                 version: self.index.version(),
                 documents,
-                materialization: super::super::Materialization::Deferred,
+                materialization: Materialization {
+                    registry: PreparationRegistry::default(),
+                    deferred: true,
+                },
             }
         }
     }
@@ -947,7 +977,12 @@ mod tests {
         let selection = SelectionIdentity(selection.to_owned());
         let version = ConversationRevision::from_storage(version.to_owned());
         with_database(config, &selection, |db| {
-            db.publish(&selection, &version, Some(documents), vectors)
+            db.publish(
+                &selection,
+                &version,
+                Some((documents, &PreparationRegistry::default())),
+                vectors,
+            )
         })
         .unwrap();
     }
@@ -959,9 +994,9 @@ mod tests {
         let (documents, vectors) = fixture("first", 2);
         let snapshot = SnapshotFixture::new(&config, "first");
         let plan = snapshot.plan(documents);
-        publish_mapping(&config, &plan).unwrap();
-        publish_batch(&config, &plan, &vectors).unwrap();
-        mark_build_complete(&config, &plan).unwrap();
+        publish_mapping(&config, plan.metadata(), &plan.materialization.registry).unwrap();
+        publish_batch(&config, plan.metadata(), &vectors).unwrap();
+        mark_build_complete(&config, plan.metadata()).unwrap();
         let observer =
             Connection::open(config.directories.cache.join("semantic").join(DATABASE)).unwrap();
         observer
@@ -970,7 +1005,7 @@ mod tests {
             WHEN old.complete=1 BEGIN SELECT RAISE(ABORT, 'updated a completed build'); END;",
             )
             .unwrap();
-        mark_build_complete(&config, &plan).unwrap();
+        mark_build_complete(&config, plan.metadata()).unwrap();
         assert!(matches!(
             build_history(&config, &selection("model")).unwrap(),
             BuildHistory::Completed
@@ -1032,7 +1067,7 @@ mod tests {
             directory.join("documents-model.msgpack"),
             rmp_serde::to_vec_named(&DocumentCache {
                 version: plan.version.clone(),
-                documents: fixture("first", 2).0,
+                documents: legacy_documents(fixture("first", 2).0),
             })
             .unwrap(),
         )
@@ -1042,33 +1077,38 @@ mod tests {
             rmp_serde::to_vec(&vectors).unwrap(),
         )
         .unwrap();
-        assert!(mark_build_complete(&config, &plan).is_err());
-        assert!(publish_batch(&config, &plan, &vectors).is_err());
+        assert!(mark_build_complete(&config, plan.metadata()).is_err());
+        assert!(publish_batch(&config, plan.metadata(), &vectors).is_err());
         assert!(directory.join("model.msgpack").exists());
         assert!(directory.join("documents-model.msgpack").exists());
         fs::remove_file(directory.join("model.msgpack")).unwrap();
         fs::remove_file(directory.join("documents-model.msgpack")).unwrap();
-        publish_mapping(&config, &plan).unwrap();
-        assert!(mark_build_complete(&config, &plan).is_err());
+        publish_mapping(&config, plan.metadata(), &plan.materialization.registry).unwrap();
+        assert!(mark_build_complete(&config, plan.metadata()).is_err());
         assert!(matches!(
             build_history(&config, &selection("model")).unwrap(),
             BuildHistory::Unfinished
         ));
-        publish_batch(&config, &plan, &vectors).unwrap();
+        publish_batch(&config, plan.metadata(), &vectors).unwrap();
         let other = SnapshotFixture::new(&config, "next");
         let (documents, other_vectors) = fixture("next", 2);
         let other_plan = other.plan(documents);
-        publish_mapping(&config, &other_plan).unwrap();
-        assert!(publish_batch(&config, &plan, &vectors).is_err());
-        assert!(mark_build_complete(&config, &plan).is_err());
+        publish_mapping(
+            &config,
+            other_plan.metadata(),
+            &other_plan.materialization.registry,
+        )
+        .unwrap();
+        assert!(publish_batch(&config, plan.metadata(), &vectors).is_err());
+        assert!(mark_build_complete(&config, plan.metadata()).is_err());
         assert!(
             load(&config, &selection("model"))
                 .unwrap()
                 .vectors
                 .is_empty()
         );
-        publish_batch(&config, &other_plan, &other_vectors).unwrap();
-        mark_build_complete(&config, &other_plan).unwrap();
+        publish_batch(&config, other_plan.metadata(), &other_vectors).unwrap();
+        mark_build_complete(&config, other_plan.metadata()).unwrap();
         assert!(covered(&config, &selection("model"), &other_plan.version).unwrap());
     }
 
@@ -1106,8 +1146,8 @@ mod tests {
         let (documents, vectors) = fixture("first", 2);
         let snapshot = SnapshotFixture::new(&config, "first");
         let plan = snapshot.plan(documents);
-        publish_mapping(&config, &plan).unwrap();
-        publish_batch(&config, &plan, &vectors).unwrap();
+        publish_mapping(&config, plan.metadata(), &plan.materialization.registry).unwrap();
+        publish_batch(&config, plan.metadata(), &vectors).unwrap();
         let observer =
             Connection::open(config.directories.cache.join("semantic").join(DATABASE)).unwrap();
         observer
@@ -1116,7 +1156,7 @@ mod tests {
             BEGIN SELECT RAISE(ABORT, 'rewrote a completed vector'); END;",
             )
             .unwrap();
-        publish_batch(&config, &plan, &vectors).unwrap();
+        publish_batch(&config, plan.metadata(), &vectors).unwrap();
         assert_eq!(
             load(&config, &selection("model")).unwrap().vectors,
             vectors.vectors
@@ -1136,15 +1176,15 @@ mod tests {
             build_history(&config, &selection("model")).unwrap(),
             BuildHistory::Absent
         ));
-        publish_mapping(&config, &plan).unwrap();
-        publish_batch(&config, &plan, &first).unwrap();
+        publish_mapping(&config, plan.metadata(), &plan.materialization.registry).unwrap();
+        publish_batch(&config, plan.metadata(), &first).unwrap();
         assert!(matches!(
             build_history(&config, &selection("model")).unwrap(),
             BuildHistory::Unfinished
         ));
         assert_eq!(load(&config, &selection("model")).unwrap().vectors.len(), 1);
-        publish_batch(&config, &plan, &second).unwrap();
-        mark_build_complete(&config, &plan).unwrap();
+        publish_batch(&config, plan.metadata(), &second).unwrap();
+        mark_build_complete(&config, plan.metadata()).unwrap();
         assert!(
             !build_history(&config, &selection("model"))
                 .unwrap()
@@ -1158,7 +1198,8 @@ mod tests {
         );
         // An ordinary index update does not make the selection a full build.
         let next = SnapshotFixture::new(&config, "next");
-        publish_mapping(&config, &next.plan(plan.documents)).unwrap();
+        let plan = next.plan(plan.documents);
+        publish_mapping(&config, plan.metadata(), &plan.materialization.registry).unwrap();
         assert!(
             !build_history(&config, &selection("model"))
                 .unwrap()
@@ -1185,8 +1226,8 @@ mod tests {
         let (documents, vectors) = fixture("first", 2);
         let snapshot = SnapshotFixture::new(&config, "first");
         let plan = snapshot.plan(documents);
-        publish_mapping(&config, &plan).unwrap();
-        publish_batch(&config, &plan, &vectors).unwrap();
+        publish_mapping(&config, plan.metadata(), &plan.materialization.registry).unwrap();
+        publish_batch(&config, plan.metadata(), &vectors).unwrap();
         with_database(&config, &selection("model"), |db| {
             db.connection.execute("DELETE FROM builds", [])?;
             Ok(())
@@ -1198,8 +1239,8 @@ mod tests {
         ));
         let next = SnapshotFixture::new(&config, "next");
         let plan = next.plan(plan.documents);
-        publish_mapping(&config, &plan).unwrap();
-        publish_batch(&config, &plan, &vectors).unwrap();
+        publish_mapping(&config, plan.metadata(), &plan.materialization.registry).unwrap();
+        publish_batch(&config, plan.metadata(), &vectors).unwrap();
         assert!(
             !build_history(&config, &selection("model"))
                 .unwrap()
@@ -1215,7 +1256,7 @@ mod tests {
         db.publish(
             &selection("model"),
             &revision("commit1"),
-            Some(&first),
+            Some((&first, &PreparationRegistry::default())),
             &vectors,
         )
         .unwrap();
@@ -1223,7 +1264,7 @@ mod tests {
         db.publish(
             &selection("model"),
             &revision("commit2"),
-            Some(&next),
+            Some((&next, &PreparationRegistry::default())),
             &vectors,
         )
         .unwrap();
@@ -1235,7 +1276,8 @@ mod tests {
         assert_eq!(
             db.documents(&selection("model"), &revision("commit2"))
                 .unwrap()
-                .unwrap()[0]
+                .unwrap()
+                .0[0]
                 .keys,
             ["next"]
         );
@@ -1290,7 +1332,7 @@ mod tests {
             db.publish(
                 &selection("model"),
                 &revision("new"),
-                Some(&large),
+                Some((&large, &PreparationRegistry::default())),
                 &vectors,
             )
         })
@@ -1347,7 +1389,7 @@ mod tests {
             directory.join("documents-model.msgpack"),
             rmp_serde::to_vec_named(&DocumentCache {
                 version: revision("commit"),
-                documents,
+                documents: legacy_documents(documents),
             })
             .unwrap(),
         )
@@ -1381,7 +1423,8 @@ mod tests {
         assert_eq!(
             super::documents(&config, &selection("model"), &revision("commit"))
                 .unwrap()
-                .unwrap()[0]
+                .unwrap()
+                .0[0]
                 .keys,
             ["useful"]
         );
@@ -1435,7 +1478,7 @@ mod tests {
                 .unwrap()
                 .needs_full_build()
         );
-        publish_mapping(&config, &plan).unwrap();
+        publish_mapping(&config, plan.metadata(), &plan.materialization.registry).unwrap();
         let cached = load(&config, &selection("model")).unwrap();
         assert_eq!(cached.vectors.len(), 1);
         assert_eq!(cached.vectors["useful"], [1.0, 1.0]);
@@ -1444,7 +1487,7 @@ mod tests {
                 .unwrap()
                 .needs_full_build()
         );
-        mark_build_complete(&config, &plan).unwrap();
+        mark_build_complete(&config, plan.metadata()).unwrap();
         assert!(
             !build_history(&config, &selection("model"))
                 .unwrap()
@@ -1464,7 +1507,7 @@ mod tests {
             &path,
             rmp_serde::to_vec_named(&DocumentCache {
                 version: revision("commit"),
-                documents: mapped,
+                documents: legacy_documents(mapped),
             })
             .unwrap(),
         )
@@ -1478,7 +1521,8 @@ mod tests {
         assert_eq!(
             documents(&config, &selection("model"), &revision("commit"))
                 .unwrap()
-                .unwrap()[0]
+                .unwrap()
+                .0[0]
                 .keys,
             ["missing"]
         );
@@ -1508,7 +1552,7 @@ mod tests {
                 directory.join("documents-model.msgpack"),
                 rmp_serde::to_vec_named(&DocumentCache {
                     version: revision("commit"),
-                    documents,
+                    documents: legacy_documents(documents),
                 })
                 .unwrap(),
             )
@@ -1541,14 +1585,14 @@ mod tests {
             let snapshot = SnapshotFixture::new(&config, "rebuilt");
             let (documents, vectors) = fixture("new", 2);
             let plan = snapshot.plan(documents);
-            publish_mapping(&config, &plan).unwrap();
-            publish_batch(&config, &plan, &vectors).unwrap();
+            publish_mapping(&config, plan.metadata(), &plan.materialization.registry).unwrap();
+            publish_batch(&config, plan.metadata(), &vectors).unwrap();
             begin_rebuild(&config, &selection("model")).unwrap();
             assert_eq!(
                 load(&config, &selection("model")).unwrap().vectors,
                 vectors.vectors
             );
-            mark_build_complete(&config, &plan).unwrap();
+            mark_build_complete(&config, plan.metadata()).unwrap();
             begin_rebuild(&config, &selection("model")).unwrap();
             assert!(
                 load(&config, &selection("model"))

@@ -25,13 +25,13 @@ fn collection<T: Serialize>(
     rows: &[T],
     item: &str,
     row_type: &str,
-    completion: Value,
+    completion: &Value,
 ) -> Result<String> {
     let mut output = String::new();
     for row in rows {
         output.push_str(&json_line(&json!({"record_type":row_type,item:row}))?);
     }
-    output.push_str(&json_line(&completion)?);
+    output.push_str(&json_line(completion)?);
     Ok(output)
 }
 fn event_completion(cursor: &Option<String>) -> Value {
@@ -43,31 +43,31 @@ fn jsonl(report: &Report) -> Result<String> {
             &r.results,
             "result",
             "search_result",
-            json!({"record_type":"search_completion","query":r.query,"retrieval":r.retrieval}),
+            &json!({"record_type":"search_completion","query":r.query,"retrieval":r.retrieval}),
         ),
         Report::ShowEvent(r) => {
             // `show event` repeats the selected event outside its event range.
             // Keep selection identity without repeating a full transcript record.
             let mut completion = event_completion(&None);
             completion["trwl_event_id"] = r.event.event_id.clone().into();
-            collection(&r.events, "event", "event_range_event", completion)
+            collection(&r.events, "event", "event_range_event", &completion)
         }
         Report::ShowSession(r) => {
             let mut completion = event_completion(&None);
             completion["session"] = serde_json::to_value(&r.session)?;
-            collection(&r.events, "event", "event_range_event", completion)
+            collection(&r.events, "event", "event_range_event", &completion)
         }
         Report::Events(r) => collection(
             &r.events,
             "event",
             "event_range_event",
-            event_completion(&r.next_cursor),
+            &event_completion(&r.next_cursor),
         ),
         Report::Sessions(r) => collection(
             &r.sessions,
             "session",
             "session_range_session",
-            json!({
+            &json!({
                 "record_type": "session_range_completion",
                 "next_cursor": r.next_cursor,
                 "terminal": r.next_cursor.is_none(),
@@ -78,13 +78,13 @@ fn jsonl(report: &Report) -> Result<String> {
             sources,
             "source",
             "source",
-            json!({"record_type":"sources_completion"}),
+            &json!({"record_type":"sources_completion"}),
         ),
         Report::Import(r) => collection(
             &r.sources,
             "source",
             "source",
-            json!({"record_type":"sources_completion","outcome":r.outcome}),
+            &json!({"record_type":"sources_completion","outcome":r.outcome}),
         ),
         _ => json_line(report),
     }

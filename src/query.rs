@@ -326,19 +326,22 @@ fn resolve_in(index: &ReadIndex, kind: Entity, prefix: &str) -> Result<Record> {
         }),
         "ambiguous record reference {prefix:?}"
     );
-    Ok(first.clone())
+    matching
+        .into_iter()
+        .next()
+        .context("record reference not found")
 }
 
 pub fn show(root: &Path, kind: Entity, id: &str, window: usize) -> Result<Report> {
     let index = ReadIndex::open(root)?.context("no history index")?;
     let record = resolve_in(&index, kind, id)?;
     if matches!(kind, Entity::Event) {
-        let event = record.clone().project()?;
+        let event = record.project()?;
         let events = if window == 0 {
             vec![event.clone()]
         } else {
             index
-                .window(&record, window)?
+                .window(&event.session_id, &event.event_id, window)?
                 .into_iter()
                 .map(Record::project)
                 .collect::<Result<_>>()?

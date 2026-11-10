@@ -21,7 +21,7 @@ impl EmbeddingServer {
         let url = format!("http://{}", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let recorded = requests.clone();
+        let recorded = std::sync::Arc::clone(&requests);
         let (stop, stopped) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
             while stopped.try_recv().is_err() {
@@ -44,10 +44,10 @@ impl EmbeddingServer {
                     if line == "\r\n" {
                         break;
                     }
-                    if let Some((name, value)) = line.split_once(':') {
-                        if name.eq_ignore_ascii_case("content-length") {
-                            length = Some(value.trim().parse::<usize>().unwrap());
-                        }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = Some(value.trim().parse::<usize>().unwrap());
                     }
                 }
                 let mut body = vec![0; length.unwrap()];

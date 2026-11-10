@@ -221,25 +221,68 @@ pub struct ConversationMessage {
 
 impl ConversationMessage {
     pub fn new(record: &Record) -> Option<Self> {
-        let text = record.message_text()?.into_owned();
-        let request = matches!(record.role, Some(Role::User)).then(|| {
-            let mut request = record.clone();
-            request.text = text.chars().take(SEARCH_SNIPPET_CHARS).collect();
-            request.structured_content = Value::Null;
-            request.source_spans = None;
-            request
-        });
+        let view = Self::view(record)?;
         Some(Self {
-            session_id: record.session_id.clone(),
-            occurred_at: record.occurred_at.clone(),
-            sequence: record.sequence,
+            session_id: view.session_id.into(),
+            occurred_at: view.occurred_at.into(),
+            sequence: view.sequence,
+            event_id: view.event_id.into(),
+            provider_message_id: view.provider_message_id.map(str::to_owned),
+            source: view.source.into(),
+            text: view.text.into_owned(),
+            request: view.request,
+        })
+    }
+
+    pub fn view(record: &Record) -> Option<ConversationMessageView<'_>> {
+        let text = record.message_text()?;
+        let request = matches!(record.role, Some(Role::User)).then(|| Record {
             event_id: record.event_id.clone(),
+            session_id: record.session_id.clone(),
+            provider: record.provider,
+            provider_session_id: record.provider_session_id.clone(),
+            provider_event_id: record.provider_event_id.clone(),
             provider_message_id: record.provider_message_id.clone(),
-            source: record.source.path.clone(),
+            parent_session_id: record.parent_session_id.clone(),
+            event_type: record.event_type,
+            role: record.role.clone(),
+            occurred_at: record.occurred_at.clone(),
+            text: text.chars().take(SEARCH_SNIPPET_CHARS).collect(),
+            structured_content: Value::Null,
+            source_spans: None,
+            native_kind: record.native_kind,
+            workspace: record.workspace.clone(),
+            workspace_root: record.workspace_root.clone(),
+            source: record.source.clone(),
+            files: record.files.clone(),
+            sequence: record.sequence,
+            is_subagent: record.is_subagent,
+        });
+        Some(ConversationMessageView {
+            session_id: &record.session_id,
+            occurred_at: &record.occurred_at,
+            sequence: record.sequence,
+            event_id: &record.event_id,
+            provider_message_id: record.provider_message_id.as_deref(),
+            source: &record.source.path,
             text,
             request,
         })
     }
+}
+
+// Hashing borrows visible message text; pairing owns messages that outlive
+// their source records. Both use the same serialized field layout.
+#[derive(Serialize)]
+pub struct ConversationMessageView<'a> {
+    session_id: &'a str,
+    occurred_at: &'a str,
+    sequence: u64,
+    event_id: &'a str,
+    provider_message_id: Option<&'a str>,
+    source: &'a Path,
+    text: Cow<'a, str>,
+    request: Option<Record>,
 }
 
 impl Record {

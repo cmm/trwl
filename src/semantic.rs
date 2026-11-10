@@ -42,12 +42,13 @@ use ort::{
     environment::Environment,
     ep::{ArbitrarilyConfigurableExecutionProvider, ExecutionProvider, ExecutionProviderDispatch},
     session::Session,
-    value::Tensor,
+    value::{Tensor, TensorRef},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
     io::Read,
@@ -78,7 +79,7 @@ const INFERENCE_THREADS: usize = 2;
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct ChunkInput {
     text: String,
     tokens: usize,
@@ -240,24 +241,70 @@ fn model_hash(config: &Config, directory: &Path) -> Result<String> {
     memo.finish()
 }
 
-#[derive(Serialize, Deserialize)]
 struct EmbeddingDocument {
+    record: Record,
+    keys: Vec<String>,
+    prepared: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PreparedDocument {
+    input: String,
+    chunks: Vec<(String, ChunkInput)>,
+}
+
+#[derive(Default)]
+struct PreparationRegistry {
+    preparations: HashMap<String, Vec<String>>,
+    chunks: ChunkInputs,
+}
+
+impl PreparationRegistry {
+    fn register(&mut self, prepared: PreparedDocument) -> String {
+        let PreparedDocument { input, chunks } = prepared;
+        self.preparations.entry(input.clone()).or_insert_with(|| {
+            chunks
+                .into_iter()
+                .map(|(key, chunk)| {
+                    self.chunks.entry(key.clone()).or_insert(chunk);
+                    key
+                })
+                .collect()
+        });
+        input
+    }
+
+    fn chunks(&self, input: &str) -> Vec<(&str, &ChunkInput)> {
+        self.preparations[input]
+            .iter()
+            .map(|key| (key.as_str(), &self.chunks[key]))
+            .collect()
+    }
+}
+
+// Storage keeps the historical per-document layout; runtime text has one owner.
+#[derive(Serialize, Deserialize)]
+struct StoredDocument {
     record: Record,
     keys: Vec<String>,
     #[serde(default)]
     prepared: Option<PreparedDocument>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct PreparedDocument {
-    input: String,
-    chunks: Vec<(String, ChunkInput)>,
+impl StoredDocument {
+    fn register(self, registry: &mut PreparationRegistry) -> EmbeddingDocument {
+        EmbeddingDocument {
+            record: self.record,
+            keys: self.keys,
+            prepared: self.prepared.map(|prepared| registry.register(prepared)),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
 struct DocumentCache {
     version: crate::store::ConversationRevision,
-    documents: Vec<EmbeddingDocument>,
+    documents: Vec<StoredDocument>,
 }
 
 fn load_tokenizer(directory: &Path) -> Result<Tokenizer> {
@@ -284,7 +331,7 @@ enum PlanningTokenizer {
     Owned(PlanningState),
     Shared {
         selection: SelectionIdentity,
-        client: server::Client,
+        client: Box<server::Client>,
     },
 }
 
@@ -302,7 +349,7 @@ enum PlanningState {
 }
 
 impl PlanningState {
-    fn prepare(&mut self, selection: &Selection, texts: &[String]) -> Result<Vec<Vec<ChunkInput>>> {
+    fn prepare(&mut self, selection: &Selection, texts: &[&str]) -> Result<Vec<Vec<ChunkInput>>> {
         let key = match self {
             Self::Uninitialized => None,
             Self::Local { selection, .. } | Self::Remote { selection } => Some(&*selection),
@@ -338,7 +385,7 @@ impl PlanningTokenizer {
     fn shared(config: &Config, selection: &Selection) -> Self {
         Self::Shared {
             selection: selection.key.clone(),
-            client: server::Client::new(&config.directories, selection),
+            client: Box::new(server::Client::new(&config.directories, selection)),
         }
     }
 
@@ -347,9 +394,19 @@ impl PlanningTokenizer {
         config: &Config,
         selection: &Selection,
         index: &ReadIndex,
-    ) -> Result<(Vec<EmbeddingDocument>, ChunkInputs)> {
-        let reusable = index::prepared(config, &selection.key)?;
-        plan_records(&index.messages()?, &reusable, |texts| match self {
+    ) -> Result<(Vec<EmbeddingDocument>, PreparationRegistry)> {
+        let mut registry = index::prepared(config, &selection.key)?;
+        let documents = self.plan(selection, &index.messages()?, &mut registry)?;
+        Ok((documents, registry))
+    }
+
+    fn plan(
+        &mut self,
+        selection: &Selection,
+        records: &[ConversationMessage],
+        registry: &mut PreparationRegistry,
+    ) -> Result<Vec<EmbeddingDocument>> {
+        plan_records(records, registry, |texts| match self {
             Self::Owned(state) => state.prepare(selection, texts),
             Self::Shared {
                 selection: key,
@@ -366,7 +423,7 @@ impl PlanningTokenizer {
 fn materialize(
     index: &ReadIndex,
     tokenizer: Option<&mut Tokenizer>,
-) -> Result<(Vec<EmbeddingDocument>, ChunkInputs)> {
+) -> Result<(Vec<EmbeddingDocument>, PreparationRegistry)> {
     let records = index.messages()?;
     match tokenizer {
         Some(tokenizer) => DocumentTokenizer::prepare(tokenizer, |tokenizer| {
@@ -419,76 +476,84 @@ impl DocumentTokenizer<'_> {
 fn materialize_documents(
     records: &[ConversationMessage],
     tokenizer: Option<&Tokenizer>,
-) -> Result<(Vec<EmbeddingDocument>, ChunkInputs)> {
-    plan_records(records, &HashMap::new(), |texts| {
+) -> Result<(Vec<EmbeddingDocument>, PreparationRegistry)> {
+    let mut registry = PreparationRegistry::default();
+    let documents = plan_records(records, &mut registry, |texts| {
         prepare_chunks(texts, tokenizer)
-    })
+    })?;
+    Ok((documents, registry))
 }
 
 fn plan_records(
     records: &[ConversationMessage],
-    reusable: &HashMap<String, PreparedDocument>,
-    mut prepare: impl FnMut(&[String]) -> Result<Vec<Vec<ChunkInput>>>,
-) -> Result<(Vec<EmbeddingDocument>, ChunkInputs)> {
-    let mut inputs = BTreeMap::new();
+    registry: &mut PreparationRegistry,
+    mut prepare: impl FnMut(&[&str]) -> Result<Vec<Vec<ChunkInput>>>,
+) -> Result<Vec<EmbeddingDocument>> {
     let mut plan = Vec::new();
     for batch in documents(records).chunks(BATCH_SIZE) {
         // Cap documents before sending them to inference so a native transcript
         // cannot make a planning request exceed the transport's frame limit.
-        let texts: Vec<String> = batch
+        let texts: Vec<&str> = batch
             .iter()
-            .map(|(_, text)| text.chars().take(DOCUMENT_MAX_CHARS).collect())
+            .map(|(_, text)| {
+                &text[..text
+                    .char_indices()
+                    .nth(DOCUMENT_MAX_CHARS)
+                    .map_or(text.len(), |(i, _)| i)]
+            })
             .collect();
         // Pairing and result metadata come from this commit. Reuse only the
         // capped composed input: a later reply can change an older user's plan.
         let identities: Vec<_> = texts.iter().map(|text| digest(&[text])).collect();
+        let mut seen = HashSet::new();
         let missing: Vec<_> = texts
             .iter()
             .zip(&identities)
-            .filter(|(_, input)| !reusable.contains_key(*input))
-            .map(|(text, _)| text.clone())
+            .filter(|(_, input)| {
+                !registry.preparations.contains_key(*input) && seen.insert(input.as_str())
+            })
             .collect();
+        let missing_texts: Vec<_> = missing.iter().map(|(text, _)| **text).collect();
         let prepared = if missing.is_empty() {
             Vec::new()
         } else {
-            prepare(&missing)?
+            prepare(&missing_texts)?
         };
         ensure!(
             prepared.len() == missing.len(),
             "planning batch size differs"
         );
-        let mut prepared = prepared.into_iter();
+        for ((_, input), chunks) in missing.into_iter().zip(prepared) {
+            registry.register(PreparedDocument {
+                input: input.clone(),
+                chunks: chunks
+                    .into_iter()
+                    .map(|chunk| (digest(&[&chunk.text]), chunk))
+                    .collect(),
+            });
+        }
         for ((record, _), input) in batch.iter().zip(identities) {
-            let prepared = match reusable.get(&input) {
-                Some(prepared) => prepared.clone(),
-                None => PreparedDocument {
-                    input,
-                    chunks: prepared
-                        .next()
-                        .unwrap()
-                        .into_iter()
-                        .map(|chunk| (digest(&[&chunk.text]), chunk))
-                        .collect(),
-                },
-            };
-            let mut keys = Vec::new();
-            for (key, chunk) in &prepared.chunks {
-                keys.push(key.clone());
-                inputs.entry(key.clone()).or_insert_with(|| chunk.clone());
-            }
             plan.push(EmbeddingDocument {
                 record: (**record).clone(),
-                keys,
-                prepared: Some(prepared),
+                keys: registry.preparations[&input].clone(),
+                prepared: Some(input),
             });
         }
     }
-    Ok((plan, inputs))
+    Ok(plan)
 }
 
-enum Materialization {
-    Deferred,
-    Materialized(ChunkInputs),
+struct Materialization {
+    registry: PreparationRegistry,
+    deferred: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DocumentMetadata<'a> {
+    selection: &'a Selection,
+    index: &'a ReadIndex,
+    version: &'a crate::store::ConversationRevision,
+    documents: &'a [EmbeddingDocument],
 }
 
 struct DocumentPlan<'a> {
@@ -499,19 +564,41 @@ struct DocumentPlan<'a> {
     materialization: Materialization,
 }
 
-// Availability is independent of scores and of the query's later filters.
-// Own the keys so input materialization can mutate the pinned plan during fill.
-struct KeyCoverage {
-    keys: HashMap<String, bool>,
+impl DocumentPlan<'_> {
+    fn metadata(&self) -> DocumentMetadata<'_> {
+        DocumentMetadata {
+            selection: self.selection,
+            index: self.index,
+            version: &self.version,
+            documents: &self.documents,
+        }
+    }
+
+    fn split(&mut self) -> (DocumentMetadata<'_>, &mut Materialization) {
+        (
+            DocumentMetadata {
+                selection: self.selection,
+                index: self.index,
+                version: &self.version,
+                documents: &self.documents,
+            },
+            &mut self.materialization,
+        )
+    }
 }
 
-impl KeyCoverage {
-    fn new(documents: &[EmbeddingDocument]) -> Self {
+// Availability is independent of scores and of the query's later filters.
+struct KeyCoverage<'a> {
+    keys: HashMap<&'a str, bool>,
+}
+
+impl<'a> KeyCoverage<'a> {
+    fn new(documents: &'a [EmbeddingDocument]) -> Self {
         Self {
             keys: documents
                 .iter()
                 .flat_map(|document| &document.keys)
-                .map(|key| (key.clone(), false))
+                .map(|key| (key.as_str(), false))
                 .collect(),
         }
     }
@@ -531,19 +618,19 @@ impl KeyCoverage {
     }
 }
 
-struct Scores<'query> {
-    coverage: KeyCoverage,
-    owners: HashMap<String, Vec<usize>>,
+struct Scores<'document, 'query> {
+    coverage: KeyCoverage<'document>,
+    owners: HashMap<&'document str, Vec<usize>>,
     best: Vec<Option<f32>>,
     queries: &'query [Vec<f32>],
 }
 
-impl<'query> Scores<'query> {
-    fn new(documents: &[EmbeddingDocument], queries: &'query [Vec<f32>]) -> Self {
-        let mut owners: HashMap<String, Vec<usize>> = HashMap::new();
+impl<'document, 'query> Scores<'document, 'query> {
+    fn new(documents: &'document [EmbeddingDocument], queries: &'query [Vec<f32>]) -> Self {
+        let mut owners: HashMap<&str, Vec<usize>> = HashMap::new();
         for (i, document) in documents.iter().enumerate() {
             for key in &document.keys {
-                let entries = owners.entry(key.clone()).or_default();
+                let entries = owners.entry(key.as_str()).or_default();
                 if entries.last() != Some(&i) {
                     entries.push(i);
                 }
@@ -578,14 +665,28 @@ impl<'query> Scores<'query> {
         Ok(())
     }
 
-    fn finish(self, documents: &[EmbeddingDocument]) -> Result<SearchResult> {
-        let complete = self.coverage.complete();
+    fn finish(self) -> FinishedScores {
+        FinishedScores {
+            complete: self.coverage.complete(),
+            best: self.best,
+        }
+    }
+}
+
+struct FinishedScores {
+    complete: bool,
+    best: Vec<Option<f32>>,
+}
+
+impl FinishedScores {
+    fn results(self, documents: Vec<EmbeddingDocument>) -> Result<SearchResult> {
+        let complete = self.complete;
         // Preserve plan order; query.rs owns filtering, ranking and grouping.
         let hits: Vec<_> = self
             .best
             .into_iter()
             .zip(documents)
-            .filter_map(|(score, document)| score.map(|score| (score, document.record.clone())))
+            .filter_map(|(score, document)| score.map(|score| (score, document.record)))
             .collect();
         ensure!(
             complete || !hits.is_empty(),
@@ -595,20 +696,23 @@ impl<'query> Scores<'query> {
     }
 }
 
-impl DocumentPlan<'_> {
-    fn take_inputs(
+impl Materialization {
+    fn ensure_inputs(
         &mut self,
-        config: &Config,
+        metadata: DocumentMetadata<'_>,
         tokenizer: &mut PlanningTokenizer,
-    ) -> Result<ChunkInputs> {
-        // Taking inputs leaves the plan rematerializable from the same snapshot.
-        // Deferred inputs say nothing about whether its vectors are complete.
-        match std::mem::replace(&mut self.materialization, Materialization::Deferred) {
-            Materialization::Materialized(inputs) => Ok(inputs),
-            Materialization::Deferred => {
-                Ok(tokenizer.materialize(config, self.selection, self.index)?.1)
-            }
+    ) -> Result<()> {
+        if self.deferred {
+            // Regenerate text from the pinned reader, never its frozen document
+            // records or ordered keys. Legacy mappings may have vectors already.
+            tokenizer.plan(
+                metadata.selection,
+                &metadata.index.messages()?,
+                &mut self.registry,
+            )?;
+            self.deferred = false;
         }
+        Ok(())
     }
 }
 
@@ -620,11 +724,23 @@ fn document_plan<'a>(
 ) -> Result<DocumentPlan<'a>> {
     let version = index.version();
     let (documents, materialization) =
-        if let Some(documents) = index::documents(config, &selection.key, &version)? {
-            (documents, Materialization::Deferred)
+        if let Some((documents, registry)) = index::documents(config, &selection.key, &version)? {
+            let deferred = documents.iter().any(|document| {
+                document
+                    .keys
+                    .iter()
+                    .any(|key| !registry.chunks.contains_key(key))
+            });
+            (documents, Materialization { registry, deferred })
         } else {
             let (documents, inputs) = tokenizer.materialize(config, selection, index)?;
-            (documents, Materialization::Materialized(inputs))
+            (
+                documents,
+                Materialization {
+                    registry: inputs,
+                    deferred: false,
+                },
+            )
         };
     let plan = DocumentPlan {
         selection,
@@ -792,7 +908,7 @@ impl Executor {
         Ok(None)
     }
 
-    fn embed(&mut self, texts: &[String], prefix: &str) -> Result<Vec<Vec<f32>>> {
+    fn embed(&mut self, texts: &[&str], prefix: &str) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -843,7 +959,7 @@ impl Executor {
                 session.batch(|session| {
                     let mut inputs = ort::inputs![
                         "input_ids" => Tensor::from_array(([texts.len(), width], ids))?,
-                        "attention_mask" => Tensor::from_array(([texts.len(), width], mask.clone()))?,
+                        "attention_mask" => TensorRef::from_array_view(([texts.len(), width], mask.as_slice()))?,
                     ];
                     if session
                         .inputs()
@@ -1034,7 +1150,7 @@ fn http_vectors(value: &Value, count: usize) -> Result<Vec<Vec<f32>>> {
             index < count && vectors[index].is_none(),
             "duplicate or invalid embedding response index"
         );
-        let vector: Vec<f32> = serde_json::from_value(item["embedding"].clone())
+        let vector = Vec::<f32>::deserialize(&item["embedding"])
             .context("embedding is not a float vector")?;
         vectors[index] = Some(vector);
     }
@@ -1068,7 +1184,7 @@ fn normalize(vector: &mut [f32]) -> Result<()> {
 fn documents(records: &[ConversationMessage]) -> Vec<(&Record, String)> {
     let mut messages: Vec<_> = records
         .iter()
-        .map(|record| (record, record.text.clone()))
+        .map(|record| (record, Cow::Borrowed(record.text.as_str())))
         .collect();
     messages.sort_by(|(a, _), (b, _)| {
         a.session_id.cmp(&b.session_id).then_with(|| {
@@ -1080,17 +1196,20 @@ fn documents(records: &[ConversationMessage]) -> Vec<(&Record, String)> {
     });
     // OpenCode emits one record per part. Merge visible parts before pairing
     // turns, keeping the first part as the result's event reference.
-    let mut merged: Vec<(&ConversationMessage, String)> = Vec::new();
+    let mut merged: Vec<(&ConversationMessage, Cow<'_, str>)> = Vec::new();
     let mut positions = HashMap::new();
     for (record, text) in messages {
         if let Some(message) = &record.provider_message_id {
             let key = (&record.session_id, &record.source, message);
             if let Some(&position) = positions.get(&key) {
-                let (_, combined): &mut (&ConversationMessage, String) = &mut merged[position];
+                let (_, combined): &mut (&ConversationMessage, Cow<'_, str>) =
+                    &mut merged[position];
                 if !combined.is_empty() && !text.is_empty() {
-                    combined.push('\n');
+                    combined.to_mut().push('\n');
                 }
-                combined.push_str(&text);
+                if !text.is_empty() {
+                    combined.to_mut().push_str(&text);
+                }
                 continue;
             }
             positions.insert(key, merged.len());
@@ -1234,7 +1353,7 @@ fn document_chunks<'a>(
     Ok(result)
 }
 
-fn prepare_chunks(texts: &[String], tokenizer: Option<&Tokenizer>) -> Result<Vec<Vec<ChunkInput>>> {
+fn prepare_chunks(texts: &[&str], tokenizer: Option<&Tokenizer>) -> Result<Vec<Vec<ChunkInput>>> {
     // Padding follows token count, which can differ for equal-length text.
     // Keep the length measured with inference's prefix during the budget check.
     // Discard encodings rather than retaining the whole corpus's tokens in memory.
@@ -1252,13 +1371,15 @@ fn prepare_chunks(texts: &[String], tokenizer: Option<&Tokenizer>) -> Result<Vec
         .collect()
 }
 
-fn ordered_inputs(inputs: ChunkInputs) -> Vec<(String, ChunkInput)> {
+fn ordered_inputs<'a>(
+    inputs: impl IntoIterator<Item = (&'a String, &'a ChunkInput)>,
+) -> Vec<(&'a String, &'a ChunkInput)> {
     let mut inputs: Vec<_> = inputs.into_iter().collect();
-    inputs.sort_by_key(|(_, input)| input.tokens);
+    inputs.sort_by(|(a, x), (b, y)| x.tokens.cmp(&y.tokens).then_with(|| a.cmp(b)));
     inputs
 }
 
-fn heavy_incremental(inputs: &[(String, ChunkInput)]) -> bool {
+fn heavy_incremental(inputs: &[(&String, &ChunkInput)]) -> bool {
     // Sorted batches pay for padding to their longest input. The work budget
     // amortizes worker/model startup; device costs vary, so it is not a
     // hardware-independent latency prediction.
@@ -1278,36 +1399,45 @@ fn heavy_incremental(inputs: &[(String, ChunkInput)]) -> bool {
 
 fn fill(
     config: &Config,
-    plan: &mut DocumentPlan<'_>,
+    plan: DocumentMetadata<'_>,
+    materialization: &mut Materialization,
     tokenizer: &mut PlanningTokenizer,
     executor: &mut Option<Executor>,
-    target: &mut FillTarget<'_>,
+    target: &mut FillTarget<'_, '_>,
 ) -> Result<()> {
     let _lock = lock(&config.directories.cache, "semantic.lock")?;
     // A query can wait behind a newer fill. Its pinned inputs still need
     // embeddings, but must not replace the newer persistent snapshot.
     let publication =
-        if store::semantic_version(&config.directories.data)?.as_ref() == Some(&plan.version) {
+        if store::semantic_version(&config.directories.data)?.as_ref() == Some(plan.version) {
             Publication::Current
         } else {
             Publication::Local
         };
-    fill_locked(config, plan, tokenizer, executor, target, publication)
+    fill_locked(
+        config,
+        plan,
+        materialization,
+        tokenizer,
+        executor,
+        target,
+        publication,
+    )
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Publication {
     Current,
     Local,
 }
 
-enum FillTarget<'query> {
-    Query(Scores<'query>),
-    Update(KeyCoverage),
+enum FillTarget<'document, 'query> {
+    Query(Scores<'document, 'query>),
+    Update(KeyCoverage<'document>),
 }
 
-impl FillTarget<'_> {
-    fn coverage(&self) -> &KeyCoverage {
+impl FillTarget<'_, '_> {
+    fn coverage(&self) -> &KeyCoverage<'_> {
         match self {
             Self::Query(scores) => &scores.coverage,
             Self::Update(coverage) => coverage,
@@ -1331,15 +1461,18 @@ enum FillBackend {
 }
 
 enum FillProgress<'a> {
-    Gpu(worker::Pending<&'a [(String, ChunkInput)]>),
-    Cpu(worker::Batch<&'a [(String, ChunkInput)]>),
+    Gpu(worker::Pending<'a, &'a [(&'a String, &'a ChunkInput)]>),
+    Cpu(worker::Batch<'a, &'a [(&'a String, &'a ChunkInput)]>),
     Finished(FillBackend),
 }
 
 impl FillBackend {
-    fn submit(self, inputs: &[(String, ChunkInput)]) -> FillProgress<'_> {
+    fn submit<'a>(self, inputs: &'a [(&'a String, &'a ChunkInput)]) -> FillProgress<'a> {
         let batch = worker::Batch {
-            texts: inputs.iter().map(|(_, input)| input.text.clone()).collect(),
+            texts: inputs
+                .iter()
+                .map(|(_, input)| input.text.as_str())
+                .collect(),
             association: inputs,
         };
         match self {
@@ -1351,15 +1484,16 @@ impl FillBackend {
 
 fn fill_locked(
     config: &Config,
-    plan: &mut DocumentPlan<'_>,
+    plan: DocumentMetadata<'_>,
+    materialization: &mut Materialization,
     tokenizer: &mut PlanningTokenizer,
     executor: &mut Option<Executor>,
-    target: &mut FillTarget<'_>,
+    target: &mut FillTarget<'_, '_>,
     publication: Publication,
 ) -> Result<()> {
     let selection = plan.selection;
     if publication == Publication::Current {
-        index::publish_mapping(config, plan)?;
+        index::publish_mapping(config, plan, &materialization.registry)?;
     }
     match target {
         FillTarget::Query(scores) => index::scan_vectors(config, &selection.key, |key, vector| {
@@ -1376,13 +1510,10 @@ fn fill_locked(
         }
         return Ok(());
     }
-    let inputs = plan.take_inputs(config, tokenizer)?;
-    let missing = inputs
-        .into_iter()
-        .filter(|(key, _)| {
-            target.coverage().keys.contains_key(key) && !target.coverage().available(key)
-        })
-        .collect();
+    materialization.ensure_inputs(plan, tokenizer)?;
+    let missing = materialization.registry.chunks.iter().filter(|(key, _)| {
+        target.coverage().keys.contains_key(key.as_str()) && !target.coverage().available(key)
+    });
     let missing = ordered_inputs(missing);
     let worker = if matches!(target, FillTarget::Update(_))
         && selection.directory.is_some()
@@ -1437,7 +1568,7 @@ fn fill_locked(
             vectors: batch
                 .association
                 .iter()
-                .map(|(key, _)| key.clone())
+                .map(|(key, _)| (*key).clone())
                 .zip(vectors)
                 .collect(),
         };
@@ -1515,10 +1646,12 @@ fn refresh_inner(config: &Config, rebuild: bool, tokenizer: &mut PlanningTokeniz
     }
     // Chunking and batch ordering share a vocabulary, loaded only on a cache miss.
     let mut plan = document_plan(config, &selection, &index, tokenizer)?;
-    let mut target = FillTarget::Update(KeyCoverage::new(&plan.documents));
+    let (metadata, materialization) = plan.split();
+    let mut target = FillTarget::Update(KeyCoverage::new(metadata.documents));
     fill_locked(
         config,
-        &mut plan,
+        metadata,
+        materialization,
         tokenizer,
         &mut None,
         &mut target,
@@ -1567,7 +1700,7 @@ fn coverage(config: &Config, report: &mut SemanticStatus) -> Result<()> {
         &index,
         &mut PlanningTokenizer::default(),
     )?;
-    let mut coverage = KeyCoverage::new(&plan.documents);
+    let mut coverage = KeyCoverage::new(plan.metadata().documents);
     index::scan_keys(config, &selection.key, |key| {
         coverage.observe(key);
         Ok(())
@@ -1649,18 +1782,21 @@ pub fn search(
     // Detect an unavailable index and query-executor failures before loading transcript payloads.
     // A failed semantic attempt must leave lexical fallback independent of their size.
     let mut executor = Some(Executor::shared(config, &selection)?);
-    let queries = executor.as_mut().unwrap().embed(terms, QUERY_PREFIX)?;
+    let terms: Vec<_> = terms.iter().map(String::as_str).collect();
+    let queries = executor.as_mut().unwrap().embed(&terms, QUERY_PREFIX)?;
     let mut tokenizer = if selection.directory.is_some() {
         PlanningTokenizer::shared(config, &selection)
     } else {
         PlanningTokenizer::default()
     };
     let mut plan = document_plan(config, &selection, index, &mut tokenizer)?;
-    let mut target = FillTarget::Query(Scores::new(&plan.documents, &queries));
+    let (metadata, materialization) = plan.split();
+    let mut target = FillTarget::Query(Scores::new(metadata.documents, &queries));
     if fill_missing {
         fill(
             config,
-            &mut plan,
+            metadata,
+            materialization,
             &mut tokenizer,
             &mut executor,
             &mut target,
@@ -1673,7 +1809,8 @@ pub fn search(
     let FillTarget::Query(scores) = target else {
         unreachable!()
     };
-    scores.finish(&plan.documents)
+    let scores = scores.finish();
+    scores.results(plan.documents)
 }
 
 #[cfg(test)]
@@ -1715,6 +1852,7 @@ pub(crate) mod tests {
             index::documents(&config, &selection.key, &main.version())
                 .unwrap()
                 .unwrap()
+                .0
                 .is_empty()
         );
         planner.refresh(&config).unwrap();
@@ -1799,10 +1937,12 @@ pub(crate) mod tests {
                 &mut PlanningTokenizer::default(),
             )
             .unwrap();
-            let mut target = FillTarget::Update(KeyCoverage::new(&plan.documents));
+            let (metadata, materialization) = plan.split();
+            let mut target = FillTarget::Update(KeyCoverage::new(metadata.documents));
             fill_locked(
                 &config,
-                &mut plan,
+                metadata,
+                materialization,
                 &mut PlanningTokenizer::default(),
                 &mut None,
                 &mut target,
@@ -1993,7 +2133,7 @@ pub(crate) mod tests {
         let settings = tokenizer.to_string(false).unwrap();
         let actual = materialize(&index, Some(&mut tokenizer)).unwrap();
         assert_eq!(actual.0[0].keys, expected.0[0].keys);
-        assert_eq!(actual.1, expected.1);
+        assert_eq!(actual.1.chunks, expected.1.chunks);
         assert_eq!(tokenizer.to_string(false).unwrap(), settings);
 
         // A failed tokenization must not leave inference unpadded/untruncated.
@@ -2030,10 +2170,10 @@ pub(crate) mod tests {
             directory: Some(dir.path().into()),
         };
         let mut vocabulary = PlanningTokenizer::default();
-        let mut plan = document_plan(&config, &selection, &index, &mut vocabulary).unwrap();
-        index::publish_mapping(&config, &plan).unwrap();
+        let plan = document_plan(&config, &selection, &index, &mut vocabulary).unwrap();
+        index::publish_mapping(&config, plan.metadata(), &plan.materialization.registry).unwrap();
         fs::remove_file(&tokenizer_path).unwrap();
-        let inputs = ordered_inputs(plan.take_inputs(&config, &mut vocabulary).unwrap());
+        let inputs = ordered_inputs(&plan.materialization.registry.chunks);
         let documents = &plan.documents;
         assert_eq!(inputs.len(), 1);
         let mut cached = document_plan(
@@ -2043,16 +2183,17 @@ pub(crate) mod tests {
             &mut PlanningTokenizer::default(),
         )
         .unwrap();
-        assert!(matches!(cached.materialization, Materialization::Deferred));
         assert_eq!(cached.documents[0].keys, documents[0].keys);
         let vectors = Cache {
             vectors: [(documents[0].keys[0].clone(), vec![1.0, 0.0])].into(),
         };
-        index::publish_batch(&config, &plan, &vectors).unwrap();
-        let mut target = FillTarget::Update(KeyCoverage::new(&cached.documents));
+        index::publish_batch(&config, plan.metadata(), &vectors).unwrap();
+        let (metadata, materialization) = cached.split();
+        let mut target = FillTarget::Update(KeyCoverage::new(metadata.documents));
         fill(
             &config,
-            &mut cached,
+            metadata,
+            materialization,
             &mut PlanningTokenizer::default(),
             &mut None,
             &mut target,
@@ -2074,8 +2215,8 @@ pub(crate) mod tests {
             &mut PlanningTokenizer::default(),
         )
         .unwrap();
-        index::publish_mapping(&config, &other).unwrap();
-        index::publish_batch(&config, &other, &vectors).unwrap();
+        index::publish_mapping(&config, other.metadata(), &other.materialization.registry).unwrap();
+        index::publish_batch(&config, other.metadata(), &vectors).unwrap();
         let reused = document_plan(
             &config,
             &selection,
@@ -2117,8 +2258,14 @@ pub(crate) mod tests {
         tokenizer.save(&tokenizer_path, false).unwrap();
         let retried = document_plan(&config, &changed, &next, &mut vocabulary).unwrap();
         assert_eq!(
-            retried.documents[0].prepared.as_ref().unwrap().chunks,
-            paired.documents[0].prepared.as_ref().unwrap().chunks,
+            retried
+                .materialization
+                .registry
+                .chunks(retried.documents[0].prepared.as_ref().unwrap()),
+            paired
+                .materialization
+                .registry
+                .chunks(paired.documents[0].prepared.as_ref().unwrap()),
         );
     }
 
@@ -2163,7 +2310,7 @@ pub(crate) mod tests {
                 &mut PlanningTokenizer::default(),
             )
             .unwrap();
-            (plan.documents, plan.materialization)
+            plan.documents
         };
         let mut user = json!({
             "type":"user", "uuid":"11111111-1111-4111-8111-111111111111",
@@ -2194,8 +2341,7 @@ pub(crate) mod tests {
             })
             .unwrap()
             .event_id;
-        let (first, inputs) = plan(&index);
-        assert!(matches!(inputs, Materialization::Materialized(_)));
+        let first = plan(&index);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].record.text, "question");
         assert!(first[0].record.source_spans.is_none());
@@ -2212,7 +2358,12 @@ pub(crate) mod tests {
             &mut PlanningTokenizer::default(),
         )
         .unwrap();
-        index::publish_mapping(&config, &initial).unwrap();
+        index::publish_mapping(
+            &config,
+            initial.metadata(),
+            &initial.materialization.registry,
+        )
+        .unwrap();
 
         assistant["message"]["content"][0]["thinking"] = json!("revised private reasoning");
         user["message"]["content"][0]["thinking"] = json!("revised selected user prefix");
@@ -2226,16 +2377,14 @@ pub(crate) mod tests {
         let mut expected = assistant["message"].clone();
         expected["content"].as_array_mut().unwrap().remove(0);
         assert_eq!(latest[0].structured_content, expected);
-        let (cached, inputs) = plan(&irrelevant);
-        assert!(matches!(inputs, Materialization::Deferred));
+        let cached = plan(&irrelevant);
         assert_eq!(cached[0].keys, first[0].keys);
         assert_eq!(irrelevant.record_decodes.get(), 0);
 
         assistant["message"]["content"][1]["text"] = json!("edited answer");
         let visible = write(&user, Some(&assistant));
         assert_ne!(visible.version(), irrelevant.version());
-        let (edited, inputs) = plan(&visible);
-        assert!(matches!(inputs, Materialization::Materialized(_)));
+        let edited = plan(&visible);
         assert_eq!(edited.len(), 1);
         assert_eq!(
             edited[0].keys,
@@ -2247,8 +2396,7 @@ pub(crate) mod tests {
         user["timestamp"] = json!("2026-01-01T00:00:30.000Z");
         let metadata = write(&user, Some(&assistant));
         assert_ne!(metadata.version(), visible.version());
-        let (updated, inputs) = plan(&metadata);
-        assert!(matches!(inputs, Materialization::Materialized(_)));
+        let updated = plan(&metadata);
         assert_eq!(updated.len(), 1);
         assert_eq!(updated[0].keys, edited[0].keys);
         assert_eq!(updated[0].record.workspace, "/workspace/second");
@@ -2257,13 +2405,12 @@ pub(crate) mod tests {
 
         let deleted = write(&user, None);
         assert_ne!(deleted.version(), metadata.version());
-        let (unanswered, inputs) = plan(&deleted);
-        assert!(matches!(inputs, Materialization::Materialized(_)));
+        let unanswered = plan(&deleted);
         assert_eq!(unanswered.len(), 1);
         assert_eq!(unanswered[0].keys, vec![digest(&["user:\nquestion"])]);
         assert_eq!(deleted.record_decodes.get(), 1);
 
-        let (pinned, _) = plan(&irrelevant);
+        let pinned = plan(&irrelevant);
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned[0].keys, first[0].keys);
         assert_eq!(pinned[0].record.workspace, "/workspace/first");

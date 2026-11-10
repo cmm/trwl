@@ -5,6 +5,12 @@ edition = "2024"
 license = "Apache-2.0"
 description = "Search coding agent history"
 
+[lints.clippy]
+redundant_clone = "warn"
+needless_pass_by_value = "warn"
+unnecessary_to_owned = "warn"
+clone_on_ref_ptr = "warn"
+
 [dependencies]
 anyhow = "1"
 chrono = "0.4"

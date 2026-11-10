@@ -3,6 +3,7 @@
   onnxruntime,
   lib,
   rustPlatform,
+  clippy,
   pkg-config,
   oniguruma,
   sqlite,
@@ -46,6 +47,10 @@ let
     # The ignored provider-equivalence test needs OpenVINO, which the ONNX
     # Runtime package in stable nixpkgs does not include.
     nativeBuildInputs = [ pkg-config ];
+    nativeCheckInputs = [ clippy ];
+    postCheck = ''
+      cargo clippy --offline --all-targets --release -- -D warnings
+    '';
     buildInputs = [
       onnxruntime
       oniguruma

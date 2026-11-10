@@ -34,8 +34,9 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    borrow::Cow,
     cmp::{Ordering, Reverse},
-    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet, btree_map, hash_map},
     ffi::CString,
     fs::{self, File},
     hash::Hash,
@@ -436,9 +437,10 @@ impl LexicalResults<'_> {
             .unwrap_or("");
         // Older v6 documents store selected text in `text`; their summary's
         // spans must still be applied even when the original source is gone.
-        let text = source
-            .as_ref()
-            .map_or_else(|| Ok(text.to_owned()), |spans| spans.project_text(text))?;
+        let text = source.as_ref().map_or_else(
+            || Ok(Cow::Borrowed(text)),
+            |spans| spans.project_text(text).map(Cow::Owned),
+        )?;
         let fragment = self
             .generators
             .iter()
@@ -637,14 +639,16 @@ impl<T: Ord + Clone + Hash> Candidates<T> {
                     rows.push(Reverse(row));
                 }
             }
-            Self::Sessions(rows) => {
-                let entry = rows
-                    .entry(row.session.clone())
-                    .or_insert_with(|| row.clone());
-                if row > *entry {
-                    *entry = row;
+            Self::Sessions(rows) => match rows.entry(row.session.clone()) {
+                hash_map::Entry::Vacant(entry) => {
+                    entry.insert(row);
                 }
-            }
+                hash_map::Entry::Occupied(mut entry) => {
+                    if row > *entry.get() {
+                        entry.insert(row);
+                    }
+                }
+            },
             #[cfg(test)]
             Self::All(rows) => rows.push(row),
         }
@@ -1317,9 +1321,15 @@ impl ReadIndex {
                     chronological: false,
                 },
             )? {
-                let best = scores.entry(row.address).or_insert_with(|| row.clone());
-                if row > *best {
-                    *best = row;
+                match scores.entry(row.address) {
+                    btree_map::Entry::Vacant(entry) => {
+                        entry.insert(row);
+                    }
+                    btree_map::Entry::Occupied(mut entry) => {
+                        if row > *entry.get() {
+                            entry.insert(row);
+                        }
+                    }
                 }
             }
         }
@@ -1376,14 +1386,11 @@ impl ReadIndex {
             .collect())
     }
 
-    pub fn window(&self, record: &Record, radius: usize) -> Result<Vec<Record>> {
+    pub fn window(&self, session: &str, event: &str, radius: usize) -> Result<Vec<Record>> {
         let mut addresses = self.addresses(&BooleanQuery::new(vec![
             (
                 Occur::Must,
-                term_query(Term::from_field_text(
-                    self.fields.session,
-                    &record.session_id,
-                )),
+                term_query(Term::from_field_text(self.fields.session, session)),
             ),
             (Occur::Must, self.ordinary_content()),
         ]))?;
@@ -1414,7 +1421,7 @@ impl ReadIndex {
         ordered.sort_unstable_by(|(a, _), (b, _)| b.compare(a));
         let selected = ordered
             .iter()
-            .position(|(order, _)| order.id() == record.event_id)
+            .position(|(order, _)| order.id() == event)
             .context("event missing from session")?;
         let end = selected
             .saturating_add(radius)
@@ -1562,7 +1569,7 @@ fn read_record(searcher: &Searcher, fields: Fields, address: DocAddress) -> Resu
 }
 
 fn message_hash(record: &Record) -> Result<Option<String>> {
-    ConversationMessage::new(record)
+    ConversationMessage::view(record)
         .map(|message| Ok(digest(&[&serde_json::to_string(&message)?])))
         .transpose()
 }
@@ -1768,7 +1775,7 @@ mod staging {
 
     pub(super) fn stage_input(
         input: &InputSnapshot,
-        previous: Option<providers::Checkpoint>,
+        previous: Option<&providers::Checkpoint>,
         spool: &mut Option<BufWriter<File>>,
         directories: &crate::directories::Directories,
         parse: &mut impl FnMut(
@@ -1786,16 +1793,11 @@ mod staging {
         }
         let spool = spool.as_mut().unwrap();
         let start = spool.stream_position()?;
-        let parsed = parse(
-            input.provider,
-            &input.path,
-            previous.as_ref(),
-            &mut |record| {
-                serde_json::to_writer(&mut *spool, record)?;
-                spool.write_all(b"\n")?;
-                Ok(())
-            },
-        )?;
+        let parsed = parse(input.provider, &input.path, previous, &mut |record| {
+            serde_json::to_writer(&mut *spool, record)?;
+            spool.write_all(b"\n")?;
+            Ok(())
+        })?;
         let length = spool.stream_position()? - start;
         // SQLite parsing owns a read transaction. Keep its pre-read stamp so later
         // commits cause another scan, not a rejection of the snapshot just read.
@@ -1803,7 +1805,7 @@ mod staging {
             input.provider == Provider::Opencode || input.stamp == stamp(&input.path, false)?,
             "input changed during parsing; retry import"
         );
-        let unchanged = previous.as_ref() == Some(&parsed.checkpoint);
+        let unchanged = previous == Some(&parsed.checkpoint);
         // An unchanged checkpoint is not rewritten, so a stamp-only
         // change leaves the published records untouched. Replacing
         // every record also deletes the old checkpoint.
@@ -2297,7 +2299,13 @@ fn stage_index(
             ..
         } = &input;
         let parsed = previous.and_then(|previous| {
-            staging::stage_input(&input, previous, &mut spool, &config.directories, parse)
+            staging::stage_input(
+                &input,
+                previous.as_ref(),
+                &mut spool,
+                &config.directories,
+                parse,
+            )
         });
         match parsed {
             Ok((replacement, report)) => {
@@ -2425,7 +2433,7 @@ impl CompletedImport {
             if let staging::CheckpointIntent::Write(checkpoint) = &replacement.checkpoint {
                 writer.delete_query(checkpoint_query(fields, &key))?;
                 writer.add_document(doc!(
-                    fields.source => key.clone(),
+                    fields.source => key,
                     fields.id => CHECKPOINT_ID,
                     fields.message => false,
                     fields.record => serde_json::to_vec(checkpoint)?
@@ -2444,42 +2452,41 @@ impl CompletedImport {
                 if let Some(hash) = message_hash(&record)? {
                     added_messages.push(hash);
                 }
-                let full = serde_json::to_vec(&StoredRecord::new(record.clone()))?;
                 let message = record.is_conversation_message();
                 let availability = u64::from(!record.has_ordinary_content());
-                let mut summary = record.clone();
-                summary.text.clear();
-                summary.structured_content = Value::Null;
-                summary.files.clear();
                 let mut document = doc!(
-                    fields.source => key.clone(),
-                    fields.id => record.event_id.clone(),
-                    fields.session => record.session_id.clone(),
                     fields.message => message,
-                    fields.text => record.text.clone(),
-                    fields.default_text => record.text,
                     fields.availability => availability,
-                    fields.record => full,
-                    fields.summary => serde_json::to_vec(&summary)?,
                     fields.provider => record.provider.as_str(),
-                    fields.native_session => record.provider_session_id,
-                    fields.timestamp => record.occurred_at,
                     fields.event_type => record.event_type.as_str(),
                     fields.subagent => record.is_subagent,
                     fields.sequence => record.sequence
                 );
+                document.add_text(fields.source, &key);
+                document.add_text(fields.id, &record.event_id);
+                document.add_text(fields.session, &record.session_id);
+                document.add_text(fields.text, &record.text);
+                document.add_text(fields.default_text, &record.text);
+                document.add_text(fields.native_session, &record.provider_session_id);
+                document.add_text(fields.timestamp, &record.occurred_at);
                 if let Some(root) = &record.workspace_root {
                     document.add_text(fields.workspace_root, root.text());
                 }
                 // Hash normalized suffixes: paths can exceed a term's length
                 // limit, and file filters match path components, not substrings.
-                for file in record.files {
-                    let mut components = Path::new(&file).components();
+                for file in &record.files {
+                    let mut components = Path::new(file).components();
                     while !components.as_path().as_os_str().is_empty() {
                         document.add_text(fields.file, file_key(components.as_path()));
                         components.next();
                     }
                 }
+                let stored = StoredRecord::new(record);
+                document.add_bytes(fields.record, &serde_json::to_vec(&stored)?);
+                let mut summary = stored.record;
+                summary.structured_content = Value::Null;
+                summary.files.clear();
+                document.add_bytes(fields.summary, &serde_json::to_vec(&summary)?);
                 writer.add_document(document)?;
             }
         }
@@ -2837,12 +2844,12 @@ pub(crate) mod tests {
         summary.structured_content = Value::Null;
         writer
             .add_document(doc!(
-                fields.id => record.event_id.clone(),
-                fields.session => record.session_id.clone(),
-                fields.native_session => record.provider_session_id.clone(),
-                fields.text => record.text.clone(),
+                fields.id => record.event_id,
+                fields.session => record.session_id,
+                fields.native_session => record.provider_session_id,
+                fields.text => record.text,
                 fields.default_text => format!("{before}\n{after}"),
-                fields._expanded_text => record.text.clone(),
+                fields._expanded_text => record.text,
                 fields.availability => 0u64,
                 fields.record => serde_json::to_vec(&StoredRecord::new(record.clone())).unwrap(),
                 fields.summary => serde_json::to_vec(&summary).unwrap(),
